@@ -24,30 +24,27 @@ use serde::Deserialize;
 const FIXTURE_RELATIVE_PATH: &str = "data/uniswap-t100-c20.json";
 
 pub fn bench_first_uniswap_tx(c: &mut Criterion) {
-    let fixture_plain = Fixture::load().expect("failed to load JSON fixture");
-    let fixture_jit = Fixture::load().expect("failed to load JSON fixture");
+    let fixture = Fixture::load().expect("failed to load JSON fixture");
 
     let mut group = c.benchmark_group("uniswap_first_transaction");
-    group.bench_function("plain_execution", move |b| {
+    group.bench_function("plain_execution", |b| {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                let mut evm = fixture_plain.prepare_plain_evm();
                 let start = Instant::now();
-                let result = evm.transact().expect("transaction execution failed");
+                let result = fixture.run_plain().expect("plain execution failed");
                 total += start.elapsed();
                 black_box(result);
             }
             total
         });
     });
-    group.bench_function("jit_optimized", move |b| {
+    group.bench_function("jit_optimized", |b| {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                let mut evm = fixture_jit.prepare_evm();
                 let start = Instant::now();
-                let result = evm.transact().expect("transaction execution failed");
+                let result = fixture.run_jit().expect("jit execution failed");
                 total += start.elapsed();
                 black_box(result);
             }
@@ -64,6 +61,7 @@ struct Fixture {
     env: Env,
     accounts: Vec<PreparedAccount>,
     compiled: CompiledContracts,
+    prebuilt_db: Arc<CacheDB<EmptyDB>>,
 }
 
 #[derive(Clone)]
@@ -99,31 +97,44 @@ impl Fixture {
         let accounts = parse_accounts(raw_case.pre)?;
         let compiled = compile_contracts(&accounts)?;
 
-        Ok(Self { env, accounts, compiled })
-    }
-
-    fn prepare_evm(&self) -> Evm<'static, BenchExternalContext, CacheDB<EmptyDB>> {
-        let mut evm = build_optimized_evm(self.populate_db(), self.compiled.functions.clone());
-        *evm.context.evm.env = self.env.clone();
-        evm
-    }
-
-    fn prepare_plain_evm(&self) -> Evm<'static, (), CacheDB<EmptyDB>> {
-        let mut evm = build_plain_evm(self.populate_db());
-        *evm.context.evm.env = self.env.clone();
-        evm
-    }
-
-    fn populate_db(&self) -> CacheDB<EmptyDB> {
+        // Prebuild DB once to avoid repeated construction in benchmark iterations
         let mut db = CacheDB::new(EmptyDB::new());
-        for account in &self.accounts {
+        for account in &accounts {
             db.insert_account_info(account.address, account.info.clone());
             if !account.storage.is_empty() {
                 db.replace_account_storage(account.address, account.storage.clone())
-                    .expect("failed to populate account storage");
+                    .map_err(|e| format!("failed to populate account storage: {:?}", e))?;
             }
         }
-        db
+        let prebuilt_db = Arc::new(db);
+
+        Ok(Self { env, accounts, compiled, prebuilt_db })
+    }
+
+    fn run_jit(&self) -> Result<revm::primitives::ResultAndState, String> {
+        unsafe {
+            // Use raw pointer from Arc to avoid DB clone overhead
+            let db_ptr = Arc::as_ptr(&self.prebuilt_db) as *mut CacheDB<EmptyDB>;
+            let db_ref = &mut *db_ptr;
+
+            let mut evm = build_optimized_evm(db_ref, self.compiled.functions.clone());
+            *evm.context.evm.env = self.env.clone();
+
+            evm.transact().map_err(|e| format!("JIT execution failed: {:?}", e))
+        }
+    }
+
+    fn run_plain(&self) -> Result<revm::primitives::ResultAndState, String> {
+        unsafe {
+            // Use raw pointer from Arc to avoid DB clone overhead
+            let db_ptr = Arc::as_ptr(&self.prebuilt_db) as *mut CacheDB<EmptyDB>;
+            let db_ref = &mut *db_ptr;
+
+            let mut evm = build_plain_evm(db_ref);
+            *evm.context.evm.env = self.env.clone();
+
+            evm.transact().map_err(|e| format!("Plain execution failed: {:?}", e))
+        }
     }
 }
 
@@ -431,10 +442,10 @@ impl BenchExternalContext {
     }
 }
 
-fn build_optimized_evm<'a, DB: revm::Database + 'static>(
-    db: DB,
+fn build_optimized_evm<'a, DB: revm::Database>(
+    db: &'a mut DB,
     functions: Arc<HashMap<B256, RawEvmCompilerFn>>,
-) -> Evm<'a, BenchExternalContext, DB> {
+) -> Evm<'a, BenchExternalContext, &'a mut DB> {
     revm::Evm::builder()
         .with_db(db)
         .with_external_context(BenchExternalContext::new(functions))
@@ -442,11 +453,11 @@ fn build_optimized_evm<'a, DB: revm::Database + 'static>(
         .build()
 }
 
-fn build_plain_evm<'a, DB: revm::Database + 'static>(db: DB) -> Evm<'a, (), DB> {
+fn build_plain_evm<'a, DB: revm::Database>(db: &'a mut DB) -> Evm<'a, (), &'a mut DB> {
     revm::Evm::builder().with_db(db).build()
 }
 
-fn register_bench_handler<DB: revm::Database + 'static>(
+fn register_bench_handler<DB: revm::Database>(
     handler: &mut EvmHandler<'_, BenchExternalContext, DB>,
 ) {
     let prev = handler.execution.execute_frame.clone();
