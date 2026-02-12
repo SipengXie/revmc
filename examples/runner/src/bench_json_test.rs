@@ -9,13 +9,22 @@ use std::{
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use k256::ecdsa::SigningKey;
 use revm::{
-    db::{CacheDB, EmptyDB},
-    handler::register::EvmHandler,
-    primitives::{
-        keccak256, AccountInfo, Address, BlobExcessGasAndPrice, BlockEnv, Bytecode, Bytes, CfgEnv,
-        Env, HashMap as RevmHashMap, SpecId, TransactTo, TxEnv, B256, U256,
+    bytecode::Bytecode,
+    context::{BlockEnv, CfgEnv, TxEnv},
+    context_interface::{
+        result::{EVMError, HaltReason, InvalidTransaction, ResultAndState},
+        ContextSetters,
     },
-    Evm,
+    database::{CacheDB, EmptyDB},
+    handler::{
+        EvmTr, FrameResult, Handler, ItemOrResult, MainBuilder,
+    },
+    primitives::{
+        hardfork::SpecId, keccak256, Address, Bytes, HashMap as RevmHashMap, StorageKey,
+        StorageValue, TxKind, B256, U256,
+    },
+    state::AccountInfo,
+    ExecuteEvm, MainnetEvm,
 };
 use revmc::{EvmCompiler, EvmLlvmBackend, OptimizationLevel};
 use revmc_context::{EvmCompilerFn, RawEvmCompilerFn};
@@ -58,7 +67,9 @@ criterion_group!(benches, bench_first_uniswap_tx);
 criterion_main!(benches);
 
 struct Fixture {
-    env: Env,
+    block: BlockEnv,
+    cfg: CfgEnv,
+    tx: TxEnv,
     accounts: Vec<PreparedAccount>,
     compiled: CompiledContracts,
     prebuilt_db: Arc<CacheDB<EmptyDB>>,
@@ -68,7 +79,7 @@ struct Fixture {
 struct PreparedAccount {
     address: Address,
     info: AccountInfo,
-    storage: RevmHashMap<U256, U256>,
+    storage: RevmHashMap<StorageKey, StorageValue>,
 }
 
 impl Fixture {
@@ -92,8 +103,13 @@ impl Fixture {
             .next()
             .ok_or_else(|| "fixture does not contain any transactions".to_owned())?;
 
-        let mut env = build_env(&raw_case.env)?;
-        apply_transaction(&mut env, &first_tx)?;
+        let block = build_block_env(&raw_case.env)?;
+        let cfg = {
+            let mut cfg = CfgEnv::default();
+            cfg.set_spec_and_mainnet_gas_params(SpecId::CANCUN);
+            cfg
+        };
+        let tx = build_tx_env(&cfg, &first_tx)?;
         let accounts = parse_accounts(raw_case.pre)?;
         let compiled = compile_contracts(&accounts)?;
 
@@ -108,35 +124,108 @@ impl Fixture {
         }
         let prebuilt_db = Arc::new(db);
 
-        Ok(Self { env, accounts, compiled, prebuilt_db })
+        Ok(Self { block, cfg, tx, accounts, compiled, prebuilt_db })
     }
 
-    fn run_jit(&self) -> Result<revm::primitives::ResultAndState, String> {
-        unsafe {
-            // Use raw pointer from Arc to avoid DB clone overhead
-            let db_ptr = Arc::as_ptr(&self.prebuilt_db) as *mut CacheDB<EmptyDB>;
-            let db_ref = &mut *db_ptr;
+    fn make_plain_evm(&self) -> BenchEvm<'static> {
+        // SAFETY: we treat the Arc's inner data as exclusively owned per iteration.
+        // The benchmark is single-threaded and each iteration is independent.
+        let db_ref = unsafe {
+            &mut *(Arc::as_ptr(&self.prebuilt_db) as *mut CacheDB<EmptyDB>)
+        };
+        let ctx = revm::context::Context::new(db_ref, SpecId::CANCUN);
+        let mut evm = ctx.build_mainnet();
+        evm.ctx.block = self.block.clone();
+        evm.ctx.cfg = self.cfg.clone();
+        evm
+    }
 
-            let mut evm = build_optimized_evm(db_ref, self.compiled.functions.clone());
-            *evm.context.evm.env = self.env.clone();
+    fn run_plain(&self) -> Result<ResultAndState, String> {
+        let mut evm = self.make_plain_evm();
+        evm.transact(self.tx.clone()).map_err(|e| format!("Plain execution failed: {:?}", e))
+    }
 
-            evm.transact().map_err(|e| format!("JIT execution failed: {:?}", e))
+    fn run_jit(&self) -> Result<ResultAndState, String> {
+        let mut evm = self.make_plain_evm();
+        let tx = self.tx.clone();
+        // Set the transaction on the context so the handler can validate/execute it
+        evm.ctx.set_tx(tx);
+
+        let mut handler = JitHandler {
+            functions: self.compiled.functions.clone(),
+        };
+        let result = handler
+            .run(&mut evm)
+            .map_err(|e| format!("JIT execution failed: {:?}", e))?;
+        let state = evm.ctx.journaled_state.finalize();
+        Ok(ResultAndState::new(result, state))
+    }
+}
+
+// ── JIT Handler ──────────────────────────────────────────────────────────────
+
+type BenchEvm<'a> = MainnetEvm<revm::handler::MainnetContext<&'a mut CacheDB<EmptyDB>>>;
+type BenchError = EVMError<core::convert::Infallible, InvalidTransaction>;
+
+struct JitHandler {
+    functions: Arc<HashMap<B256, RawEvmCompilerFn>>,
+}
+
+impl Handler for JitHandler {
+    type Evm = BenchEvm<'static>;
+    type Error = BenchError;
+    type HaltReason = HaltReason;
+
+    fn run_exec_loop(
+        &mut self,
+        evm: &mut Self::Evm,
+        first_frame_input: revm::interpreter::interpreter_action::FrameInit,
+    ) -> Result<FrameResult, Self::Error> {
+        let res = evm.frame_init(first_frame_input)?;
+        if let ItemOrResult::Result(frame_result) = res {
+            return Ok(frame_result);
         }
-    }
 
-    fn run_plain(&self) -> Result<revm::primitives::ResultAndState, String> {
-        unsafe {
-            // Use raw pointer from Arc to avoid DB clone overhead
-            let db_ptr = Arc::as_ptr(&self.prebuilt_db) as *mut CacheDB<EmptyDB>;
-            let db_ref = &mut *db_ptr;
+        loop {
+            let call_or_result = {
+                let (ctx, instructions, _precompiles, frame_stack) = evm.all_mut();
+                let frame = frame_stack.get();
+                let bytecode_hash =
+                    frame.interpreter.bytecode.get_or_calculate_hash();
 
-            let mut evm = build_plain_evm(db_ref);
-            *evm.context.evm.env = self.env.clone();
+                if let Some(&raw_fn) = self.functions.get(&bytecode_hash) {
+                    let f = EvmCompilerFn::new(raw_fn);
+                    let action =
+                        unsafe { f.call_with_interpreter(&mut frame.interpreter, ctx) };
+                    frame.process_next_action::<_, BenchError>(ctx, action).inspect(|i| {
+                        if i.is_result() {
+                            frame.set_finished(true);
+                        }
+                    })?
+                } else {
+                    // Fall back to standard frame_run for non-JIT contracts.
+                    // Drop split borrows and use evm.frame_run() for optimal performance.
+                    drop((ctx, instructions, _precompiles, frame_stack));
+                    evm.frame_run()?
+                }
+            };
 
-            evm.transact().map_err(|e| format!("Plain execution failed: {:?}", e))
+            let result = match call_or_result {
+                ItemOrResult::Item(init) => match evm.frame_init(init)? {
+                    ItemOrResult::Item(_) => continue,
+                    ItemOrResult::Result(result) => result,
+                },
+                ItemOrResult::Result(result) => result,
+            };
+
+            if let Some(result) = evm.frame_return_result(result)? {
+                return Ok(result);
+            }
         }
     }
 }
+
+// ── JSON fixture parsing ─────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct RawTestFile {
@@ -205,76 +294,96 @@ struct RawTransaction {
     max_fee_per_blob_gas: Option<String>,
 }
 
-fn build_env(raw: &RawEnv) -> Result<Env, String> {
-    let mut env = Env { cfg: CfgEnv::default(), block: BlockEnv::default(), tx: TxEnv::default() };
+// ── Environment builders ─────────────────────────────────────────────────────
 
-    env.block.number = parse_u256(
+fn build_block_env(raw: &RawEnv) -> Result<BlockEnv, String> {
+    let mut block = BlockEnv::default();
+    block.number = parse_u256(
         raw.current_number.as_deref().ok_or_else(|| "missing env.currentNumber".to_owned())?,
     )?;
-    env.block.timestamp = parse_u256(
+    block.timestamp = parse_u256(
         raw.current_timestamp
             .as_deref()
             .ok_or_else(|| "missing env.currentTimestamp".to_owned())?,
     )?;
-    env.block.gas_limit = parse_u256(
+    block.gas_limit = parse_u64(
         raw.current_gas_limit.as_deref().ok_or_else(|| "missing env.currentGasLimit".to_owned())?,
     )?;
-    env.block.basefee = parse_u256(
+    block.basefee = parse_u64(
         raw.current_base_fee.as_deref().ok_or_else(|| "missing env.currentBaseFee".to_owned())?,
     )?;
-    env.block.coinbase = parse_address(
+    block.beneficiary = parse_address(
         raw.current_coinbase.as_deref().ok_or_else(|| "missing env.currentCoinbase".to_owned())?,
     )?;
     if let Some(difficulty) = &raw.current_difficulty {
-        env.block.difficulty = parse_u256(difficulty)?;
+        block.difficulty = parse_u256(difficulty)?;
     }
-    env.block.prevrandao = match raw.current_random.as_deref() {
+    block.prevrandao = match raw.current_random.as_deref() {
         Some(value) => Some(parse_b256(value)?),
         None => None,
     };
     match raw.current_excess_blob_gas.as_deref() {
         Some(value) => {
             let excess = parse_u64(value)?;
-            env.block.blob_excess_gas_and_price.replace(BlobExcessGasAndPrice::new(excess, false));
+            block.set_blob_excess_gas_and_price(
+                excess,
+                revm::primitives::eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN,
+            );
         }
-        None => env.block.blob_excess_gas_and_price = None,
+        None => block.blob_excess_gas_and_price = None,
     }
-
-    Ok(env)
+    Ok(block)
 }
 
-fn apply_transaction(env: &mut Env, tx: &RawTransaction) -> Result<(), String> {
-    env.tx = TxEnv::default();
-    env.tx.caller = derive_caller_address(&tx.secret_key)?;
-    env.tx.gas_limit = parse_u64(&tx.gas_limit)?;
+fn build_tx_env(cfg: &CfgEnv, tx: &RawTransaction) -> Result<TxEnv, String> {
+    let caller = derive_caller_address(&tx.secret_key)?;
+    let gas_limit = parse_u64(&tx.gas_limit)?;
 
     let gas_price_source =
         tx.gas_price.as_deref().or(tx.max_fee_per_gas.as_deref()).unwrap_or("0x0");
-    env.tx.gas_price = parse_u256(gas_price_source)?;
-    env.tx.gas_priority_fee = match tx.max_priority_fee_per_gas.as_deref() {
-        Some(value) => Some(parse_u256(value)?),
+    let gas_price = parse_u128(gas_price_source)?;
+
+    let gas_priority_fee = match tx.max_priority_fee_per_gas.as_deref() {
+        Some(value) => Some(parse_u128(value)?),
         None => None,
     };
 
-    env.tx.value = parse_u256(tx.value.as_deref().unwrap_or("0x0"))?;
-    env.tx.data = parse_bytes(&tx.data)?;
-    env.tx.nonce = Some(parse_u64(tx.nonce.as_deref().unwrap_or("0x0"))?);
-    env.tx.chain_id = Some(env.cfg.chain_id);
-    env.tx.transact_to = match tx.to.as_deref() {
-        Some(value) if value.trim().is_empty() || value.trim() == "0x" => TransactTo::Create,
-        Some(value) => TransactTo::Call(parse_address(value)?),
-        None => TransactTo::Create,
+    let value = parse_u256(tx.value.as_deref().unwrap_or("0x0"))?;
+    let data = parse_bytes(&tx.data)?;
+    let nonce = parse_u64(tx.nonce.as_deref().unwrap_or("0x0"))?;
+
+    let kind = match tx.to.as_deref() {
+        Some(value) if value.trim().is_empty() || value.trim() == "0x" => TxKind::Create,
+        Some(value) => TxKind::Call(parse_address(value)?),
+        None => TxKind::Create,
     };
 
-    env.tx.blob_hashes =
+    let blob_hashes =
         tx.blob_hashes.iter().map(|hash| parse_b256(hash)).collect::<Result<Vec<_>, _>>()?;
-    env.tx.max_fee_per_blob_gas = match tx.max_fee_per_blob_gas.as_deref() {
-        Some(value) => Some(parse_u256(value)?),
-        None => None,
+    let max_fee_per_blob_gas = match tx.max_fee_per_blob_gas.as_deref() {
+        Some(value) => parse_u128(value)?,
+        None => 0,
     };
 
-    Ok(())
+    Ok(TxEnv {
+        tx_type: 0, // will be derived
+        caller,
+        gas_limit,
+        gas_price,
+        kind,
+        value,
+        data,
+        nonce,
+        chain_id: Some(cfg.chain_id),
+        access_list: Default::default(),
+        gas_priority_fee,
+        blob_hashes,
+        max_fee_per_blob_gas,
+        authorization_list: Vec::new(),
+    })
 }
+
+// ── Account parsing ──────────────────────────────────────────────────────────
 
 fn parse_accounts(pre: BTreeMap<String, RawAccount>) -> Result<Vec<PreparedAccount>, String> {
     let mut accounts = Vec::with_capacity(pre.len());
@@ -295,13 +404,16 @@ fn parse_account(address_hex: &str, account: RawAccount) -> Result<PreparedAccou
 
     let storage = parse_storage(account.storage)?;
 
-    let info = AccountInfo { balance, nonce, code_hash, code: Some(bytecode) };
+    let info = AccountInfo { balance, nonce, code_hash, account_id: None, code: Some(bytecode) };
 
     Ok(PreparedAccount { address, info, storage })
 }
 
-fn parse_storage(storage: BTreeMap<String, String>) -> Result<RevmHashMap<U256, U256>, String> {
-    let mut entries = RevmHashMap::with_capacity(storage.len());
+fn parse_storage(
+    storage: BTreeMap<String, String>,
+) -> Result<RevmHashMap<StorageKey, StorageValue>, String> {
+    let mut entries: RevmHashMap<StorageKey, StorageValue> =
+        RevmHashMap::with_capacity_and_hasher(storage.len(), Default::default());
     for (slot_hex, value_hex) in storage {
         let slot = parse_u256(&slot_hex)?;
         let value = parse_u256(&value_hex)?;
@@ -309,6 +421,8 @@ fn parse_storage(storage: BTreeMap<String, String>) -> Result<RevmHashMap<U256, 
     }
     Ok(entries)
 }
+
+// ── JIT compilation ──────────────────────────────────────────────────────────
 
 struct CompiledContracts {
     functions: Arc<HashMap<B256, RawEvmCompilerFn>>,
@@ -353,6 +467,8 @@ fn compile_contracts(accounts: &[PreparedAccount]) -> Result<CompiledContracts, 
     Ok(CompiledContracts { functions: Arc::new(functions), _compiler: compiler, _context: context })
 }
 
+// ── Hex parsing helpers ──────────────────────────────────────────────────────
+
 fn derive_caller_address(secret_hex: &str) -> Result<Address, String> {
     let raw = parse_fixed_bytes(secret_hex, 32)?;
     let key_bytes: [u8; 32] =
@@ -392,6 +508,15 @@ fn parse_u256(value: &str) -> Result<U256, String> {
     }
 }
 
+fn parse_u128(value: &str) -> Result<u128, String> {
+    let trimmed = strip_0x(value.trim());
+    if trimmed.is_empty() {
+        Ok(0)
+    } else {
+        u128::from_str_radix(trimmed, 16).map_err(|err| err.to_string())
+    }
+}
+
 fn parse_u64(value: &str) -> Result<u64, String> {
     let trimmed = strip_0x(value.trim());
     if trimmed.is_empty() {
@@ -426,48 +551,4 @@ fn parse_fixed_bytes(value: &str, expected_len: usize) -> Result<Vec<u8>, String
 
 fn strip_0x(value: &str) -> &str {
     value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")).unwrap_or(value)
-}
-
-struct BenchExternalContext {
-    functions: Arc<HashMap<B256, RawEvmCompilerFn>>,
-}
-
-impl BenchExternalContext {
-    fn new(functions: Arc<HashMap<B256, RawEvmCompilerFn>>) -> Self {
-        Self { functions }
-    }
-
-    fn get_function(&self, hash: B256) -> Option<EvmCompilerFn> {
-        self.functions.get(&hash).copied().map(EvmCompilerFn::new)
-    }
-}
-
-fn build_optimized_evm<'a, DB: revm::Database>(
-    db: &'a mut DB,
-    functions: Arc<HashMap<B256, RawEvmCompilerFn>>,
-) -> Evm<'a, BenchExternalContext, &'a mut DB> {
-    revm::Evm::builder()
-        .with_db(db)
-        .with_external_context(BenchExternalContext::new(functions))
-        .append_handler_register(register_bench_handler)
-        .build()
-}
-
-fn build_plain_evm<'a, DB: revm::Database>(db: &'a mut DB) -> Evm<'a, (), &'a mut DB> {
-    revm::Evm::builder().with_db(db).build()
-}
-
-fn register_bench_handler<DB: revm::Database>(
-    handler: &mut EvmHandler<'_, BenchExternalContext, DB>,
-) {
-    let prev = handler.execution.execute_frame.clone();
-    handler.execution.execute_frame = Arc::new(move |frame, memory, tables, context| {
-        let interpreter = frame.interpreter_mut();
-        let bytecode_hash = interpreter.contract.hash.unwrap_or_default();
-        if let Some(f) = context.external.get_function(bytecode_hash) {
-            Ok(unsafe { f.call_with_interpreter_and_memory(interpreter, memory, context) })
-        } else {
-            prev(frame, memory, tables, context)
-        }
-    });
 }
