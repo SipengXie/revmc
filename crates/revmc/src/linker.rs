@@ -63,7 +63,7 @@ impl Linker {
         cmd.arg("-O3");
         if let Some(linker) = &self.linker {
             cmd.arg(format!("-fuse-ld={}", linker.display()));
-        } else {
+        } else if !cfg!(target_vendor = "apple") {
             cmd.arg("-fuse-ld=lld");
         }
         if cfg!(target_vendor = "apple") {
@@ -77,19 +77,16 @@ impl Linker {
         trace!(?cmd, "full linking command");
         let output = cmd.output()?;
         if !output.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("cc failed with {output:#?}"),
-            ));
+            return Err(std::io::Error::other(format!("cc failed with {output:#?}")));
         }
         Ok(())
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "llvm"))]
 mod tests {
     use super::*;
-    use revm_primitives::SpecId;
+    use crate::SpecId;
 
     #[test]
     fn basic() {
