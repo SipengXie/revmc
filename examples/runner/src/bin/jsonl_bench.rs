@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -273,10 +274,219 @@ fn build_tx_env(tx: &TxRecordLine) -> OpTransaction<TxEnv> {
 
 struct CompiledContracts {
     functions: Arc<HashMap<B256, RawEvmCompilerFn>>,
+    _libraries: Vec<libloading::Library>,
 }
 
-// SAFETY: RawEvmCompilerFn is a function pointer (leaked LLVM engine keeps it valid).
-unsafe impl Send for CompiledContracts {}
+#[derive(Default)]
+struct CacheStats {
+    hits: usize,
+    misses: usize,
+}
+
+struct CacheArtifacts {
+    key: String,
+    symbol: String,
+    object: PathBuf,
+    library: PathBuf,
+}
+
+fn sanitize_cache_component(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn opt_cache_tag(opt: OptimizationLevel) -> &'static str {
+    match opt {
+        OptimizationLevel::None => "o0",
+        OptimizationLevel::Less => "o1",
+        OptimizationLevel::Default => "o2",
+        OptimizationLevel::Aggressive => "o3",
+    }
+}
+
+fn cache_artifacts(cache_dir: &Path, hash: &B256, opt: OptimizationLevel) -> CacheArtifacts {
+    let hash_hex = hex::encode(hash);
+    let spec_tag = sanitize_cache_component(&format!("{ETH_SPEC:?}"));
+    let key = format!("{hash_hex}__{spec_tag}__{}", opt_cache_tag(opt));
+    let stem = cache_dir.join(&key);
+    let object = stem.with_extension("o");
+    let library = stem.with_extension(std::env::consts::DLL_EXTENSION);
+    let symbol = format!("c_{hash_hex}");
+    CacheArtifacts {
+        key,
+        symbol,
+        object,
+        library,
+    }
+}
+
+fn load_cached_symbol(
+    artifacts: &CacheArtifacts,
+) -> Result<(RawEvmCompilerFn, libloading::Library), String> {
+    let library = unsafe { libloading::Library::new(&artifacts.library) }
+        .map_err(|e| format!("dlopen {} failed: {e}", artifacts.library.display()))?;
+    let symbol = unsafe { library.get::<RawEvmCompilerFn>(artifacts.symbol.as_bytes()) }
+        .map_err(|e| {
+            format!(
+                "dlsym {} failed in {}: {e}",
+                artifacts.symbol,
+                artifacts.library.display()
+            )
+        })?;
+    let function = *symbol;
+    drop(symbol);
+    Ok((function, library))
+}
+
+fn compile_contract_to_cache(
+    bytecode: &Bytecode,
+    opt: OptimizationLevel,
+    artifacts: &CacheArtifacts,
+) -> Result<(), String> {
+    if let Some(parent) = artifacts.object.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create cache dir {} failed: {e}", parent.display()))?;
+    }
+
+    let context = Box::leak(Box::new(revmc::llvm::inkwell::context::Context::create()));
+    let backend = EvmLlvmBackend::new(context, true, opt)
+        .map_err(|e| format!("AOT backend init failed ({}): {e}", artifacts.key))?;
+    let mut compiler = EvmCompiler::new(backend);
+    compiler
+        .translate(&artifacts.symbol, bytecode.original_byte_slice(), ETH_SPEC)
+        .map_err(|e| format!("translate {} failed: {e}", artifacts.key))?;
+    compiler
+        .write_object_to_file(&artifacts.object)
+        .map_err(|e| format!("write object {} failed: {e}", artifacts.object.display()))?;
+
+    revmc::Linker::new()
+        .link(&artifacts.library, [&artifacts.object])
+        .map_err(|e| format!("link {} failed: {e}", artifacts.library.display()))?;
+    Ok(())
+}
+
+fn compile_contract_jit_fallback(
+    hash: B256,
+    bytecode: &Bytecode,
+    opt: OptimizationLevel,
+) -> Option<RawEvmCompilerFn> {
+    let symbol = format!("c_{}", hex::encode(hash));
+    let context = Box::leak(Box::new(revmc::llvm::inkwell::context::Context::create()));
+    let backend = EvmLlvmBackend::new(context, false, opt).ok()?;
+    let compiler: &'static mut EvmCompiler<EvmLlvmBackend<'static>> =
+        Box::leak(Box::new(EvmCompiler::new(backend)));
+    let func_id = compiler.translate(&symbol, bytecode.original_byte_slice(), ETH_SPEC).ok()?;
+    unsafe { compiler.jit_function(func_id).ok().map(|f| f.into_inner()) }
+}
+
+fn load_or_compile_cached_contract(
+    hash: B256,
+    bytecode: &Bytecode,
+    opt: OptimizationLevel,
+    cache_dir: &Path,
+    stats: &mut CacheStats,
+) -> Option<(RawEvmCompilerFn, libloading::Library)> {
+    let artifacts = cache_artifacts(cache_dir, &hash, opt);
+    let has_cache = artifacts.object.exists() && artifacts.library.exists();
+    if has_cache {
+        match load_cached_symbol(&artifacts) {
+            Ok(loaded) => {
+                stats.hits += 1;
+                return Some(loaded);
+            }
+            Err(e) => {
+                eprintln!(
+                    "  Cache stale/unloadable for {}.. ({}), recompiling",
+                    &hex::encode(hash)[..16],
+                    e
+                );
+            }
+        }
+    }
+
+    stats.misses += 1;
+    if let Err(e) = compile_contract_to_cache(bytecode, opt, &artifacts) {
+        eprintln!("  WARN cache compile failed {}..: {e}", &hex::encode(hash)[..16]);
+        return None;
+    }
+
+    match load_cached_symbol(&artifacts) {
+        Ok(loaded) => Some(loaded),
+        Err(e) => {
+            eprintln!(
+                "  WARN cache load after compile failed {}..: {e}",
+                &hex::encode(hash)[..16]
+            );
+            None
+        }
+    }
+}
+
+fn compile_all_contracts_with_cache(
+    code_values: &HashMap<B256, Bytecode>,
+    opt: OptimizationLevel,
+    cache_dir: &Path,
+) -> CompiledContracts {
+    std::fs::create_dir_all(cache_dir)
+        .unwrap_or_else(|e| panic!("failed to create cache dir {}: {e}", cache_dir.display()));
+
+    let mut contracts: Vec<(B256, &Bytecode)> = code_values
+        .iter()
+        .filter(|(_, bc)| !bc.is_empty())
+        .map(|(h, bc)| (*h, bc))
+        .collect();
+    contracts.sort_by_key(|(_, bc)| std::cmp::Reverse(bc.original_byte_slice().len()));
+
+    eprintln!(
+        "  Using persistent cache: dir={} contracts={} opt={opt:?}",
+        cache_dir.display(),
+        contracts.len()
+    );
+
+    let mut functions = HashMap::new();
+    let mut libraries = Vec::new();
+    let mut stats = CacheStats::default();
+    let mut jit_fallbacks = 0usize;
+
+    for (hash, bytecode) in contracts {
+        if functions.contains_key(&hash) {
+            continue;
+        }
+        if let Some((function, library)) =
+            load_or_compile_cached_contract(hash, bytecode, opt, cache_dir, &mut stats)
+        {
+            functions.insert(hash, function);
+            libraries.push(library);
+            continue;
+        }
+        if let Some(function) = compile_contract_jit_fallback(hash, bytecode, opt) {
+            jit_fallbacks += 1;
+            functions.insert(hash, function);
+            eprintln!(
+                "  WARN using JIT fallback for {}.. (cache unavailable)",
+                &hex::encode(hash)[..16]
+            );
+        }
+    }
+
+    eprintln!(
+        "  Cache stats: hits={} misses={} jit_fallbacks={}",
+        stats.hits, stats.misses, jit_fallbacks
+    );
+
+    CompiledContracts {
+        functions: Arc::new(functions),
+        _libraries: libraries,
+    }
+}
 
 fn compile_all_contracts(code_values: &HashMap<B256, Bytecode>) -> CompiledContracts {
     // Collect non-empty contracts, sorted by bytecode size descending for load balancing
@@ -379,6 +589,7 @@ fn compile_all_contracts(code_values: &HashMap<B256, Bytecode>) -> CompiledContr
 
     CompiledContracts {
         functions: Arc::new(all_functions),
+        _libraries: Vec::new(),
     }
 }
 
@@ -581,12 +792,16 @@ fn print_results(results: &[TxResult], skipped: usize) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    let cache_dir = args
+        .iter()
+        .position(|a| a == "--cache-dir")
+        .map(|i| PathBuf::from(args.get(i + 1).expect("--cache-dir requires <dir>")));
     let path = args
         .iter()
         .position(|a| a == "--path")
         .and_then(|i| args.get(i + 1))
         .map(|s| s.as_str())
-        .expect("Usage: jsonl_bench --path <jsonl_file>");
+        .expect("Usage: jsonl_bench --path <jsonl_file> [--cache-dir <dir>]");
 
     eprintln!("=== Loading JSONL ===");
     eprintln!("File: {path}");
@@ -596,7 +811,11 @@ fn main() {
 
     eprintln!("\n=== Compiling contracts ===");
     let start = Instant::now();
-    let compiled = compile_all_contracts(&code_values);
+    let compiled = if let Some(cache_dir) = cache_dir.as_deref() {
+        compile_all_contracts_with_cache(&code_values, OptimizationLevel::Aggressive, cache_dir)
+    } else {
+        compile_all_contracts(&code_values)
+    };
     eprintln!("  Compilation time: {:.2}s", start.elapsed().as_secs_f64());
 
     eprintln!("\n=== Benchmark: Native vs JIT ===");
