@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use op_revm::{DefaultOp, OpEvm, OpHaltReason, OpSpecId, OpTransactionError};
@@ -423,6 +424,204 @@ fn parse_opt_level(args: &[String]) -> OptimizationLevel {
     }
 }
 
+#[derive(Default)]
+struct CacheStats {
+    hits: usize,
+    misses: usize,
+}
+
+struct CacheArtifacts {
+    key: String,
+    symbol: String,
+    object: PathBuf,
+    library: PathBuf,
+}
+
+struct CachedFunctions {
+    functions: Arc<HashMap<B256, RawEvmCompilerFn>>,
+    _libraries: Vec<libloading::Library>,
+}
+
+fn sanitize_cache_component(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn opt_cache_tag(opt: OptimizationLevel) -> &'static str {
+    match opt {
+        OptimizationLevel::None => "o0",
+        OptimizationLevel::Less => "o1",
+        OptimizationLevel::Default => "o2",
+        OptimizationLevel::Aggressive => "o3",
+    }
+}
+
+fn cache_artifacts(cache_dir: &Path, hash: &B256, opt: OptimizationLevel) -> CacheArtifacts {
+    let hash_hex = hex::encode(hash);
+    let spec_tag = sanitize_cache_component(&format!("{ETH_SPEC:?}"));
+    let key = format!("{hash_hex}__{spec_tag}__{}", opt_cache_tag(opt));
+    let stem = cache_dir.join(&key);
+    let object = stem.with_extension("o");
+    let library = stem.with_extension(std::env::consts::DLL_EXTENSION);
+    let symbol = format!("c_{hash_hex}");
+    CacheArtifacts { key, symbol, object, library }
+}
+
+fn load_cached_symbol(
+    artifacts: &CacheArtifacts,
+) -> Result<(RawEvmCompilerFn, libloading::Library), String> {
+    let library = unsafe { libloading::Library::new(&artifacts.library) }
+        .map_err(|e| format!("dlopen {} failed: {e}", artifacts.library.display()))?;
+    let symbol = unsafe { library.get::<RawEvmCompilerFn>(artifacts.symbol.as_bytes()) }
+        .map_err(|e| format!("dlsym {} failed in {}: {e}", artifacts.symbol, artifacts.library.display()))?;
+    let function = *symbol;
+    drop(symbol);
+    Ok((function, library))
+}
+
+fn compile_contract_to_cache(
+    bytecode: &Bytecode,
+    opt: OptimizationLevel,
+    artifacts: &CacheArtifacts,
+    dump_ir_dir: Option<&Path>,
+) -> Result<(), String> {
+    if let Some(parent) = artifacts.object.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create cache dir {} failed: {e}", parent.display()))?;
+    }
+
+    let context = Box::leak(Box::new(revmc::llvm::inkwell::context::Context::create()));
+    let backend = EvmLlvmBackend::new(context, true, opt)
+        .map_err(|e| format!("AOT backend init failed ({}): {e}", artifacts.key))?;
+    let mut compiler = EvmCompiler::new(backend);
+    if let Some(dir) = dump_ir_dir {
+        compiler.set_dump_to(Some(dir.to_path_buf()));
+    }
+    compiler
+        .translate(&artifacts.symbol, bytecode.original_byte_slice(), ETH_SPEC)
+        .map_err(|e| format!("translate {} failed: {e}", artifacts.key))?;
+    compiler
+        .write_object_to_file(&artifacts.object)
+        .map_err(|e| format!("write object {} failed: {e}", artifacts.object.display()))?;
+
+    revmc::Linker::new()
+        .link(&artifacts.library, [&artifacts.object])
+        .map_err(|e| format!("link {} failed: {e}", artifacts.library.display()))?;
+
+    Ok(())
+}
+
+fn compile_contract_jit_fallback(
+    hash: B256,
+    bytecode: &Bytecode,
+    opt: OptimizationLevel,
+    dump_ir_dir: Option<&Path>,
+) -> Option<RawEvmCompilerFn> {
+    let symbol = format!("c_{}", &hex::encode(hash)[..16]);
+    let context = Box::leak(Box::new(revmc::llvm::inkwell::context::Context::create()));
+    let backend = EvmLlvmBackend::new(context, false, opt).ok()?;
+    let compiler: &'static mut EvmCompiler<EvmLlvmBackend<'static>> =
+        Box::leak(Box::new(EvmCompiler::new(backend)));
+    if let Some(dir) = dump_ir_dir {
+        compiler.set_dump_to(Some(dir.to_path_buf()));
+    }
+    let func_id = compiler.translate(&symbol, bytecode.original_byte_slice(), ETH_SPEC).ok()?;
+    unsafe { compiler.jit_function(func_id).ok().map(|f| f.into_inner()) }
+}
+
+fn load_or_compile_cached_contract(
+    hash: B256,
+    bytecode: &Bytecode,
+    opt: OptimizationLevel,
+    cache_dir: &Path,
+    dump_ir_dir: Option<&Path>,
+    stats: &mut CacheStats,
+) -> Option<(RawEvmCompilerFn, libloading::Library)> {
+    let artifacts = cache_artifacts(cache_dir, &hash, opt);
+    let has_cache = artifacts.object.exists() && artifacts.library.exists();
+
+    if has_cache {
+        match load_cached_symbol(&artifacts) {
+            Ok(loaded) => {
+                stats.hits += 1;
+                return Some(loaded);
+            }
+            Err(e) => {
+                eprintln!(
+                    "  Cache stale/unloadable for {}.. ({}), recompiling",
+                    &hex::encode(hash)[..16],
+                    e
+                );
+            }
+        }
+    }
+
+    stats.misses += 1;
+    if let Err(e) = compile_contract_to_cache(bytecode, opt, &artifacts, dump_ir_dir) {
+        eprintln!("  WARN cache compile failed {}..: {e}", &hex::encode(hash)[..16]);
+        return None;
+    }
+
+    match load_cached_symbol(&artifacts) {
+        Ok(loaded) => Some(loaded),
+        Err(e) => {
+            eprintln!("  WARN cache load after compile failed {}..: {e}", &hex::encode(hash)[..16]);
+            None
+        }
+    }
+}
+
+fn compile_contracts_with_cache(
+    contracts: &[(B256, &Bytecode)],
+    opt: OptimizationLevel,
+    cache_dir: &Path,
+    dump_ir_dir: Option<&Path>,
+) -> CachedFunctions {
+    std::fs::create_dir_all(cache_dir)
+        .unwrap_or_else(|e| panic!("failed to create cache dir {}: {e}", cache_dir.display()));
+
+    let mut functions = HashMap::new();
+    let mut libraries = Vec::new();
+    let mut stats = CacheStats::default();
+    let mut jit_fallbacks = 0usize;
+
+    for &(hash, bytecode) in contracts {
+        if functions.contains_key(&hash) {
+            continue;
+        }
+        if let Some((function, library)) =
+            load_or_compile_cached_contract(hash, bytecode, opt, cache_dir, dump_ir_dir, &mut stats)
+        {
+            functions.insert(hash, function);
+            libraries.push(library);
+            continue;
+        }
+
+        if let Some(function) = compile_contract_jit_fallback(hash, bytecode, opt, dump_ir_dir) {
+            jit_fallbacks += 1;
+            functions.insert(hash, function);
+            eprintln!(
+                "  WARN using JIT fallback for {}.. (cache unavailable)",
+                &hex::encode(hash)[..16]
+            );
+        }
+    }
+
+    eprintln!(
+        "Cache stats: hits={} misses={} jit_fallbacks={}",
+        stats.hits, stats.misses, jit_fallbacks
+    );
+    CachedFunctions { functions: Arc::new(functions), _libraries: libraries }
+}
+
 fn load_jsonl_all(path: &str) -> (HashMap<B256, Bytecode>, Vec<TxRecordLine>) {
     let file = File::open(path).expect("failed to open JSONL");
     let reader = BufReader::new(file);
@@ -523,12 +722,37 @@ fn compile_all_contracts(
     Arc::new(functions)
 }
 
-fn run_full_correctness(path: &str, args: &[String]) -> i32 {
+fn compile_all_contracts_with_cache(
+    code_values: &HashMap<B256, Bytecode>,
+    opt: OptimizationLevel,
+    cache_dir: &Path,
+) -> CachedFunctions {
+    let mut contracts: Vec<(B256, &Bytecode)> = code_values
+        .iter()
+        .filter(|(_, bc)| !bc.is_empty())
+        .map(|(h, bc)| (*h, bc))
+        .collect();
+    contracts.sort_by_key(|(_, bc)| std::cmp::Reverse(bc.original_byte_slice().len()));
+
+    eprintln!(
+        "Compiling/loading {} non-empty contracts with persistent cache dir={} ETH_SPEC={ETH_SPEC:?} opt={opt:?}",
+        contracts.len(),
+        cache_dir.display()
+    );
+    compile_contracts_with_cache(&contracts, opt, cache_dir, None)
+}
+
+fn run_full_correctness(path: &str, args: &[String], cache_dir: Option<&Path>) -> i32 {
     let (code_values, tx_records) = load_jsonl_all(path);
     eprintln!("Loaded code_values={} tx_records={}", code_values.len(), tx_records.len());
 
     let opt = parse_opt_level(args);
-    let functions = compile_all_contracts(&code_values, opt);
+    let _cache_loaded = cache_dir.map(|dir| compile_all_contracts_with_cache(&code_values, opt, dir));
+    let functions = if let Some(loaded) = _cache_loaded.as_ref() {
+        loaded.functions.clone()
+    } else {
+        compile_all_contracts(&code_values, opt)
+    };
     let empty_functions: Arc<HashMap<B256, RawEvmCompilerFn>> = Arc::new(HashMap::new());
 
     let mut matched = 0usize;
@@ -637,6 +861,10 @@ fn run_full_correctness(path: &str, args: &[String]) -> i32 {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let path = args.iter().position(|a| a == "--path").and_then(|i| args.get(i + 1)).map(|s| s.as_str()).expect("--path required");
+    let cache_dir = args
+        .iter()
+        .position(|a| a == "--cache-dir")
+        .map(|i| PathBuf::from(args.get(i + 1).expect("--cache-dir requires <dir>")));
     let target_tx: Option<u64> = args
         .iter()
         .position(|a| a == "--tx")
@@ -648,7 +876,7 @@ fn main() {
         if trace_calls {
             eprintln!("WARN: --trace-calls is ignored in full mode");
         }
-        let exit_code = run_full_correctness(path, &args);
+        let exit_code = run_full_correctness(path, &args, cache_dir.as_deref());
         if exit_code != 0 {
             std::process::exit(exit_code);
         }
@@ -708,11 +936,6 @@ fn main() {
     let opt = parse_opt_level(&args);
     eprintln!("  Optimization level: {opt:?}");
     let separate_modules = args.iter().any(|a| a == "--separate-modules");
-    if separate_modules {
-        eprintln!("  Mode: SEPARATE modules (one LLVM module per contract)");
-    } else {
-        eprintln!("  Mode: SHARED module (all contracts in one LLVM module)");
-    }
     let dump_ir_dir = if let Some(pos) = args.iter().position(|a| a == "--dump-ir") {
         let dir = args.get(pos + 1).map(|s| std::path::PathBuf::from(s))
             .unwrap_or_else(|| std::path::PathBuf::from("/tmp/revmc-ir"));
@@ -749,14 +972,64 @@ fn main() {
         only_prefixes.iter().any(|p| hex.starts_with(p.as_str()))
     };
 
-    let mut functions = HashMap::new();
+    let mut _cache_loaded: Option<CachedFunctions> = None;
+    let functions: Arc<HashMap<B256, RawEvmCompilerFn>> = if let Some(cache_dir) = cache_dir.as_deref() {
+        eprintln!("  Mode: CACHE AOT (per-contract shared library)");
+        if separate_modules {
+            eprintln!("  NOTE: --separate-modules is ignored when --cache-dir is enabled");
+        }
 
-    if separate_modules {
-        // Each contract gets its own LLVM Context + Module + Compiler
+        let mut selected_contracts = Vec::new();
         for (hash, _) in &touched_codes {
-            if !should_compile(hash) { continue; }
-            let bc = code_values.get(hash).unwrap();
-            let name = format!("c_{}", &hex::encode(hash)[..16]);
+            if !should_compile(hash) {
+                continue;
+            }
+            if let Some(bc) = code_values.get(hash) {
+                selected_contracts.push((*hash, bc));
+            }
+        }
+
+        let loaded =
+            compile_contracts_with_cache(&selected_contracts, opt, cache_dir, dump_ir_dir.as_deref());
+        eprintln!("Compiled/loaded: {}/{}", loaded.functions.len(), selected_contracts.len());
+        let functions = loaded.functions.clone();
+        _cache_loaded = Some(loaded);
+        functions
+    } else {
+        if separate_modules {
+            eprintln!("  Mode: SEPARATE modules (one LLVM module per contract)");
+        } else {
+            eprintln!("  Mode: SHARED module (all contracts in one LLVM module)");
+        }
+
+        let mut functions = HashMap::new();
+        if separate_modules {
+            // Each contract gets its own LLVM Context + Module + Compiler
+            for (hash, _) in &touched_codes {
+                if !should_compile(hash) {
+                    continue;
+                }
+                let bc = code_values.get(hash).unwrap();
+                let name = format!("c_{}", &hex::encode(hash)[..16]);
+                let context = Box::leak(Box::new(revmc::llvm::inkwell::context::Context::create()));
+                let backend = EvmLlvmBackend::new(context, false, opt).unwrap();
+                let compiler: &'static mut EvmCompiler<EvmLlvmBackend<'static>> =
+                    Box::leak(Box::new(EvmCompiler::new(backend)));
+                if let Some(ref dir) = dump_ir_dir {
+                    compiler.set_dump_to(Some(dir.clone()));
+                }
+                match compiler.translate(&name, bc.original_byte_slice(), ETH_SPEC) {
+                    Ok(func_id) => match unsafe { compiler.jit_function(func_id) } {
+                        Ok(fn_ptr) => {
+                            functions.insert(*hash, fn_ptr.into_inner());
+                        }
+                        Err(e) => eprintln!("  JIT failed {name}: {e}"),
+                    },
+                    Err(e) => eprintln!("  Translate failed {name}: {e}"),
+                }
+            }
+        } else {
+            // All contracts in one shared LLVM module
             let context = Box::leak(Box::new(revmc::llvm::inkwell::context::Context::create()));
             let backend = EvmLlvmBackend::new(context, false, opt).unwrap();
             let compiler: &'static mut EvmCompiler<EvmLlvmBackend<'static>> =
@@ -764,46 +1037,33 @@ fn main() {
             if let Some(ref dir) = dump_ir_dir {
                 compiler.set_dump_to(Some(dir.clone()));
             }
-            match compiler.translate(&name, bc.original_byte_slice(), ETH_SPEC) {
-                Ok(func_id) => {
-                    match unsafe { compiler.jit_function(func_id) } {
-                        Ok(fn_ptr) => { functions.insert(*hash, fn_ptr.into_inner()); }
-                        Err(e) => eprintln!("  JIT failed {name}: {e}"),
-                    }
-                }
-                Err(e) => eprintln!("  Translate failed {name}: {e}"),
-            }
-        }
-    } else {
-        // All contracts in one shared LLVM module
-        let context = Box::leak(Box::new(revmc::llvm::inkwell::context::Context::create()));
-        let backend = EvmLlvmBackend::new(context, false, opt).unwrap();
-        let compiler: &'static mut EvmCompiler<EvmLlvmBackend<'static>> =
-            Box::leak(Box::new(EvmCompiler::new(backend)));
-        if let Some(ref dir) = dump_ir_dir {
-            compiler.set_dump_to(Some(dir.clone()));
-        }
 
-        // Phase 1: translate ALL contracts into the LLVM module
-        let mut pending = Vec::new();
-        for (hash, _) in &touched_codes {
-            if !should_compile(hash) { continue; }
-            let bc = code_values.get(hash).unwrap();
-            let name = format!("c_{}", &hex::encode(hash)[..16]);
-            match compiler.translate(&name, bc.original_byte_slice(), ETH_SPEC) {
-                Ok(func_id) => pending.push((*hash, func_id)),
-                Err(e) => eprintln!("  Translate failed {}: {e}", &name),
+            // Phase 1: translate ALL contracts into the LLVM module
+            let mut pending = Vec::new();
+            for (hash, _) in &touched_codes {
+                if !should_compile(hash) {
+                    continue;
+                }
+                let bc = code_values.get(hash).unwrap();
+                let name = format!("c_{}", &hex::encode(hash)[..16]);
+                match compiler.translate(&name, bc.original_byte_slice(), ETH_SPEC) {
+                    Ok(func_id) => pending.push((*hash, func_id)),
+                    Err(e) => eprintln!("  Translate failed {}: {e}", &name),
+                }
+            }
+            // Phase 2: finalize module and extract function pointers
+            for (hash, func_id) in pending {
+                match unsafe { compiler.jit_function(func_id) } {
+                    Ok(fn_ptr) => {
+                        functions.insert(hash, fn_ptr.into_inner());
+                    }
+                    Err(e) => eprintln!("  JIT failed {}: {e}", &hex::encode(&hash.as_slice()[..8])),
+                }
             }
         }
-        // Phase 2: finalize module and extract function pointers
-        for (hash, func_id) in pending {
-            match unsafe { compiler.jit_function(func_id) } {
-                Ok(fn_ptr) => { functions.insert(hash, fn_ptr.into_inner()); }
-                Err(e) => eprintln!("  JIT failed {}: {e}", &hex::encode(&hash.as_slice()[..8])),
-            }
-        }
-    }
-    eprintln!("Compiled: {}/{}", functions.len(), touched_codes.len());
+        eprintln!("Compiled: {}/{}", functions.len(), touched_codes.len());
+        Arc::new(functions)
+    };
     if let Some(entry_point) = tx_rec.tx.to.as_ref().and_then(|s| s.parse::<Address>().ok()) {
         let entry_hash = tx_rec
             .read
@@ -831,7 +1091,6 @@ fn main() {
         }
         eprintln!("Compiled hash={}.. addrs={addrs:?}", &hex::encode(hash)[..16]);
     }
-    let functions = Arc::new(functions);
 
     // Run plain
     let tx_env = build_tx_env(&tx_rec);

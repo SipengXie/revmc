@@ -3160,6 +3160,7 @@ dependencies = [
  "criterion",
  "hex",
  "k256",
+ "libloading",
  "op-revm",
  "revm",
  "revmc",
