@@ -12,12 +12,12 @@ use op_revm::transaction::OpTransaction;
 use revm::{
     bytecode::Bytecode,
     context::{CfgEnv, Context, TxEnv},
-    context_interface::result::EVMError,
+    context_interface::result::{EVMError, ResultAndState},
     database::{CacheDB, EmptyDB},
     handler::{EvmTr, FrameResult, Handler, ItemOrResult},
     interpreter::interpreter_types::Jumps,
     primitives::{
-        hardfork::SpecId, Address, Bytes, HashMap as RevmHashMap, StorageKey, StorageValue,
+        hardfork::SpecId, keccak256, Address, Bytes, HashMap as RevmHashMap, StorageKey, StorageValue,
         TxKind, B256, U256,
     },
     state::AccountInfo,
@@ -37,10 +37,14 @@ enum TraceFrameInput {
         bytecode_address: Address,
         target_address: Address,
         caller: Address,
+        call_value: U256,
         gas_limit: u64,
         is_static: bool,
         input_len: usize,
+        input_repr: String,
+        input_hash: B256,
         return_len: usize,
+        return_offset: usize,
     },
     Create {
         gas_limit: u64,
@@ -59,6 +63,10 @@ struct TraceEvent {
     from: Address,
     pc: usize,
     gas_remaining: u64,
+    stack_len: usize,
+    stack_top: Option<String>,
+    return_ir: Option<String>,
+    return_gas_remaining: Option<u64>,
     input: TraceFrameInput,
 }
 
@@ -261,24 +269,39 @@ impl Handler for JitHandler {
 
             if self.trace_calls {
                 if let ItemOrResult::Item(init) = &call_or_result {
-                    let (_ctx, _instructions, _precompiles, frame_stack) = evm.all_mut();
+                    let (ctx, _instructions, _precompiles, frame_stack) = evm.all_mut();
                     let frame = frame_stack.get();
                     let depth = init.depth;
                     let from = frame.interpreter.input.target_address;
                     let pc = frame.interpreter.bytecode.pc();
                     let gas_remaining = frame.interpreter.gas.remaining();
+                    let stack_len = frame.interpreter.stack.len();
+                    let stack_top = frame
+                        .interpreter
+                        .stack
+                        .data()
+                        .last()
+                        .map(|w| hex::encode(w.to_be_bytes::<32>()));
                     let input = match &init.frame_input {
                         revm::interpreter::interpreter_action::FrameInput::Call(call) => {
                             let call = call.as_ref();
+                            let input_bytes = call.input.bytes(ctx);
+                            let input_head_len = input_bytes.len().min(16);
+                            let input_repr = hex::encode(&input_bytes[..input_head_len]);
+                            let input_hash = keccak256(&input_bytes);
                             Some(TraceFrameInput::Call {
                                 scheme: call.scheme,
                                 bytecode_address: call.bytecode_address,
                                 target_address: call.target_address,
                                 caller: call.caller,
+                                call_value: call.call_value(),
                                 gas_limit: call.gas_limit,
                                 is_static: call.is_static,
                                 input_len: call.input.len(),
+                                input_repr,
+                                input_hash,
                                 return_len: call.return_memory_offset.len(),
+                                return_offset: call.return_memory_offset.start,
                             })
                         }
                         revm::interpreter::interpreter_action::FrameInput::Create(create) => {
@@ -299,6 +322,10 @@ impl Handler for JitHandler {
                             from,
                             pc,
                             gas_remaining,
+                            stack_len,
+                            stack_top,
+                            return_ir: None,
+                            return_gas_remaining: None,
                             input,
                         });
                     }
@@ -320,6 +347,13 @@ impl Handler for JitHandler {
                     let from = frame.interpreter.input.target_address;
                     let pc = frame.interpreter.bytecode.pc();
                     let gas_remaining = frame.interpreter.gas.remaining();
+                    let stack_len = frame.interpreter.stack.len();
+                    let stack_top = frame
+                        .interpreter
+                        .stack
+                        .data()
+                        .last()
+                        .map(|w| hex::encode(w.to_be_bytes::<32>()));
                     let bytecode_hash = frame.interpreter.bytecode.get_or_calculate_hash();
                     let compiled = self.functions.contains_key(&bytecode_hash);
                     self.trace.push(TraceEvent {
@@ -328,6 +362,10 @@ impl Handler for JitHandler {
                         from,
                         pc,
                         gas_remaining,
+                        stack_len,
+                        stack_top,
+                        return_ir: Some(format!("{:?}", result.instruction_result())),
+                        return_gas_remaining: Some(result.gas().remaining()),
                         input: TraceFrameInput::ReturnFromFrame,
                     });
                 }
@@ -346,6 +384,13 @@ impl Handler for JitHandler {
                     let from = frame.interpreter.input.target_address;
                     let pc = frame.interpreter.bytecode.pc();
                     let gas_remaining = frame.interpreter.gas.remaining();
+                    let stack_len = frame.interpreter.stack.len();
+                    let stack_top = frame
+                        .interpreter
+                        .stack
+                        .data()
+                        .last()
+                        .map(|w| hex::encode(w.to_be_bytes::<32>()));
                     let bytecode_hash = frame.interpreter.bytecode.get_or_calculate_hash();
                     let compiled = self.functions.contains_key(&bytecode_hash);
                     self.trace.push(TraceEvent {
@@ -354,6 +399,10 @@ impl Handler for JitHandler {
                         from,
                         pc,
                         gas_remaining,
+                        stack_len,
+                        stack_top,
+                        return_ir: None,
+                        return_gas_remaining: None,
                         input: TraceFrameInput::ResumeParent,
                     });
                 }
@@ -362,13 +411,250 @@ impl Handler for JitHandler {
     }
 }
 
+fn parse_opt_level(args: &[String]) -> OptimizationLevel {
+    if args.iter().any(|a| a == "--o0") {
+        OptimizationLevel::None
+    } else if args.iter().any(|a| a == "--o1") {
+        OptimizationLevel::Less
+    } else if args.iter().any(|a| a == "--o2") {
+        OptimizationLevel::Default
+    } else {
+        OptimizationLevel::Aggressive
+    }
+}
+
+fn load_jsonl_all(path: &str) -> (HashMap<B256, Bytecode>, Vec<TxRecordLine>) {
+    let file = File::open(path).expect("failed to open JSONL");
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+
+    let first_line = lines.next().expect("empty file").expect("read error");
+    let code_line: CodeValuesLine = serde_json::from_str(&first_line).expect("parse code_values");
+    let mut code_values = HashMap::new();
+    for (hash_str, bytecode_str) in &code_line.items {
+        code_values.insert(parse_b256_hex(hash_str), extract_bytecode(bytecode_str));
+    }
+
+    let mut tx_records = Vec::new();
+    for line in lines {
+        let line = line.expect("read error");
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(rec) = serde_json::from_str::<TxRecordLine>(&line) {
+            tx_records.push(rec);
+        }
+    }
+
+    (code_values, tx_records)
+}
+
+fn compile_all_contracts(
+    code_values: &HashMap<B256, Bytecode>,
+    opt: OptimizationLevel,
+) -> Arc<HashMap<B256, RawEvmCompilerFn>> {
+    let mut contracts: Vec<(B256, &Bytecode)> = code_values
+        .iter()
+        .filter(|(_, bc)| !bc.is_empty())
+        .map(|(h, bc)| (*h, bc))
+        .collect();
+    contracts.sort_by_key(|(_, bc)| std::cmp::Reverse(bc.original_byte_slice().len()));
+
+    eprintln!(
+        "Compiling {} non-empty contracts with ETH_SPEC={ETH_SPEC:?}, opt={opt:?}",
+        contracts.len()
+    );
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(16))
+        .unwrap_or(4);
+    eprintln!("Compile threads: {n_threads}");
+
+    // Round-robin assignment so large contracts are spread across threads.
+    let mut assignments: Vec<Vec<(B256, &Bytecode)>> = vec![Vec::new(); n_threads];
+    for (i, contract) in contracts.into_iter().enumerate() {
+        assignments[i % n_threads].push(contract);
+    }
+
+    let thread_results: Vec<HashMap<B256, RawEvmCompilerFn>> = std::thread::scope(|s| {
+        let handles: Vec<_> = assignments
+            .into_iter()
+            .enumerate()
+            .map(|(tid, chunk)| {
+                s.spawn(move || {
+                    let context = Box::leak(Box::new(revmc::llvm::inkwell::context::Context::create()));
+                    let backend = EvmLlvmBackend::new(context, false, opt).expect("LLVM backend");
+                    let compiler: &'static mut EvmCompiler<EvmLlvmBackend<'static>> =
+                        Box::leak(Box::new(EvmCompiler::new(backend)));
+
+                    let mut pending = Vec::new();
+                    for (hash, bc) in &chunk {
+                        let name = format!("c_{}", &hex::encode(hash)[..16]);
+                        match compiler.translate(&name, bc.original_byte_slice(), ETH_SPEC) {
+                            Ok(func_id) => pending.push((*hash, func_id)),
+                            Err(e) => eprintln!("  [T{tid}] WARN translate failed {name}: {e}"),
+                        }
+                    }
+
+                    let mut functions = HashMap::new();
+                    for (hash, func_id) in pending {
+                        match unsafe { compiler.jit_function(func_id) } {
+                            Ok(fn_ptr) => {
+                                functions.insert(hash, fn_ptr.into_inner());
+                            }
+                            Err(e) => {
+                                eprintln!("  [T{tid}] WARN JIT failed {}: {e}", &hex::encode(hash)[..16])
+                            }
+                        }
+                    }
+                    eprintln!("  [T{tid}] compiled {}", functions.len());
+                    functions
+                })
+            })
+            .collect();
+
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut functions = HashMap::new();
+    for thread_map in thread_results {
+        functions.extend(thread_map);
+    }
+    eprintln!("Compiled functions: {}", functions.len());
+    Arc::new(functions)
+}
+
+fn run_full_correctness(path: &str, args: &[String]) -> i32 {
+    let (code_values, tx_records) = load_jsonl_all(path);
+    eprintln!("Loaded code_values={} tx_records={}", code_values.len(), tx_records.len());
+
+    let opt = parse_opt_level(args);
+    let functions = compile_all_contracts(&code_values, opt);
+    let empty_functions: Arc<HashMap<B256, RawEvmCompilerFn>> = Arc::new(HashMap::new());
+
+    let mut matched = 0usize;
+    let mut mismatched = 0usize;
+    let mut plain_failed = 0usize;
+    let mut jit_failed = 0usize;
+
+    for (i, tx_rec) in tx_records.iter().enumerate() {
+        if i % 25 == 0 {
+            eprintln!("Progress: {}/{}", i, tx_records.len());
+        }
+
+        let tx_env = build_tx_env(tx_rec);
+        let mut cfg: CfgEnv<OpSpecId> = CfgEnv::new_with_spec(OP_SPEC);
+        cfg.chain_id = tx_env.base.chain_id.unwrap_or(8453);
+        cfg.tx_chain_id_check = false;
+
+        let plain = {
+            let db_plain = build_cache_db(tx_rec, &code_values);
+            let ctx = Context::op().with_db(db_plain).with_cfg(cfg.clone()).with_tx(tx_env.clone());
+            let mut evm: OpEvm<_, ()> = OpEvm::new(ctx, ());
+            let mut handler_plain = JitHandler {
+                functions: empty_functions.clone(),
+                trace_calls: false,
+                trace: Vec::new(),
+            };
+            match handler_plain.run(&mut evm) {
+                Ok(frame_result) => {
+                    let state = evm.ctx().journaled_state.finalize();
+                    Ok(ResultAndState::new(frame_result, state))
+                }
+                Err(e) => Err(format!("{e:?}")),
+            }
+        };
+
+        let jit = {
+            let db_jit = build_cache_db(tx_rec, &code_values);
+            let ctx = Context::op().with_db(db_jit).with_cfg(cfg).with_tx(tx_env);
+            let mut evm: OpEvm<_, ()> = OpEvm::new(ctx, ());
+            let mut handler = JitHandler { functions: functions.clone(), trace_calls: false, trace: Vec::new() };
+            match handler.run(&mut evm) {
+                Ok(frame_result) => {
+                    let state = evm.ctx().journaled_state.finalize();
+                    Ok(ResultAndState::new(frame_result, state))
+                }
+                Err(e) => Err(format!("{e:?}")),
+            }
+        };
+
+        let is_match = match (&plain, &jit) {
+            (Ok(a), Ok(b)) => a == b,
+            (Err(a), Err(b)) => a == b,
+            _ => false,
+        };
+
+        if is_match {
+            matched += 1;
+            continue;
+        }
+
+        mismatched += 1;
+        match (&plain, &jit) {
+            (Ok(a), Ok(b)) => {
+                eprintln!(
+                    "MISMATCH tx#{}: result_eq={} state_eq={} gas_plain={} gas_jit={} state_plain={} state_jit={}",
+                    tx_rec.tx_index,
+                    a.result == b.result,
+                    a.state == b.state,
+                    a.result.gas_used(),
+                    b.result.gas_used(),
+                    a.state.len(),
+                    b.state.len(),
+                );
+            }
+            (Err(a), Err(b)) => {
+                plain_failed += 1;
+                jit_failed += 1;
+                eprintln!("MISMATCH tx#{}: plain_err={a} jit_err={b}", tx_rec.tx_index);
+            }
+            (Err(a), Ok(_)) => {
+                plain_failed += 1;
+                eprintln!("MISMATCH tx#{}: plain_err={a} jit_ok", tx_rec.tx_index);
+            }
+            (Ok(_), Err(b)) => {
+                jit_failed += 1;
+                eprintln!("MISMATCH tx#{}: plain_ok jit_err={b}", tx_rec.tx_index);
+            }
+        }
+    }
+
+    eprintln!("\n=== Full Correctness Summary ===");
+    eprintln!("Total tx: {}", tx_records.len());
+    eprintln!("MATCH:    {matched}");
+    eprintln!("MISMATCH: {mismatched}");
+    eprintln!("plain_err: {plain_failed}, jit_err: {jit_failed}");
+    if mismatched == 0 {
+        eprintln!("ALL MATCH (result + state + gas)");
+        0
+    } else {
+        1
+    }
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let path = args.iter().position(|a| a == "--path").and_then(|i| args.get(i + 1)).map(|s| s.as_str()).expect("--path required");
-    let target_tx: u64 = args.iter().position(|a| a == "--tx").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).expect("--tx required");
+    let target_tx: Option<u64> = args
+        .iter()
+        .position(|a| a == "--tx")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok());
     let trace_calls = args.iter().any(|a| a == "--trace-calls") || std::env::var("REVM_C_TRACE_CALLS").is_ok();
+
+    if target_tx.is_none() {
+        if trace_calls {
+            eprintln!("WARN: --trace-calls is ignored in full mode");
+        }
+        let exit_code = run_full_correctness(path, &args);
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+        return;
+    }
+    let target_tx = target_tx.expect("--tx parsing should have succeeded");
 
     eprintln!("Loading JSONL: {path}");
     let file = File::open(path).unwrap();
@@ -419,15 +705,7 @@ fn main() {
 
     // Compile only the bytecodes this tx touches
     eprintln!("\nCompiling {} contracts with ETH_SPEC={ETH_SPEC:?}...", touched_codes.len());
-    let opt = if args.iter().any(|a| a == "--o0") {
-        OptimizationLevel::None
-    } else if args.iter().any(|a| a == "--o1") {
-        OptimizationLevel::Less
-    } else if args.iter().any(|a| a == "--o2") {
-        OptimizationLevel::Default
-    } else {
-        OptimizationLevel::Aggressive
-    };
+    let opt = parse_opt_level(&args);
     eprintln!("  Optimization level: {opt:?}");
     let separate_modules = args.iter().any(|a| a == "--separate-modules");
     if separate_modules {
@@ -608,6 +886,41 @@ fn main() {
                     break;
                 }
             }
+
+            if let Ok(n_dump) = std::env::var("REVM_C_DUMP_ALL_EVENTS") {
+                let n_dump = n_dump.parse::<usize>().unwrap_or(200);
+                eprintln!("\n--- Plain all events (first {n_dump}) ---");
+                for (i, e) in handler_plain.trace.iter().take(n_dump).enumerate() {
+                    eprintln!(
+                        "  plain_all[{i}] depth={} from={} pc={} gas_remaining={} stack_len={} stack_top={:?} return_ir={:?} return_gas_remaining={:?} input={:?}",
+                        e.depth,
+                        e.from,
+                        e.pc,
+                        e.gas_remaining,
+                        e.stack_len,
+                        e.stack_top,
+                        e.return_ir,
+                        e.return_gas_remaining,
+                        e.input
+                    );
+                }
+                eprintln!("\n--- JIT all events (first {n_dump}) ---");
+                for (i, e) in handler.trace.iter().take(n_dump).enumerate() {
+                    eprintln!(
+                        "  jit_all[{i}] depth={} compiled={} from={} pc={} gas_remaining={} stack_len={} stack_top={:?} return_ir={:?} return_gas_remaining={:?} input={:?}",
+                        e.depth,
+                        e.compiled,
+                        e.from,
+                        e.pc,
+                        e.gas_remaining,
+                        e.stack_len,
+                        e.stack_top,
+                        e.return_ir,
+                        e.return_gas_remaining,
+                        e.input
+                    );
+                }
+            }
         }
 
         let entry_point: Option<Address> = tx_rec.tx.to.as_ref().and_then(|s| s.parse().ok());
@@ -629,12 +942,28 @@ fn main() {
             eprintln!("Plain events: {}", plain_calls.len());
             eprintln!("JIT events:   {}", jit_calls.len());
             for (i, e) in plain_calls.iter().enumerate() {
-                eprintln!("  plain[{i}] pc={} gas_remaining={} input={:?}", e.pc, e.gas_remaining, e.input);
+                eprintln!(
+                    "  plain[{i}] pc={} gas_remaining={} stack_len={} stack_top={:?} return_ir={:?} return_gas_remaining={:?} input={:?}",
+                    e.pc,
+                    e.gas_remaining,
+                    e.stack_len,
+                    e.stack_top,
+                    e.return_ir,
+                    e.return_gas_remaining,
+                    e.input
+                );
             }
             for (i, e) in jit_calls.iter().enumerate() {
                 eprintln!(
-                    "  jit[{i}] compiled={} pc={} gas_remaining={} input={:?}",
-                    e.compiled, e.pc, e.gas_remaining, e.input
+                    "  jit[{i}] compiled={} pc={} gas_remaining={} stack_len={} stack_top={:?} return_ir={:?} return_gas_remaining={:?} input={:?}",
+                    e.compiled,
+                    e.pc,
+                    e.gas_remaining,
+                    e.stack_len,
+                    e.stack_top,
+                    e.return_ir,
+                    e.return_gas_remaining,
+                    e.input
                 );
             }
             let n = plain_calls.len().min(jit_calls.len());
