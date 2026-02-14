@@ -26,7 +26,7 @@ use revm::{
         TxKind, B256, U256,
     },
     state::AccountInfo,
-    ExecuteEvm,
+
 };
 use revmc::{EvmCompiler, EvmLlvmBackend, OptimizationLevel};
 use revmc_builtins as _;
@@ -277,11 +277,6 @@ struct CompiledContracts {
     _libraries: Vec<libloading::Library>,
 }
 
-#[derive(Default)]
-struct CacheStats {
-    hits: usize,
-    misses: usize,
-}
 
 struct CacheArtifacts {
     key: String,
@@ -387,48 +382,6 @@ fn compile_contract_jit_fallback(
     unsafe { compiler.jit_function(func_id).ok().map(|f| f.into_inner()) }
 }
 
-fn load_or_compile_cached_contract(
-    hash: B256,
-    bytecode: &Bytecode,
-    opt: OptimizationLevel,
-    cache_dir: &Path,
-    stats: &mut CacheStats,
-) -> Option<(RawEvmCompilerFn, libloading::Library)> {
-    let artifacts = cache_artifacts(cache_dir, &hash, opt);
-    let has_cache = artifacts.object.exists() && artifacts.library.exists();
-    if has_cache {
-        match load_cached_symbol(&artifacts) {
-            Ok(loaded) => {
-                stats.hits += 1;
-                return Some(loaded);
-            }
-            Err(e) => {
-                eprintln!(
-                    "  Cache stale/unloadable for {}.. ({}), recompiling",
-                    &hex::encode(hash)[..16],
-                    e
-                );
-            }
-        }
-    }
-
-    stats.misses += 1;
-    if let Err(e) = compile_contract_to_cache(bytecode, opt, &artifacts) {
-        eprintln!("  WARN cache compile failed {}..: {e}", &hex::encode(hash)[..16]);
-        return None;
-    }
-
-    match load_cached_symbol(&artifacts) {
-        Ok(loaded) => Some(loaded),
-        Err(e) => {
-            eprintln!(
-                "  WARN cache load after compile failed {}..: {e}",
-                &hex::encode(hash)[..16]
-            );
-            None
-        }
-    }
-}
 
 fn compile_all_contracts_with_cache(
     code_values: &HashMap<B256, Bytecode>,
@@ -438,6 +391,7 @@ fn compile_all_contracts_with_cache(
     std::fs::create_dir_all(cache_dir)
         .unwrap_or_else(|e| panic!("failed to create cache dir {}: {e}", cache_dir.display()));
 
+    // Collect non-empty contracts, sorted by size descending for load balancing
     let mut contracts: Vec<(B256, &Bytecode)> = code_values
         .iter()
         .filter(|(_, bc)| !bc.is_empty())
@@ -445,41 +399,126 @@ fn compile_all_contracts_with_cache(
         .collect();
     contracts.sort_by_key(|(_, bc)| std::cmp::Reverse(bc.original_byte_slice().len()));
 
-    eprintln!(
-        "  Using persistent cache: dir={} contracts={} opt={opt:?}",
-        cache_dir.display(),
-        contracts.len()
-    );
+    // Phase 1: Partition by cache status
+    let mut cached = Vec::new();
+    let mut to_compile: Vec<(B256, &Bytecode, CacheArtifacts)> = Vec::new();
+    for (hash, bytecode) in &contracts {
+        let artifacts = cache_artifacts(cache_dir, hash, opt);
+        if artifacts.object.exists() && artifacts.library.exists() {
+            cached.push((*hash, artifacts));
+        } else {
+            to_compile.push((*hash, *bytecode, artifacts));
+        }
+    }
 
+    // Phase 2: Load cached contracts
     let mut functions = HashMap::new();
     let mut libraries = Vec::new();
-    let mut stats = CacheStats::default();
-    let mut jit_fallbacks = 0usize;
+    let mut hits = 0usize;
+    for (hash, artifacts) in cached {
+        match load_cached_symbol(&artifacts) {
+            Ok((f, lib)) => {
+                functions.insert(hash, f);
+                libraries.push(lib);
+                hits += 1;
+            }
+            Err(e) => {
+                eprintln!("  Cache stale for {}..: {e}", &hex::encode(hash)[..16]);
+                let bytecode = code_values.get(&hash).unwrap();
+                to_compile.push((hash, bytecode, artifacts));
+            }
+        }
+    }
 
-    for (hash, bytecode) in contracts {
-        if functions.contains_key(&hash) {
-            continue;
-        }
-        if let Some((function, library)) =
-            load_or_compile_cached_contract(hash, bytecode, opt, cache_dir, &mut stats)
-        {
-            functions.insert(hash, function);
-            libraries.push(library);
-            continue;
-        }
-        if let Some(function) = compile_contract_jit_fallback(hash, bytecode, opt) {
-            jit_fallbacks += 1;
-            functions.insert(hash, function);
-            eprintln!(
-                "  WARN using JIT fallback for {}.. (cache unavailable)",
-                &hex::encode(hash)[..16]
-            );
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(16))
+        .unwrap_or(4);
+    eprintln!(
+        "  Persistent cache: dir={} hits={} to_compile={} threads={}",
+        cache_dir.display(),
+        hits,
+        to_compile.len(),
+        n_threads,
+    );
+
+    if to_compile.is_empty() {
+        return CompiledContracts {
+            functions: Arc::new(functions),
+            _libraries: libraries,
+        };
+    }
+
+    // Phase 3: Parallel compile cache misses
+    // Round-robin assignment (already sorted by size desc) for even load distribution
+    let mut assignments: Vec<Vec<(B256, &Bytecode, CacheArtifacts)>> =
+        (0..n_threads).map(|_| Vec::new()).collect();
+    for (i, item) in to_compile.into_iter().enumerate() {
+        assignments[i % n_threads].push(item);
+    }
+
+    let thread_results: Vec<Vec<(B256, RawEvmCompilerFn, Option<libloading::Library>)>> =
+        std::thread::scope(|s| {
+            let handles: Vec<_> = assignments
+                .into_iter()
+                .enumerate()
+                .map(|(tid, chunk)| {
+                    s.spawn(move || {
+                        let total = chunk.len();
+                        let mut results = Vec::with_capacity(total);
+                        for (hash, bytecode, artifacts) in chunk {
+                            // Try AOT: compile → write .o → link .so → dlopen
+                            if let Err(e) = compile_contract_to_cache(bytecode, opt, &artifacts) {
+                                eprintln!(
+                                    "  [T{tid}] AOT failed {}..: {e}",
+                                    &hex::encode(hash)[..16]
+                                );
+                                if let Some(f) = compile_contract_jit_fallback(hash, bytecode, opt)
+                                {
+                                    results.push((hash, f, None));
+                                }
+                                continue;
+                            }
+                            match load_cached_symbol(&artifacts) {
+                                Ok((f, lib)) => results.push((hash, f, Some(lib))),
+                                Err(e) => {
+                                    eprintln!(
+                                        "  [T{tid}] cache load failed {}..: {e}",
+                                        &hex::encode(hash)[..16]
+                                    );
+                                    if let Some(f) =
+                                        compile_contract_jit_fallback(hash, bytecode, opt)
+                                    {
+                                        results.push((hash, f, None));
+                                    }
+                                }
+                            }
+                        }
+                        eprintln!("  [T{tid}] done: {}/{total} compiled", results.len());
+                        results
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+    // Phase 4: Merge
+    let mut jit_fallbacks = 0usize;
+    for thread_result in thread_results {
+        for (hash, f, lib) in thread_result {
+            functions.insert(hash, f);
+            if let Some(lib) = lib {
+                libraries.push(lib);
+            } else {
+                jit_fallbacks += 1;
+            }
         }
     }
 
     eprintln!(
-        "  Cache stats: hits={} misses={} jit_fallbacks={}",
-        stats.hits, stats.misses, jit_fallbacks
+        "  Total: {} compiled (hits={} jit_fallbacks={})",
+        functions.len(),
+        hits,
+        jit_fallbacks,
     );
 
     CompiledContracts {
@@ -593,11 +632,46 @@ fn compile_all_contracts(code_values: &HashMap<B256, Bytecode>) -> CompiledContr
     }
 }
 
-// ── JIT Handler ─────────────────────────────────────────────────────────────
+// ── Handlers ────────────────────────────────────────────────────────────────
 
 type BenchEvm = OpEvm<op_revm::OpContext<CacheDB<EmptyDB>>, ()>;
 type BenchError = EVMError<core::convert::Infallible, OpTransactionError>;
 
+/// Standard exec loop using the native interpreter (no JIT).
+struct NativeHandler;
+
+impl Handler for NativeHandler {
+    type Evm = BenchEvm;
+    type Error = BenchError;
+    type HaltReason = OpHaltReason;
+
+    fn run_exec_loop(
+        &mut self,
+        evm: &mut Self::Evm,
+        first_frame_input: revm::interpreter::interpreter_action::FrameInit,
+    ) -> Result<FrameResult, Self::Error> {
+        let res = evm.frame_init(first_frame_input)?;
+        if let ItemOrResult::Result(frame_result) = res {
+            return Ok(frame_result);
+        }
+
+        loop {
+            let call_or_result = evm.frame_run()?;
+            let result = match call_or_result {
+                ItemOrResult::Item(init) => match evm.frame_init(init)? {
+                    ItemOrResult::Item(_) => continue,
+                    ItemOrResult::Result(result) => result,
+                },
+                ItemOrResult::Result(result) => result,
+            };
+            if let Some(result) = evm.frame_return_result(result)? {
+                return Ok(result);
+            }
+        }
+    }
+}
+
+/// JIT exec loop: looks up compiled functions by bytecode hash, falls back to interpreter.
 struct JitHandler {
     functions: Arc<HashMap<B256, RawEvmCompilerFn>>,
 }
@@ -666,13 +740,14 @@ fn execute_plain(db: CacheDB<EmptyDB>, tx: OpTransaction<TxEnv>) -> Result<(u64,
     let ctx = Context::op()
         .with_db(db)
         .with_cfg(cfg)
-        .with_tx(tx.clone());
+        .with_tx(tx);
     let mut evm: OpEvm<_, ()> = OpEvm::new(ctx, ());
 
+    let mut handler = NativeHandler;
     let start = Instant::now();
-    let result = evm.transact(tx).map_err(|e| format!("{e:?}"))?;
+    let exec_result = handler.run(&mut evm).map_err(|e| format!("{e:?}"))?;
     let elapsed = start.elapsed();
-    Ok((result.result.gas_used(), elapsed))
+    Ok((exec_result.gas_used(), elapsed))
 }
 
 fn execute_jit(

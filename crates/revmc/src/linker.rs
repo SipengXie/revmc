@@ -1,4 +1,17 @@
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+fn has_lld() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::process::Command::new("lld")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
+}
 
 /// EVM bytecode compiler linker.
 #[derive(Debug)]
@@ -63,7 +76,7 @@ impl Linker {
         cmd.arg("-O3");
         if let Some(linker) = &self.linker {
             cmd.arg(format!("-fuse-ld={}", linker.display()));
-        } else if !cfg!(target_vendor = "apple") {
+        } else if !cfg!(target_vendor = "apple") && has_lld() {
             cmd.arg("-fuse-ld=lld");
         }
         if cfg!(target_vendor = "apple") {
