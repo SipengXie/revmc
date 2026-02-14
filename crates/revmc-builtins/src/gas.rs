@@ -133,47 +133,60 @@ pub fn sstore_cost(
 /// Calculate SSTORE refund.
 #[inline]
 pub fn sstore_refund(spec_id: SpecId, result: &SStoreResult) -> i64 {
-    if spec_id.is_enabled_in(SpecId::BERLIN) {
+    // EIP-2200 / EIP-3529 refund logic, matching revm GasParams::sstore_refund exactly.
+    if spec_id.is_enabled_in(SpecId::ISTANBUL) {
+        // EIP-3529: London reduced SSTORE clearing refund from 15000 to 4800
+        let sstore_clears_refund = if spec_id.is_enabled_in(SpecId::LONDON) {
+            (WARM_SSTORE_RESET + ACCESS_LIST_STORAGE_KEY) as i64 // 4800
+        } else {
+            REFUND_SSTORE_CLEARS // 15000
+        };
+
+        // Restore refund values depend on Berlin
+        let (set_refund, reset_refund) = if spec_id.is_enabled_in(SpecId::BERLIN) {
+            (
+                (SSTORE_SET - WARM_STORAGE_READ_COST) as i64,       // 19900
+                (WARM_SSTORE_RESET - WARM_STORAGE_READ_COST) as i64, // 2800
+            )
+        } else {
+            (
+                (SSTORE_SET - ISTANBUL_SLOAD_GAS) as i64,  // 19200
+                (SSTORE_RESET - ISTANBUL_SLOAD_GAS) as i64, // 4200
+            )
+        };
+
+        // No-op: new == present
+        if result.new_value == result.present_value {
+            return 0;
+        }
+
+        // Clean store: original == present, setting to zero
+        if result.original_value == result.present_value && result.new_value.is_zero() {
+            return sstore_clears_refund;
+        }
+
         let mut refund = 0i64;
-        if result.original_value != result.present_value
-            && result.original_value == result.new_value
-        {
-            if result.original_value.is_zero() {
-                refund += (SSTORE_SET - WARM_STORAGE_READ_COST) as i64;
-            } else {
-                refund += (WARM_SSTORE_RESET - WARM_STORAGE_READ_COST) as i64;
+
+        // Dirty store clearing/restoring refunds (only when original != 0)
+        if !result.original_value.is_zero() {
+            if result.present_value.is_zero() {
+                // Slot was cleared, now being restored — undo previous clearing refund
+                refund -= sstore_clears_refund;
+            } else if result.new_value.is_zero() {
+                // Slot being cleared from dirty non-zero state
+                refund += sstore_clears_refund;
             }
         }
-        if !result.present_value.is_zero() && result.new_value.is_zero() {
-            refund += REFUND_SSTORE_CLEARS;
-        }
-        if !result.original_value.is_zero()
-            && result.present_value.is_zero()
-            && result.new_value == result.original_value
-        {
-            refund -= REFUND_SSTORE_CLEARS;
-        }
-        refund
-    } else if spec_id.is_enabled_in(SpecId::ISTANBUL) {
-        let mut refund = 0i64;
-        if result.original_value != result.present_value
-            && result.original_value == result.new_value
-        {
+
+        // Reset refund: original == new (restoring to original value)
+        if result.original_value == result.new_value {
             if result.original_value.is_zero() {
-                refund += (SSTORE_SET - ISTANBUL_SLOAD_GAS) as i64;
+                refund += set_refund;
             } else {
-                refund += (SSTORE_RESET - ISTANBUL_SLOAD_GAS) as i64;
+                refund += reset_refund;
             }
         }
-        if !result.present_value.is_zero() && result.new_value.is_zero() {
-            refund += REFUND_SSTORE_CLEARS;
-        }
-        if !result.original_value.is_zero()
-            && result.present_value.is_zero()
-            && result.new_value == result.original_value
-        {
-            refund -= REFUND_SSTORE_CLEARS;
-        }
+
         refund
     } else if !result.present_value.is_zero() && result.new_value.is_zero() {
         REFUND_SSTORE_CLEARS

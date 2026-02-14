@@ -22,14 +22,25 @@ revmc-builtins = { workspace = true, default-features = false }
 revmc-context = { workspace = true, default-features = false }
 
 revm = { workspace = true, default-features = false }
+op-revm = "15.0"
 
-[dev-dependencies]
-criterion = "0.5"
-hex = "0.4"
-k256 = "0.13"
+# Used by jsonl_bench binary
 revmc = { workspace = true, features = ["llvm-prefer-dynamic"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+hex = "0.4"
+
+[dev-dependencies]
+criterion = "0.5"
+k256 = "0.13"
+
+[[bin]]
+name = "jsonl_bench"
+path = "src/bin/jsonl_bench.rs"
+
+[[bin]]
+name = "gas_debug"
+path = "src/bin/gas_debug.rs"
 
 [[bench]]
 name = "bench_json_test"
