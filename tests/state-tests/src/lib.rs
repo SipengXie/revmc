@@ -695,47 +695,10 @@ fn run_with_jit(
 }
 
 /// Call JIT function with explicit resume_at tracking.
-fn call_jit_with_resume<DB: revm::Database + 'static>(
-    interpreter: &mut Interpreter<EthInterpreter>,
-    ctx: &mut Context<BlockEnv, TxEnv, CfgEnv, DB, Journal<DB>, ()>,
-    jit_fn: EvmCompilerFn,
-    resume_at: usize,
-) -> (revm::interpreter::InstructionResult, usize)
-where
-    DB::Error: std::fmt::Debug,
-{
-    interpreter.bytecode.action = None;
-
-    let (stack, stack_len) = EvmStack::from_interpreter_stack(&mut interpreter.stack);
-    let bytecode_slice = interpreter.bytecode.bytecode_slice();
-    let bytecode_ptr = bytecode_slice.as_ptr();
-    let bytecode_len = bytecode_slice.len();
-    let mut ecx = EvmContext {
-        memory: &mut interpreter.memory,
-        input: &mut interpreter.input,
-        gas: &mut interpreter.gas,
-        host: ctx,
-        next_action: &mut interpreter.bytecode.action,
-        return_data: interpreter.return_data.buffer(),
-        is_static: interpreter.runtime_flag.is_static,
-        resume_at,
-        bytecode_ptr,
-        bytecode_len,
-    };
-
-    let result = unsafe { jit_fn.call(Some(stack), Some(stack_len), &mut ecx) };
-
-    if result == revm::interpreter::InstructionResult::OutOfGas {
-        ecx.gas.spend_all();
-    }
-
-    let new_resume_at = ecx.resume_at;
-    (result, new_resume_at)
-}
-
-/// Call JIT function with explicit resume_at tracking for nested frames.
-/// This is similar to call_jit_with_resume but accepts a generic Host.
-fn call_jit_with_resume_nested<H: revmc::HostExt>(
+///
+/// Constructs an EvmContext from the interpreter state, invokes the JIT function,
+/// and returns the instruction result along with the updated resume_at value.
+fn call_jit_with_resume<H: revmc::HostExt>(
     interpreter: &mut Interpreter<EthInterpreter>,
     host: &mut H,
     jit_fn: EvmCompilerFn,
@@ -744,6 +707,8 @@ fn call_jit_with_resume_nested<H: revmc::HostExt>(
     interpreter.bytecode.action = None;
 
     let (stack, stack_len) = EvmStack::from_interpreter_stack(&mut interpreter.stack);
+    // Extract raw pointer and length before the struct init to avoid borrow conflicts:
+    // bytecode_slice borrows interpreter.bytecode immutably, but next_action needs it mutably.
     let bytecode_slice = interpreter.bytecode.bytecode_slice();
     let bytecode_ptr = bytecode_slice.as_ptr();
     let bytecode_len = bytecode_slice.len();
@@ -829,10 +794,8 @@ where
                 // Track resume_at across nested call suspensions
                 let mut resume_at: usize = 0;
 
-                // Use call_jit_with_resume_nested instead of call_with_interpreter to properly
-                // track resume_at
                 let (result, new_resume_at) =
-                    call_jit_with_resume_nested(&mut nested_interpreter, ctx, jit_fn, resume_at);
+                    call_jit_with_resume(&mut nested_interpreter, ctx, jit_fn, resume_at);
                 resume_at = new_resume_at;
                 let mut last_result = result;
 
@@ -871,7 +834,7 @@ where
                                 inner_return_offset,
                             );
                             // Resume with preserved resume_at
-                            let (result, new_resume_at) = call_jit_with_resume_nested(
+                            let (result, new_resume_at) = call_jit_with_resume(
                                 &mut nested_interpreter,
                                 ctx,
                                 jit_fn,
