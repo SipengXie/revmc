@@ -57,8 +57,8 @@ fn resize_memory_inner(
         // Calculate gas cost for memory expansion
         // memory_gas(num_words, linear_cost, quadratic_cost)
         // MEMORY = 3 (linear cost per word), MEMORY_QUAD_COEFFICIENT = 512 (1/512 for quadratic)
-        let new_cost = crate::gas::memory_gas(new_num_words, 3, 512);
-        let old_cost = crate::gas::memory_gas(current_words, 3, 512);
+        let new_cost = crate::gas::memory_gas(new_num_words);
+        let old_cost = crate::gas::memory_gas(current_words);
         let cost = new_cost.saturating_sub(old_cost);
 
         if !gas.record_cost(cost) {

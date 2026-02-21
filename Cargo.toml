@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*", "examples/*", "fuzz", "tests/state-tests"]
+members = ["crates/*", "examples/runner"]
 default-members = ["crates/revmc-cli"]
 resolver = "2"
 
@@ -77,4 +77,3 @@ strip = false
 
 [profile.bench]
 inherits = "profiling"
-

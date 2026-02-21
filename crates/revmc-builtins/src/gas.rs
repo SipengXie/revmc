@@ -17,9 +17,6 @@ macro_rules! tri {
     };
 }
 
-/// Gas cost for SELFDESTRUCT operation.
-pub const SELFDESTRUCT: i64 = SELFDESTRUCT_REFUND;
-
 /// Minimum gas required for callee.
 pub const MIN_CALLEE_GAS: u64 = 2300;
 

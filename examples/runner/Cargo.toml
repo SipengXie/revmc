@@ -21,15 +21,17 @@ cc = "1.0"
 revmc-builtins = { workspace = true, default-features = false }
 revmc-context = { workspace = true, default-features = false }
 
-revm = { workspace = true, default-features = false }
-op-revm = "15.0"
+revm = { workspace = true, default-features = false, features = ["std", "serde"] }
+op-revm = { git = "ssh://git@github.com/Altius-Parallel-EVM/revm", branch = "jit-integration", default-features = false, features = ["std"] }
 
-# Used by jsonl_bench binary
+# Used by jsonl_bench / bin_bench binaries
 revmc = { workspace = true, features = ["llvm-prefer-dynamic"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
 libloading = "0.8"
+bincode = "1.3"
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 criterion = "0.5"
@@ -38,6 +40,10 @@ k256 = "0.13"
 [[bin]]
 name = "jsonl_bench"
 path = "src/bin/jsonl_bench.rs"
+
+[[bin]]
+name = "bin_bench"
+path = "src/bin/bin_bench.rs"
 
 [[bin]]
 name = "gas_debug"
