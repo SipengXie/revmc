@@ -5,4 +5,5 @@ clif
 /tmp
 .omc/
 *AGENTS.md
-*.log
+*.log.planning/
+.planning/

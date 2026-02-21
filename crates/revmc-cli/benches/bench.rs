@@ -36,7 +36,7 @@ fn run_bench(c: &mut Criterion, bench: &Bench) {
 
     let bytecode_raw = Bytecode::new_raw(revmc::primitives::Bytes::copy_from_slice(bytecode));
 
-    let mut host = DummyHost::new(SPEC_ID);
+    let mut host = DummyHost;
 
     let table = instruction_table::<EthInterpreter, DummyHost>();
 

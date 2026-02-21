@@ -145,7 +145,7 @@ fn main() -> Result<()> {
     let bytecode_raw = Bytecode::new_raw(revmc::primitives::Bytes::copy_from_slice(&bytecode));
     let bytecode_slice = bytecode_raw.original_byte_slice();
 
-    let mut host = DummyHost::new(spec_id);
+    let mut host = DummyHost;
 
     if !stack_input.is_empty() {
         compiler.inspect_stack_length(true);
