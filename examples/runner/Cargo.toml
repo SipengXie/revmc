@@ -46,6 +46,18 @@ name = "bin_bench"
 path = "src/bin/bin_bench.rs"
 
 [[bin]]
+name = "precompile"
+path = "src/bin/precompile.rs"
+
+[[bin]]
+name = "compile_profile"
+path = "src/bin/compile_profile.rs"
+
+[[bin]]
+name = "scan_codes"
+path = "src/bin/scan_codes.rs"
+
+[[bin]]
 name = "gas_debug"
 path = "src/bin/gas_debug.rs"
 

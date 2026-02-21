@@ -785,6 +785,10 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     count: u64,
 
+    /// Step between sampled blocks (e.g. 1000 = every 1000th block)
+    #[arg(long, default_value_t = 1000)]
+    step: u64,
+
     /// Persistent AOT cache directory
     #[arg(long)]
     cache_dir: Option<String>,
@@ -793,12 +797,15 @@ struct Args {
 fn main() {
     let args = Args::parse();
     let bench_dir = Path::new(&args.dir);
-    let end = args.end.unwrap_or(args.start + args.count - 1);
-    let block_range: Vec<u64> = (args.start..=end).collect();
+    let block_range: Vec<u64> = if let Some(end) = args.end {
+        (args.start..=end).collect()
+    } else {
+        (0..args.count).map(|i| args.start + i * args.step).collect()
+    };
 
     println!(
-        "=== Bin JIT Benchmark: blocks {}..={} ({} blocks) ===\n",
-        args.start, end, block_range.len()
+        "=== Bin JIT Benchmark: {} blocks (start={}, step={}) ===\n",
+        block_range.len(), args.start, args.step,
     );
 
     // Phase 1: Load all blocks
