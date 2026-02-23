@@ -4,13 +4,13 @@ use std::time::{Duration, Instant};
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
-const FIXTURE_RELATIVE_PATH: &str = "data/uniswap-t100-c20.json";
+const FIXTURE_RELATIVE_PATH: &str = "data/curve-stableswap-2pool.json";
 
-pub fn bench_first_uniswap_tx(c: &mut Criterion) {
+pub fn bench_curve_stableswap(c: &mut Criterion) {
     let fixture =
         bench_common::Fixture::load(FIXTURE_RELATIVE_PATH).expect("failed to load JSON fixture");
 
-    let mut group = c.benchmark_group("uniswap_first_transaction");
+    let mut group = c.benchmark_group("curve_stableswap");
     group.bench_function("plain_execution", |b| {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
@@ -38,5 +38,5 @@ pub fn bench_first_uniswap_tx(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_first_uniswap_tx);
+criterion_group!(benches, bench_curve_stableswap);
 criterion_main!(benches);

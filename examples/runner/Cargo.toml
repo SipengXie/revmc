@@ -65,3 +65,13 @@ path = "src/bin/gas_debug.rs"
 name = "bench_json_test"
 path = "src/bench_json_test.rs"
 harness = false
+
+[[bench]]
+name = "bench_burntpix"
+path = "src/bench_burntpix.rs"
+harness = false
+
+[[bench]]
+name = "bench_curve"
+path = "src/bench_curve.rs"
+harness = false
