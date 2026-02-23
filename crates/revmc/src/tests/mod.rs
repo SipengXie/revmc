@@ -855,13 +855,14 @@ tests! {
             expected_stack: &[],
             expected_memory: &0x69_U256.to_be_bytes::<32>(),
             expected_gas: GAS_WHAT_INTERPRETER_SAYS,
-            expected_next_action: InterpreterAction::NewFrame(FrameInput::Create(Box::new(CreateInputs::new(
-                DEF_ADDR,
-                context_interface::CreateScheme::Create,
-                0x42_U256,
-                Bytes::copy_from_slice(&0x69_U256.to_be_bytes::<32>()),
-                66917,
-            )))),
+            expected_next_action: InterpreterAction::NewFrame(FrameInput::Create(Box::new(CreateInputs {
+                caller: DEF_ADDR,
+                scheme: context_interface::CreateScheme::Create,
+                value: 0x42_U256,
+                init_code: Bytes::copy_from_slice(&0x69_U256.to_be_bytes::<32>()),
+                gas_limit: 66917,
+                skip_nonce_bump: false,
+            }))),
         }),
         create2(@raw {
             bytecode: &[op::PUSH1, 0x69, op::PUSH0, op::MSTORE, op::PUSH1, 100, op::PUSH1, 32, op::PUSH0, op::PUSH1, 0x42, op::CREATE2],
@@ -870,13 +871,14 @@ tests! {
             expected_stack: &[],
             expected_memory: &0x69_U256.to_be_bytes::<32>(),
             expected_gas: GAS_WHAT_INTERPRETER_SAYS,
-            expected_next_action: InterpreterAction::NewFrame(FrameInput::Create(Box::new(CreateInputs::new(
-                DEF_ADDR,
-                context_interface::CreateScheme::Create2 { salt: 100_U256 },
-                0x42_U256,
-                Bytes::copy_from_slice(&0x69_U256.to_be_bytes::<32>()),
-                66908,
-            )))),
+            expected_next_action: InterpreterAction::NewFrame(FrameInput::Create(Box::new(CreateInputs {
+                caller: DEF_ADDR,
+                scheme: context_interface::CreateScheme::Create2 { salt: 100_U256 },
+                value: 0x42_U256,
+                init_code: Bytes::copy_from_slice(&0x69_U256.to_be_bytes::<32>()),
+                gas_limit: 66908,
+                skip_nonce_bump: false,
+            }))),
         }),
         call(@raw {
             bytecode: &[

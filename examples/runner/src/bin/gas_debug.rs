@@ -191,7 +191,7 @@ fn build_cache_db(tx: &TxRecordLine, code_values: &HashMap<B256, Bytecode>) -> C
             _ => continue,
         };
         let bytecode = code_values.get(&code_hash).cloned();
-        db.insert_account_info(addr, AccountInfo { balance, nonce, code_hash, account_id: None, code: bytecode });
+        db.insert_account_info(addr, AccountInfo { balance, nonce, code_hash, code: bytecode });
         if let Some(storage) = storage_by_addr.remove(&acc.addr) {
             db.replace_account_storage(addr, storage).unwrap();
         }
@@ -246,14 +246,14 @@ impl Handler for JitHandler {
         }
         loop {
             let raw_fn = {
-                let (_ctx, _instructions, _precompiles, frame_stack) = evm.all_mut();
+                let frame_stack = &mut evm.0.frame_stack;
                 let frame = frame_stack.get();
                 let bytecode_hash = frame.interpreter.bytecode.get_or_calculate_hash();
                 self.functions.get(&bytecode_hash).copied()
             };
 
             let (compiled, call_or_result) = if let Some(raw_fn) = raw_fn {
-                let (ctx, _instructions, _precompiles, frame_stack) = evm.all_mut();
+                let (ctx, frame_stack) = (&mut evm.0.ctx, &mut evm.0.frame_stack);
                 let frame = frame_stack.get();
                 let f = EvmCompilerFn::new(raw_fn);
                 let action = unsafe { f.call_with_interpreter(&mut frame.interpreter, ctx) };
@@ -270,7 +270,7 @@ impl Handler for JitHandler {
 
             if self.trace_calls {
                 if let ItemOrResult::Item(init) = &call_or_result {
-                    let (ctx, _instructions, _precompiles, frame_stack) = evm.all_mut();
+                    let (ctx, frame_stack) = (&mut evm.0.ctx, &mut evm.0.frame_stack);
                     let frame = frame_stack.get();
                     let depth = init.depth;
                     let from = frame.interpreter.input.target_address;
@@ -308,10 +308,10 @@ impl Handler for JitHandler {
                         revm::interpreter::interpreter_action::FrameInput::Create(create) => {
                             let create = create.as_ref();
                             Some(TraceFrameInput::Create {
-                                gas_limit: create.gas_limit(),
-                                caller: create.caller(),
-                                value: create.value(),
-                                init_code_len: create.init_code().len(),
+                                gas_limit: create.gas_limit,
+                                caller: create.caller,
+                                value: create.value,
+                                init_code_len: create.init_code.len(),
                             })
                         }
                         revm::interpreter::interpreter_action::FrameInput::Empty => None,
@@ -341,7 +341,7 @@ impl Handler for JitHandler {
             };
 
             if self.trace_calls {
-                let (_ctx, _instructions, _precompiles, frame_stack) = evm.all_mut();
+                let frame_stack = &mut evm.0.frame_stack;
                 let depth = frame_stack.index().map(|i| i + 1).unwrap_or(0);
                 if depth != 0 {
                     let frame = frame_stack.get();
@@ -378,7 +378,7 @@ impl Handler for JitHandler {
             }
 
             if self.trace_calls {
-                let (_ctx, _instructions, _precompiles, frame_stack) = evm.all_mut();
+                let frame_stack = &mut evm.0.frame_stack;
                 let depth = frame_stack.index().map(|i| i + 1).unwrap_or(0);
                 if depth != 0 {
                     let frame = frame_stack.get();

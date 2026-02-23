@@ -1,13 +1,11 @@
 use super::*;
 use context_interface::{
-    cfg::GasParams,
     context::{SStoreResult, SelfDestructResult, StateLoad},
-    host::LoadError,
-    journaled_state::AccountInfoLoad,
+    journaled_state::AccountLoad,
 };
 use revm_bytecode::opcode as op;
 use revm_interpreter::{
-    instructions::instruction_table_gas_changes_spec, interpreter::ExtBytecode, CallInput, Host,
+    instructions::instruction_table, interpreter::ExtBytecode, CallInput, CancelSource, Host,
     InputsImpl, Interpreter, SharedMemory,
 };
 use revm_primitives::{HashMap, B256};
@@ -125,10 +123,9 @@ pub fn get_opcode_gas(op: u8) -> u64 {
     }
 }
 
-/// Memory gas calculation with proper parameters.
-/// This is a helper that wraps the new 3-argument memory_gas function.
+/// Memory gas calculation helper.
 pub fn memory_gas_cost(num_words: usize) -> u64 {
-    gas::memory_gas(num_words, 3, 512)
+    gas::memory_gas(num_words)
 }
 
 pub struct TestCase<'a> {
@@ -275,7 +272,6 @@ pub struct TestHost {
     pub code_map: &'static HashMap<Address, revm_bytecode::Bytecode>,
     pub selfdestructs: Vec<(Address, Address)>,
     pub logs: Vec<primitives::Log>,
-    pub gas_params: GasParams,
 }
 
 impl Default for TestHost {
@@ -289,17 +285,18 @@ impl TestHost {
         Self::with_spec(DEF_SPEC)
     }
 
-    pub fn with_spec(spec_id: SpecId) -> Self {
+    pub fn with_spec(_spec_id: SpecId) -> Self {
         Self {
             storage: def_storage().clone(),
             transient_storage: HashMap::default(),
             code_map: def_codemap(),
             selfdestructs: Vec::new(),
             logs: Vec::new(),
-            gas_params: GasParams::new_spec(spec_id),
         }
     }
 }
+
+impl CancelSource for TestHost {}
 
 impl Host for TestHost {
     fn basefee(&self) -> U256 {
@@ -312,10 +309,6 @@ impl Host for TestHost {
 
     fn gas_limit(&self) -> U256 {
         U256::from(0x5678)
-    }
-
-    fn gas_params(&self) -> &GasParams {
-        &self.gas_params
     }
 
     fn difficulty(&self) -> U256 {
@@ -356,7 +349,6 @@ impl Host for TestHost {
     }
 
     fn max_initcode_size(&self) -> usize {
-        // EIP-3860: Max initcode size is 2 * MAX_CODE_SIZE = 2 * 24576 = 49152
         49152
     }
 
@@ -368,11 +360,10 @@ impl Host for TestHost {
         &mut self,
         address: Address,
         target: Address,
-        _skip_cold_load: bool,
-    ) -> Result<StateLoad<SelfDestructResult>, LoadError> {
+    ) -> Option<StateLoad<SelfDestructResult>> {
         self.selfdestructs.push((address, target));
 
-        Ok(StateLoad::new(
+        Some(StateLoad::new(
             SelfDestructResult {
                 had_value: false,
                 target_exists: true,
@@ -394,64 +385,53 @@ impl Host for TestHost {
         self.transient_storage.get(&key).copied().unwrap_or(U256::ZERO)
     }
 
-    fn load_account_info_skip_cold_load(
-        &mut self,
-        address: Address,
-        load_code: bool,
-        _skip_cold_load: bool,
-    ) -> Result<AccountInfoLoad<'_>, LoadError> {
-        use revm_state::AccountInfo;
-        use std::borrow::Cow;
-
-        let code = if load_code {
-            // Return actual code if found, otherwise empty bytecode
-            Some(self.code_map.get(&address).cloned().unwrap_or_default())
-        } else {
-            None
-        };
-
-        // Return address byte as balance (test convention)
-        // The balance is the last byte of the address
-        let balance = U256::from(address.0[19]);
-
-        // Calculate code hash from the actual bytecode
-        let code_hash = if let Some(bytecode) = self.code_map.get(&address) {
-            keccak256(bytecode.original_byte_slice())
-        } else {
-            KECCAK_EMPTY
-        };
-
-        // Create owned account info
-        let info = AccountInfo { balance, nonce: 0, code_hash, account_id: None, code };
-
-        let is_empty = info.code.is_none() && info.balance.is_zero() && info.nonce == 0;
-
-        Ok(AccountInfoLoad { account: Cow::Owned(info), is_cold: false, is_empty })
-    }
-
-    fn sstore_skip_cold_load(
+    fn sstore(
         &mut self,
         _address: Address,
         key: U256,
         value: U256,
-        _skip_cold_load: bool,
-    ) -> Result<StateLoad<SStoreResult>, LoadError> {
+    ) -> Option<StateLoad<SStoreResult>> {
         let original = self.storage.get(&key).copied().unwrap_or(U256::ZERO);
         self.storage.insert(key, value);
-        Ok(StateLoad::new(
+        Some(StateLoad::new(
             SStoreResult { original_value: original, present_value: original, new_value: value },
             false,
         ))
     }
 
-    fn sload_skip_cold_load(
-        &mut self,
-        _address: Address,
-        key: U256,
-        _skip_cold_load: bool,
-    ) -> Result<StateLoad<U256>, LoadError> {
+    fn sload(&mut self, _address: Address, key: U256) -> Option<StateLoad<U256>> {
         let value = self.storage.get(&key).copied().unwrap_or(U256::ZERO);
-        Ok(StateLoad::new(value, false))
+        Some(StateLoad::new(value, false))
+    }
+
+    fn balance(&mut self, address: Address) -> Option<StateLoad<U256>> {
+        let balance = U256::from(address.0[19]);
+        Some(StateLoad::new(balance, false))
+    }
+
+    fn load_account_delegated(&mut self, _address: Address) -> Option<StateLoad<AccountLoad>> {
+        Some(StateLoad::new(
+            AccountLoad { is_delegate_account_cold: None, is_empty: false },
+            false,
+        ))
+    }
+
+    fn load_account_code(&mut self, address: Address) -> Option<StateLoad<Bytes>> {
+        let code = self
+            .code_map
+            .get(&address)
+            .map(|b| b.original_bytes())
+            .unwrap_or_default();
+        Some(StateLoad::new(code, false))
+    }
+
+    fn load_account_code_hash(&mut self, address: Address) -> Option<StateLoad<B256>> {
+        let code_hash = if let Some(bytecode) = self.code_map.get(&address) {
+            keccak256(bytecode.original_byte_slice())
+        } else {
+            KECCAK_EMPTY
+        };
+        Some(StateLoad::new(code_hash, false))
     }
 }
 
@@ -550,10 +530,10 @@ fn run_compiled_test_case(test_case: &TestCase<'_>, f: EvmCompilerFn) {
             DEF_GAS_LIMIT,
         );
 
-        let table = instruction_table_gas_changes_spec::<
+        let table = instruction_table::<
             revm_interpreter::interpreter::EthInterpreter,
             TestHost,
-        >(spec_id);
+        >();
         let mut int_host = TestHost::with_spec(spec_id);
         let interpreter_action = interpreter.run_plain(&table, &mut int_host);
 
@@ -750,18 +730,18 @@ fn assert_actions(actual: &InterpreterAction, expected: &InterpreterAction) {
             InterpreterAction::NewFrame(FrameInput::Create(actual_create)),
             InterpreterAction::NewFrame(FrameInput::Create(expected_create)),
         ) => {
-            // Compare CreateInputs fields
-            assert_eq!(actual_create.caller(), expected_create.caller(), "caller mismatch");
-            assert_eq!(actual_create.scheme(), expected_create.scheme(), "scheme mismatch");
-            assert_eq!(actual_create.value(), expected_create.value(), "value mismatch");
+            // Compare CreateInputs fields (public fields, not methods)
+            assert_eq!(actual_create.caller, expected_create.caller, "caller mismatch");
+            assert_eq!(actual_create.scheme, expected_create.scheme, "scheme mismatch");
+            assert_eq!(actual_create.value, expected_create.value, "value mismatch");
             assert_eq!(
-                actual_create.init_code(),
-                expected_create.init_code(),
+                actual_create.init_code,
+                expected_create.init_code,
                 "init_code mismatch"
             );
             assert_eq!(
-                actual_create.gas_limit(),
-                expected_create.gas_limit(),
+                actual_create.gas_limit,
+                expected_create.gas_limit,
                 "gas_limit mismatch"
             );
         }

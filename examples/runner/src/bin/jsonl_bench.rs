@@ -214,7 +214,6 @@ fn build_cache_db(tx: &TxRecordLine, code_values: &HashMap<B256, Bytecode>) -> C
             balance,
             nonce,
             code_hash,
-            account_id: None,
             code: bytecode,
         };
         db.insert_account_info(addr, info);
@@ -693,7 +692,7 @@ impl Handler for JitHandler {
 
         loop {
             let call_or_result = {
-                let (ctx, _instructions, _precompiles, frame_stack) = evm.all_mut();
+                let (ctx, frame_stack) = (&mut evm.0.ctx, &mut evm.0.frame_stack);
                 let frame = frame_stack.get();
                 let bytecode_hash = frame.interpreter.bytecode.get_or_calculate_hash();
 
@@ -710,7 +709,7 @@ impl Handler for JitHandler {
                         })?
                 } else {
                     // Fall back to interpreter for non-JIT contracts
-                    drop((ctx, _instructions, _precompiles, frame_stack));
+                    drop((ctx, frame_stack));
                     evm.frame_run()?
                 }
             };
