@@ -75,3 +75,8 @@ harness = false
 name = "bench_curve"
 path = "src/bench_curve.rs"
 harness = false
+
+[[bench]]
+name = "bench_snailtracer"
+path = "src/bench_snailtracer.rs"
+harness = false

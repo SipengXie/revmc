@@ -52,6 +52,82 @@ impl Fixture {
         Self::from_path(&path)
     }
 
+    /// Build a fixture from raw bytecode and calldata (no JSON file needed).
+    ///
+    /// Deploys the bytecode to a synthetic contract address and creates a
+    /// minimal CANCUN environment that calls it with the given calldata.
+    pub fn from_bytecode(bytecode: &[u8], calldata: &[u8]) -> Result<Self, String> {
+        let contract_addr: Address = "0x1000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+        let caller: Address = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+            .parse()
+            .unwrap();
+
+        let code = Bytecode::new_raw(Bytes::from(bytecode.to_vec()));
+        let code_hash = code.hash_slow();
+
+        let info = AccountInfo {
+            balance: U256::from(1_000_000_000_000_000_000u128),
+            nonce: 0,
+            code_hash,
+            code: Some(code),
+        };
+
+        let accounts = vec![PreparedAccount {
+            address: contract_addr,
+            info,
+            storage: Default::default(),
+        }];
+
+        let compiled = compile_contracts(&accounts)?;
+
+        let mut db = CacheDB::new(EmptyDB::new());
+        db.insert_account_info(contract_addr, accounts[0].info.clone());
+        // Fund the caller so the transaction doesn't fail
+        db.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::from(10_000_000_000_000_000_000u128),
+                nonce: 0,
+                code_hash: revm::primitives::KECCAK_EMPTY,
+                code: None,
+            },
+        );
+
+        let cfg = CfgEnv::new_with_spec(SpecId::CANCUN);
+        let mut block = BlockEnv::default();
+        block.number = U256::from(1);
+        block.timestamp = U256::from(1);
+        block.gas_limit = 1_000_000_000;
+        block.basefee = 1;
+
+        let tx = TxEnv {
+            tx_type: 0,
+            caller,
+            gas_limit: 1_000_000_000,
+            gas_price: 1,
+            kind: TxKind::Call(contract_addr),
+            value: U256::ZERO,
+            data: Bytes::from(calldata.to_vec()),
+            nonce: 0,
+            chain_id: Some(cfg.chain_id),
+            access_list: Default::default(),
+            gas_priority_fee: None,
+            blob_hashes: Vec::new(),
+            max_fee_per_blob_gas: 0,
+            authorization_list: Vec::new(),
+        };
+
+        Ok(Self {
+            block,
+            cfg,
+            tx,
+            compiled,
+            prebuilt_db: Arc::new(db),
+        })
+    }
+
     /// Run plain (interpreter-only) EVM execution.
     pub fn run_plain(&self) -> Result<ResultAndState, String> {
         let mut evm = self.make_plain_evm();
