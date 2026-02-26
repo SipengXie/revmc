@@ -61,6 +61,10 @@ path = "src/bin/scan_codes.rs"
 name = "gas_debug"
 path = "src/bin/gas_debug.rs"
 
+[[bin]]
+name = "frame_bench"
+path = "src/bin/frame_bench.rs"
+
 [[bench]]
 name = "bench_json_test"
 path = "src/bench_json_test.rs"
