@@ -69,6 +69,10 @@ path = "src/bin/frame_bench.rs"
 name = "ablation_bench"
 path = "src/bin/ablation_bench.rs"
 
+[[bin]]
+name = "selective_demo"
+path = "src/bin/selective_demo.rs"
+
 [[bench]]
 name = "bench_json_test"
 path = "src/bench_json_test.rs"
