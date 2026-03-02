@@ -74,6 +74,11 @@ name = "selective_demo"
 path = "src/bin/selective_demo.rs"
 
 [[bench]]
+name = "bench_airdrop"
+path = "src/bench_airdrop.rs"
+harness = false
+
+[[bench]]
 name = "bench_json_test"
 path = "src/bench_json_test.rs"
 harness = false

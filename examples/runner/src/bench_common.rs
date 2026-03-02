@@ -128,6 +128,25 @@ impl Fixture {
         })
     }
 
+    /// Build a fixture from a pre-populated CacheDB and transaction.
+    ///
+    /// Scans the DB for contract bytecodes and JIT-compiles them.
+    pub fn from_db(db: CacheDB<EmptyDB>, block: BlockEnv, tx: TxEnv) -> Result<Self, String> {
+        let accounts: Vec<PreparedAccount> = db
+            .cache
+            .accounts
+            .iter()
+            .map(|(addr, cached)| PreparedAccount {
+                address: *addr,
+                info: cached.info.clone(),
+                storage: Default::default(),
+            })
+            .collect();
+        let compiled = compile_contracts(&accounts)?;
+        let cfg = CfgEnv::new_with_spec(SpecId::CANCUN);
+        Ok(Self { block, cfg, tx, compiled, prebuilt_db: Arc::new(db) })
+    }
+
     /// Run plain (interpreter-only) EVM execution.
     pub fn run_plain(&self) -> Result<ResultAndState, String> {
         let mut evm = self.make_plain_evm();
