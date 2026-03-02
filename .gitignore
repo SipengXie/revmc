@@ -7,3 +7,4 @@ clif
 *AGENTS.md
 *.log.planning/
 .planning/
+.worktrees/
