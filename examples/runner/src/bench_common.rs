@@ -384,7 +384,13 @@ fn build_block_env(raw: &RawEnv) -> Result<BlockEnv, String> {
                 revm::primitives::eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN,
             );
         }
-        None => block.blob_excess_gas_and_price = None,
+        None => {
+            // CANCUN requires blob_excess_gas_and_price; default to 0 if fixture omits it.
+            block.set_blob_excess_gas_and_price(
+                0,
+                revm::primitives::eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN,
+            );
+        }
     }
     Ok(block)
 }

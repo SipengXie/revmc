@@ -1,10 +1,10 @@
 // Selective JIT Synthetic Benchmark
 //
-// Demonstrates that compiling only compute-heavy contracts (Curve StableSwap pool)
+// Demonstrates that compiling only compute-heavy contracts (Uniswap V2 Router)
 // outperforms both native interpretation and full JIT compilation.
 //
-// Workload: interleaved Curve swaps (compute-heavy) + ERC20 airdrops (storage-heavy).
-// Three modes: Native (0 compiled), Full JIT (all compiled), Selective JIT (pool only).
+// Workload: interleaved Uniswap swaps (compute-heavy) + ERC20 airdrops (storage-heavy).
+// Three modes: Native (0 compiled), Full JIT (all compiled), Selective JIT (all except airdrop).
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -37,11 +37,32 @@ use serde::Deserialize;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const TOKEN_A: Address = Address::new([0xaa; 20]);
-#[allow(dead_code)] // Used indirectly via fixture (Token B bytecode is loaded from JSON)
-const TOKEN_B: Address = Address::new([0xbb; 20]);
-const POOL: Address = Address::new([0xcc; 20]);
+/// Uniswap V2 Router (0xff00...0022)
+const ROUTER: Address = Address::new([
+    0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22,
+]);
+
+/// Input token for swaps (0x1100...0000, ERC20 in fixture)
+const SWAP_INPUT_TOKEN: Address = Address::new([
+    0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+]);
+
+/// Output token for swaps (0x1100...0050, paired token in fixture)
+#[allow(dead_code)]
+const SWAP_OUTPUT_TOKEN: Address = Address::new([
+    0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50,
+]);
+
+/// Standalone airdrop ERC20 token (not in fixture, deployed at 0xaaaa...aa)
+const AIRDROP_TOKEN: Address = Address::new([0xaa; 20]);
+
+/// Airdrop contract
 const AIRDROP: Address = Address::new([0xdd; 20]);
+
+/// Sender EOA for airdrop transactions
 const SENDER: Address = Address::new([
     0x89, 0xd5, 0xe7, 0x2a, 0x8a, 0x4a, 0x03, 0x30, 0xa6, 0x5b, 0xbc, 0xef, 0x30, 0x32, 0xbe,
     0x2f, 0x72, 0x82, 0x64, 0xa8,
@@ -53,7 +74,7 @@ const SENDER: Address = Address::new([
 #[command(name = "selective_demo", about = "Selective JIT advantage demonstration")]
 struct Args {
     #[arg(long, default_value_t = 500)]
-    curve_txs: usize,
+    swap_txs: usize,
 
     #[arg(long, default_value_t = 500)]
     airdrop_txs: usize,
@@ -146,6 +167,23 @@ struct FixtureFile {
 #[derive(Deserialize)]
 struct FixtureCase {
     pre: BTreeMap<String, RawAccount>,
+    env: FixtureEnv,
+}
+
+#[derive(Deserialize)]
+struct FixtureEnv {
+    #[serde(rename = "currentBaseFee")]
+    current_base_fee: String,
+    #[serde(rename = "currentCoinbase")]
+    current_coinbase: String,
+    #[serde(rename = "currentGasLimit")]
+    current_gas_limit: String,
+    #[serde(rename = "currentNumber")]
+    current_number: String,
+    #[serde(rename = "currentTimestamp")]
+    current_timestamp: String,
+    #[serde(rename = "currentRandom")]
+    current_random: String,
 }
 
 #[derive(Deserialize)]
@@ -163,17 +201,17 @@ struct ContractCode {
     bytecode: Bytecode,
 }
 
-fn load_fixture_accounts(db: &mut CacheDB<EmptyDB>) -> Vec<ContractCode> {
+fn load_fixture_accounts(db: &mut CacheDB<EmptyDB>) -> (Vec<ContractCode>, FixtureEnv) {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../data/curve-stableswap-2pool.json");
+        .join("../../data/uniswap-t100-c20.json");
     let json = fs::read_to_string(&path).expect("failed to read fixture");
     let file: FixtureFile = serde_json::from_str(&json).expect("failed to parse fixture");
     let case = file.cases.into_values().next().expect("no cases in fixture");
 
     let mut contracts = Vec::new();
 
-    for (addr_hex, raw) in case.pre {
-        let address = parse_address(&addr_hex);
+    for (addr_hex, raw) in &case.pre {
+        let address = parse_address(addr_hex);
         let balance = parse_u256(&raw.balance);
         let nonce = parse_u64(&raw.nonce);
         let bytecode_bytes = parse_hex_bytes(&raw.code);
@@ -182,8 +220,8 @@ fn load_fixture_accounts(db: &mut CacheDB<EmptyDB>) -> Vec<ContractCode> {
 
         let storage: RevmHashMap<StorageKey, StorageValue> = raw
             .storage
-            .into_iter()
-            .map(|(k, v)| (parse_u256(&k), parse_u256(&v)))
+            .iter()
+            .map(|(k, v)| (parse_u256(k), parse_u256(v)))
             .collect();
 
         let info = AccountInfo {
@@ -207,7 +245,19 @@ fn load_fixture_accounts(db: &mut CacheDB<EmptyDB>) -> Vec<ContractCode> {
         }
     }
 
-    contracts
+    (contracts, case.env)
+}
+
+fn build_block_env(env: &FixtureEnv) -> BlockEnv {
+    let mut block = BlockEnv::default();
+    block.number = parse_u256(&env.current_number);
+    block.beneficiary = parse_address(&env.current_coinbase);
+    block.timestamp = parse_u256(&env.current_timestamp);
+    block.gas_limit = parse_u64(&env.current_gas_limit);
+    block.basefee = parse_u64(&env.current_base_fee);
+    block.prevrandao =
+        Some(B256::from_slice(&parse_fixed_bytes(&env.current_random, 32)));
+    block
 }
 
 fn load_airdrop_bytecode() -> Bytecode {
@@ -248,11 +298,19 @@ fn erc20_allowance_slot(owner: Address, spender: Address) -> U256 {
 
 // ── Database setup ───────────────────────────────────────────────────────────
 
-fn build_db(args: &Args) -> (CacheDB<EmptyDB>, Vec<ContractCode>) {
+fn make_swap_caller(index: usize) -> Address {
+    let mut bytes = [0u8; 20];
+    bytes[0] = 0x20;
+    bytes[16..20].copy_from_slice(&(index as u32).to_be_bytes());
+    Address::from(bytes)
+}
+
+fn build_db(args: &Args) -> (CacheDB<EmptyDB>, Vec<ContractCode>, BlockEnv) {
     let mut db = CacheDB::new(EmptyDB::new());
 
-    // Load fixture accounts (TokenA, TokenB, Pool, Sender EOA, Coinbase)
-    let mut contracts = load_fixture_accounts(&mut db);
+    // Load Uniswap fixture (Router, Factory, Tokens, Pairs, EOAs)
+    let (mut contracts, fixture_env) = load_fixture_accounts(&mut db);
+    let block_env = build_block_env(&fixture_env);
 
     // Insert airdrop contract
     let airdrop_code = load_airdrop_bytecode();
@@ -267,7 +325,6 @@ fn build_db(args: &Args) -> (CacheDB<EmptyDB>, Vec<ContractCode>) {
         },
     );
     // Set airdrop owner = SENDER at OZ v5 ERC-7201 namespaced storage slot for Ownable._owner
-    // Slot = 0x9016d09d72d40fdae2fd8ceac6b6234c7706214fd39c1cd1e609a0528c199300
     let oz_owner_slot = U256::from_str_radix(
         "9016d09d72d40fdae2fd8ceac6b6234c7706214fd39c1cd1e609a0528c199300",
         16,
@@ -275,14 +332,38 @@ fn build_db(args: &Args) -> (CacheDB<EmptyDB>, Vec<ContractCode>) {
     .unwrap();
     db.insert_account_storage(AIRDROP, oz_owner_slot, U256::from_be_slice(SENDER.as_slice()))
         .unwrap();
-
     contracts.push(ContractCode {
         address: AIRDROP,
         code_hash: airdrop_hash,
         bytecode: airdrop_code,
     });
 
-    // Override sender: large ETH balance for gas
+    // Deploy airdrop ERC20 token at AIRDROP_TOKEN (0xaaaa...aa)
+    // Reuse bytecode from SWAP_INPUT_TOKEN (has ERC20 functionality)
+    let token_bytecode = contracts
+        .iter()
+        .find(|c| c.address == SWAP_INPUT_TOKEN)
+        .expect("SWAP_INPUT_TOKEN not found in fixture")
+        .bytecode
+        .clone();
+    let token_hash = token_bytecode.hash_slow();
+    db.insert_account_info(
+        AIRDROP_TOKEN,
+        AccountInfo {
+            balance: U256::ZERO,
+            nonce: 1,
+            code_hash: token_hash,
+            code: Some(token_bytecode.clone()),
+        },
+    );
+    contracts.push(ContractCode {
+        address: AIRDROP_TOKEN,
+        code_hash: token_hash,
+        bytecode: token_bytecode,
+    });
+
+    // Fund SENDER for airdrops: ETH + AIRDROP_TOKEN balance + AIRDROP_TOKEN→AIRDROP allowance
+    let huge = U256::from(10u64).pow(U256::from(30));
     db.insert_account_info(
         SENDER,
         AccountInfo {
@@ -292,40 +373,82 @@ fn build_db(args: &Args) -> (CacheDB<EmptyDB>, Vec<ContractCode>) {
             code: None,
         },
     );
+    db.insert_account_storage(AIRDROP_TOKEN, erc20_balance_slot(SENDER), huge)
+        .unwrap();
+    db.insert_account_storage(
+        AIRDROP_TOKEN,
+        erc20_allowance_slot(SENDER, AIRDROP),
+        U256::MAX,
+    )
+    .unwrap();
 
-    // Token A: give sender a huge balance
-    let huge = U256::from(10u64).pow(U256::from(30));
-    db.insert_account_storage(TOKEN_A, erc20_balance_slot(SENDER), huge)
+    // Generate swap callers and fund each with:
+    //   - ETH for gas
+    //   - SWAP_INPUT_TOKEN balance
+    //   - SWAP_INPUT_TOKEN → ROUTER allowance
+    let caller_token_balance = U256::from(10u64).pow(U256::from(21)); // 1000 tokens
+    for i in 0..args.swap_txs {
+        let caller = make_swap_caller(i);
+        db.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::from(10u64).pow(U256::from(20)), // 100 ETH
+                nonce: 0,
+                code_hash: revm::primitives::KECCAK_EMPTY,
+                code: None,
+            },
+        );
+        db.insert_account_storage(
+            SWAP_INPUT_TOKEN,
+            erc20_balance_slot(caller),
+            caller_token_balance,
+        )
         .unwrap();
-    // Token A: totalSupply (slot 2)
-    db.insert_account_storage(TOKEN_A, U256::from(2), huge)
+        db.insert_account_storage(
+            SWAP_INPUT_TOKEN,
+            erc20_allowance_slot(caller, ROUTER),
+            U256::MAX,
+        )
         .unwrap();
-    // Token A: sender approves Pool (already in fixture, but ensure max)
-    db.insert_account_storage(TOKEN_A, erc20_allowance_slot(SENDER, POOL), U256::MAX)
-        .unwrap();
-    // Token A: sender approves Airdrop
-    db.insert_account_storage(TOKEN_A, erc20_allowance_slot(SENDER, AIRDROP), U256::MAX)
-        .unwrap();
+    }
 
     println!(
         "  accounts: {} | contracts: {} unique bytecodes",
         db.cache.accounts.len(),
         contracts.len()
     );
-    let _ = args; // reserved for future use
-    (db, contracts)
+    (db, contracts, block_env)
 }
 
 // ── Transaction generation ───────────────────────────────────────────────────
 
-fn make_curve_swap_calldata(dx: U256) -> Bytes {
-    // exchange(0, 1, dx, 0) — selector 0x5b41b908
-    let mut data = Vec::with_capacity(4 + 4 * 32);
-    data.extend_from_slice(&[0x5b, 0x41, 0xb9, 0x08]);
-    data.extend_from_slice(&U256::from(0).to_be_bytes::<32>());
-    data.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
-    data.extend_from_slice(&dx.to_be_bytes::<32>());
-    data.extend_from_slice(&U256::from(0).to_be_bytes::<32>());
+fn make_swap_calldata(amount_in: U256, path: &[Address], to: Address, deadline: U256) -> Bytes {
+    // swapExactTokensForTokens(uint256,uint256,address[],address,uint256)
+    // selector: 0x38ed1739
+    let mut data = Vec::with_capacity(4 + (5 + 1 + path.len()) * 32);
+    data.extend_from_slice(&[0x38, 0xed, 0x17, 0x39]);
+
+    // amountIn
+    data.extend_from_slice(&amount_in.to_be_bytes::<32>());
+    // amountOutMin = 0
+    data.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+    // offset to path array (5 static words * 32 = 160)
+    data.extend_from_slice(&U256::from(5u64 * 32).to_be_bytes::<32>());
+    // to
+    let mut padded = [0u8; 32];
+    padded[12..32].copy_from_slice(to.as_slice());
+    data.extend_from_slice(&padded);
+    // deadline
+    data.extend_from_slice(&deadline.to_be_bytes::<32>());
+
+    // path array
+    data.extend_from_slice(&U256::from(path.len()).to_be_bytes::<32>());
+    for addr in path {
+        let mut p = [0u8; 32];
+        p[12..32].copy_from_slice(addr.as_slice());
+        data.extend_from_slice(&p);
+    }
+
     Bytes::from(data)
 }
 
@@ -369,12 +492,19 @@ fn make_airdrop_calldata(token: Address, recipients: &[Address], amount_each: U2
     Bytes::from(data)
 }
 
-fn generate_txs(args: &Args) -> Vec<TxEnv> {
-    // Use small dx (1e12) so 500 swaps don't drain the pool.
-    // The pool math operates with integer precision; 1e12 is enough to exercise
-    // the Newton iteration while keeping cumulative impact < 0.1% of reserves.
-    let dx = U256::from(1_000_000_000_000u64); // 1e12 wei = 0.000001 token
-    let swap_calldata = make_curve_swap_calldata(dx);
+fn generate_txs(args: &Args, basefee: u64) -> Vec<TxEnv> {
+    let gas_price = basefee as u128;
+    let swap_amount = U256::from(1_000_000_000_000_000u64); // 0.001 token per swap
+    let path = [SWAP_INPUT_TOKEN, SWAP_OUTPUT_TOKEN];
+    let deadline = U256::from(u64::MAX);
+
+    // Build per-caller swap calldata (each caller receives output to themselves)
+    let swap_calldatas: Vec<Bytes> = (0..args.swap_txs)
+        .map(|i| {
+            let caller = make_swap_caller(i);
+            make_swap_calldata(swap_amount, &path, caller, deadline)
+        })
+        .collect();
 
     // Pre-generate all recipient addresses (unique per airdrop batch)
     let total_recipients = args.airdrop_txs * args.recipients_per_airdrop;
@@ -394,27 +524,28 @@ fn generate_txs(args: &Args) -> Vec<TxEnv> {
         .map(|i| {
             let start = i * args.recipients_per_airdrop;
             let end = start + args.recipients_per_airdrop;
-            make_airdrop_calldata(TOKEN_A, &recipients[start..end], amount_each)
+            make_airdrop_calldata(AIRDROP_TOKEN, &recipients[start..end], amount_each)
         })
         .collect();
 
-    let mut txs = Vec::with_capacity(args.curve_txs + args.airdrop_txs);
+    let mut txs = Vec::with_capacity(args.swap_txs + args.airdrop_txs);
     let mut swap_idx = 0;
     let mut airdrop_idx = 0;
     // All txs use nonce=0 since each executes on a fresh DB snapshot (no state accumulation).
     let nonce = 0u64;
 
     // Interleave: one swap, one airdrop, repeat
-    while swap_idx < args.curve_txs || airdrop_idx < args.airdrop_txs {
-        if swap_idx < args.curve_txs {
+    while swap_idx < args.swap_txs || airdrop_idx < args.airdrop_txs {
+        if swap_idx < args.swap_txs {
+            let caller = make_swap_caller(swap_idx);
             txs.push(TxEnv {
                 tx_type: 0,
-                caller: SENDER,
+                caller,
                 gas_limit: 1_000_000,
-                gas_price: 1,
-                kind: TxKind::Call(POOL),
+                gas_price,
+                kind: TxKind::Call(ROUTER),
                 value: U256::ZERO,
-                data: swap_calldata.clone(),
+                data: swap_calldatas[swap_idx].clone(),
                 nonce,
                 chain_id: Some(1),
                 access_list: Default::default(),
@@ -430,7 +561,7 @@ fn generate_txs(args: &Args) -> Vec<TxEnv> {
                 tx_type: 0,
                 caller: SENDER,
                 gas_limit: 100_000_000,
-                gas_price: 1,
+                gas_price,
                 kind: TxKind::Call(AIRDROP),
                 value: U256::ZERO,
                 data: airdrop_calldatas[airdrop_idx].clone(),
@@ -482,25 +613,25 @@ fn compile_all(contracts: &[ContractCode]) -> CompiledContracts {
     }
 
     let mut full_map = HashMap::new();
-    let mut pool_hash = B256::ZERO;
+    let mut airdrop_hash = B256::ZERO;
 
     for (addr, hash, func_id) in pending {
         let fn_ptr = unsafe { compiler.jit_function(func_id).expect("JIT failed") };
         full_map.insert(hash, fn_ptr.into_inner());
-        if addr == POOL {
-            pool_hash = hash;
+        if addr == AIRDROP {
+            airdrop_hash = hash;
         }
     }
 
-    // Selective map: pool only
+    // Selective map: everything except airdrop contract
     let selective_map: HashMap<B256, RawEvmCompilerFn> = full_map
         .iter()
-        .filter(|(h, _)| **h == pool_hash)
+        .filter(|(h, _)| **h != airdrop_hash)
         .map(|(h, f)| (*h, *f))
         .collect();
 
     println!(
-        "  full: {} unique JIT functions | selective: {} (pool only)",
+        "  full: {} unique JIT functions | selective: {} (all except airdrop)",
         full_map.len(),
         selective_map.len()
     );
@@ -515,23 +646,14 @@ fn compile_all(contracts: &[ContractCode]) -> CompiledContracts {
 
 // ── Execution ────────────────────────────────────────────────────────────────
 
-fn make_block_env() -> BlockEnv {
-    let mut block = BlockEnv::default();
-    block.number = U256::from(1);
-    block.timestamp = U256::from(1000);
-    block.gas_limit = 1_000_000_000;
-    block.basefee = 1;
-    block
-}
-
 fn execute_round(
     template_db: &Arc<CacheDB<EmptyDB>>,
     txs: &[TxEnv],
     functions: &Arc<HashMap<B256, RawEvmCompilerFn>>,
+    block: &BlockEnv,
     verbose: bool,
 ) -> (Duration, usize, usize) {
     let cfg = CfgEnv::new_with_spec(SpecId::CANCUN);
-    let block = make_block_env();
     let is_native = functions.is_empty();
 
     let mut successes = 0usize;
@@ -544,7 +666,7 @@ fn execute_round(
     let db_ref = unsafe { &mut *(Arc::as_ptr(template_db) as *mut CacheDB<EmptyDB>) };
     let ctx = revm::context::Context::new(db_ref, SpecId::CANCUN);
     let mut evm = ctx.build_mainnet();
-    evm.ctx.block = block;
+    evm.ctx.block = block.clone();
     evm.ctx.cfg = cfg;
 
     let t0 = Instant::now();
@@ -657,20 +779,23 @@ fn main() {
 
     println!("=== Selective JIT Synthetic Benchmark ===");
     println!(
-        "Curve swaps: {} | Airdrop txs: {} ({} recipients each)",
-        args.curve_txs, args.airdrop_txs, args.recipients_per_airdrop
+        "Uniswap swaps: {} | Airdrop txs: {} ({} recipients each)",
+        args.swap_txs, args.airdrop_txs, args.recipients_per_airdrop
     );
     println!("Rounds: {} | Warmup: {}", args.rounds, args.warmup);
     println!();
 
     // Build template DB
     println!("[1/4] Building state...");
-    let (template_db, contracts) = build_db(&args);
+    let (template_db, contracts, block_env) = build_db(&args);
     let template_db = Arc::new(template_db);
 
     // Generate transactions
-    println!("[2/4] Generating {} transactions...", args.curve_txs + args.airdrop_txs);
-    let txs = generate_txs(&args);
+    println!(
+        "[2/4] Generating {} transactions...",
+        args.swap_txs + args.airdrop_txs
+    );
+    let txs = generate_txs(&args, block_env.basefee);
 
     // Compile contracts
     println!("[3/4] Compiling contracts...");
@@ -709,8 +834,13 @@ fn main() {
 
         // Warmup
         for w in 0..args.warmup {
-            let (elapsed, ok, err) =
-                execute_round(&template_db, &txs, &mode.functions, args.verbose && w == 0);
+            let (elapsed, ok, err) = execute_round(
+                &template_db,
+                &txs,
+                &mode.functions,
+                &block_env,
+                args.verbose && w == 0,
+            );
             println!(
                 "  warmup {}: {:.1}ms ({} ok, {} revert)",
                 w + 1,
@@ -723,7 +853,8 @@ fn main() {
         // Measured rounds
         let mut times = Vec::with_capacity(args.rounds);
         for r in 0..args.rounds {
-            let (elapsed, ok, err) = execute_round(&template_db, &txs, &mode.functions, false);
+            let (elapsed, ok, err) =
+                execute_round(&template_db, &txs, &mode.functions, &block_env, false);
             println!(
                 "  round {}: {:.1}ms ({} ok, {} revert)",
                 r + 1,
