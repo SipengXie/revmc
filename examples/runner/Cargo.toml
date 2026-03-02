@@ -65,6 +65,10 @@ path = "src/bin/gas_debug.rs"
 name = "frame_bench"
 path = "src/bin/frame_bench.rs"
 
+[[bin]]
+name = "ablation_bench"
+path = "src/bin/ablation_bench.rs"
+
 [[bench]]
 name = "bench_json_test"
 path = "src/bench_json_test.rs"
