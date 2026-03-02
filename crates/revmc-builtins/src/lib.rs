@@ -17,7 +17,7 @@ use revm_interpreter::{
     CallInput, CallInputs, CallScheme, CallValue, CreateInputs, CreateScheme, InstructionResult,
     InterpreterAction, InterpreterResult,
 };
-use revm_primitives::{hardfork::SpecId, Bytes, Log, LogData, KECCAK_EMPTY, U256};
+use revm_primitives::{hardfork::SpecId, Bytes, Log, LogData, KECCAK_EMPTY, I256, U256};
 use revmc_context::{EvmContext, EvmWord};
 
 pub mod gas;
@@ -78,6 +78,45 @@ pub enum CreateKind {
 pub unsafe extern "C-unwind" fn __revmc_builtin_panic(data: *const u8, len: usize) -> ! {
     let msg = core::str::from_utf8_unchecked(core::slice::from_raw_parts(data, len));
     panic!("{msg}");
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __revmc_builtin_udiv(rev![a, b]: &mut [EvmWord; 2]) {
+    let divisor = b.to_u256();
+    *b = if divisor.is_zero() { U256::ZERO } else { a.to_u256().wrapping_div(divisor) }.into();
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __revmc_builtin_urem(rev![a, b]: &mut [EvmWord; 2]) {
+    let divisor = b.to_u256();
+    *b = if divisor.is_zero() { U256::ZERO } else { a.to_u256().wrapping_rem(divisor) }.into();
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __revmc_builtin_sdiv(rev![a, b]: &mut [EvmWord; 2]) {
+    let divisor = I256::from_raw(b.to_u256());
+    *b = if divisor.is_zero() {
+        U256::ZERO
+    } else {
+        I256::from_raw(a.to_u256()).wrapping_div(divisor).into_raw()
+    }
+    .into();
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __revmc_builtin_srem(rev![a, b]: &mut [EvmWord; 2]) {
+    let divisor = I256::from_raw(b.to_u256());
+    *b = if divisor.is_zero() {
+        U256::ZERO
+    } else {
+        I256::from_raw(a.to_u256()).wrapping_rem(divisor).into_raw()
+    }
+    .into();
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __revmc_builtin_imul(rev![a, b]: &mut [EvmWord; 2]) {
+    *b = a.to_u256().wrapping_mul(b.to_u256()).into();
 }
 
 #[no_mangle]

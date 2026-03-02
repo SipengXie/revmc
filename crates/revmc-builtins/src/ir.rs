@@ -153,6 +153,11 @@ macro_rules! builtins {
                 const LOG: u8 = LOG0;
                 const DORETURN: u8 = RETURN;
                 const RESIZEMEMORY: u8 = 0;
+                const UDIV: u8 = DIV;
+                const UREM: u8 = MOD;
+                const SDIVBUILTIN: u8 = SDIV;
+                const SREMBUILTIN: u8 = SMOD;
+                const IMUL: u8 = MUL;
 
                 match self {
                     $(Self::$ident => [<$ident:upper>]),*
@@ -213,6 +218,11 @@ builtins! {
 
     Panic          = __revmc_builtin_panic(ptr, usize) None,
 
+    UDiv           = __revmc_builtin_udiv(@[sp] ptr) None,
+    URem           = __revmc_builtin_urem(@[sp] ptr) None,
+    SDivBuiltin    = __revmc_builtin_sdiv(@[sp] ptr) None,
+    SRemBuiltin    = __revmc_builtin_srem(@[sp] ptr) None,
+    IMul           = __revmc_builtin_imul(@[sp] ptr) None,
     AddMod         = __revmc_builtin_addmod(@[sp] ptr) None,
     MulMod         = __revmc_builtin_mulmod(@[sp] ptr) None,
     Exp            = __revmc_builtin_exp(@[ecx] ptr, @[sp] ptr, u8) Some(u8),
