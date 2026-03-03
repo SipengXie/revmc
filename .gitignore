@@ -8,3 +8,4 @@ clif
 *.log.planning/
 .planning/
 .worktrees/
+./jit_cache
