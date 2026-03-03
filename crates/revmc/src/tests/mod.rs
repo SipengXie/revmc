@@ -23,6 +23,7 @@ mod meta;
 
 mod fibonacci;
 mod resume;
+mod smod_zero_opaque;
 
 mod runner;
 pub use runner::*;

@@ -629,15 +629,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 let r = self.bcx.select(overflow, default, r);
                 self.push(r);
             }};
-            (@if_not_zero $op:ident) => {{
-                // TODO: `select` might not have the same semantics in all backends.
-                let [a, b] = self.popn();
-                let b_is_zero = self.bcx.icmp_imm(IntCC::Equal, b, 0);
-                let zero = self.bcx.iconst_256(U256::ZERO);
-                let op_result = self.bcx.$op(a, b);
-                let r = self.bcx.select(b_is_zero, zero, op_result);
-                self.push(r);
-            }};
+
         }
 
         macro_rules! field {
@@ -684,30 +676,24 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 let _ = self.call_builtin(Builtin::UDiv, &[sp]);
             }
             op::SDIV => {
+                let sp = self.sp_after_inputs();
+                let _ = self.call_builtin(Builtin::SDivBuiltin, &[sp]);
+            }
+            op::MOD => {
+                let sp = self.sp_after_inputs();
+                let _ = self.call_builtin(Builtin::URem, &[sp]);
+            }
+            op::SMOD => {
                 let [a, b] = self.popn();
                 let b_is_zero = self.bcx.icmp_imm(IntCC::Equal, b, 0);
                 let r = self.bcx.lazy_select(
                     b_is_zero,
                     self.word_type,
                     |bcx| bcx.iconst_256(U256::ZERO),
-                    |bcx| {
-                        let min = bcx.iconst_256(I256_MIN);
-                        let is_weird_sdiv_edge_case = {
-                            let a_is_min = bcx.icmp(IntCC::Equal, a, min);
-                            let b_is_neg1 = bcx.icmp_imm(IntCC::Equal, b, -1);
-                            bcx.bitand(a_is_min, b_is_neg1)
-                        };
-                        let sdiv_result = bcx.sdiv(a, b);
-                        bcx.select(is_weird_sdiv_edge_case, min, sdiv_result)
-                    },
+                    |bcx| bcx.srem(a, b),
                 );
                 self.push(r);
             }
-            op::MOD => {
-                let sp = self.sp_after_inputs();
-                let _ = self.call_builtin(Builtin::URem, &[sp]);
-            }
-            op::SMOD => binop!(@if_not_zero srem),
             op::ADDMOD => {
                 let sp = self.sp_after_inputs();
                 let _ = self.call_builtin(Builtin::AddMod, &[sp]);
