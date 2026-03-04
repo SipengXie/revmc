@@ -675,6 +675,15 @@ struct JitHandler {
     functions: Arc<HashMap<B256, RawEvmCompilerFn>>,
 }
 
+#[inline]
+fn should_lookup_jit(
+    frame_is_create: bool,
+    bytecode_address: Option<Address>,
+    bytecode_is_empty: bool,
+) -> bool {
+    !frame_is_create && bytecode_address.is_some() && !bytecode_is_empty
+}
+
 impl Handler for JitHandler {
     type Evm = BenchEvm;
     type Error = BenchError;
@@ -694,23 +703,32 @@ impl Handler for JitHandler {
             let call_or_result = {
                 let (ctx, frame_stack) = (&mut evm.0.ctx, &mut evm.0.frame_stack);
                 let frame = frame_stack.get();
-                let bytecode_hash = frame.interpreter.bytecode.get_or_calculate_hash();
-
-                if let Some(&raw_fn) = self.functions.get(&bytecode_hash) {
-                    let f = EvmCompilerFn::new(raw_fn);
-                    let action =
-                        unsafe { f.call_with_interpreter(&mut frame.interpreter, ctx) };
-                    frame
-                        .process_next_action::<_, BenchError>(ctx, action)
-                        .inspect(|i| {
-                            if i.is_result() {
-                                frame.set_finished(true);
-                            }
-                        })?
-                } else {
-                    // Fall back to interpreter for non-JIT contracts
+                if !should_lookup_jit(
+                    frame.data.is_create(),
+                    frame.interpreter.input.bytecode_address,
+                    frame.interpreter.bytecode.is_empty(),
+                ) {
                     drop((ctx, frame_stack));
                     evm.frame_run()?
+                } else {
+                    let bytecode_hash = frame.interpreter.bytecode.get_or_calculate_hash();
+
+                    if let Some(&raw_fn) = self.functions.get(&bytecode_hash) {
+                        let f = EvmCompilerFn::new(raw_fn);
+                        let action =
+                            unsafe { f.call_with_interpreter(&mut frame.interpreter, ctx) };
+                        frame
+                            .process_next_action::<_, BenchError>(ctx, action)
+                            .inspect(|i| {
+                                if i.is_result() {
+                                    frame.set_finished(true);
+                                }
+                            })?
+                    } else {
+                        // Fall back to interpreter for non-JIT contracts
+                        drop((ctx, frame_stack));
+                        evm.frame_run()?
+                    }
                 }
             };
 

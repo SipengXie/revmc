@@ -33,7 +33,7 @@ use revmc_context::RawEvmCompilerFn;
 
 use bin_common::{
     build_op_cfg, build_op_tx, compile_all_contracts, compile_all_contracts_with_cache,
-    extract_gas, make_evm, run_jit_or_native, BenchError, BenchEvm, BinLoader, JitHandler,
+    extract_gas, make_evm, run_jit_or_native, should_lookup_jit, BenchError, BenchEvm, BinLoader, JitHandler,
     NativeHandler, OpCtx,
 };
 
@@ -89,10 +89,13 @@ impl InstrumentedHandler {
     fn record_frame(&mut self, evm: &mut BenchEvm, depth: usize) {
         let frame = evm.0.frame_stack.get();
         let hash = frame.interpreter.bytecode.get_or_calculate_hash();
-        let used_jit = self
-            .functions
-            .as_ref()
-            .map_or(false, |f| f.contains_key(&hash));
+        let used_jit = self.functions.as_ref().map_or(false, |f| {
+            should_lookup_jit(
+                frame.data.is_create(),
+                frame.interpreter.input.bytecode_address,
+                frame.interpreter.bytecode.is_empty(),
+            ) && f.contains_key(&hash)
+        });
         let size = self.bytecode_sizes.get(&hash).copied().unwrap_or(0);
         let idx = self.frames.len();
         self.frames.push(FrameRecord {

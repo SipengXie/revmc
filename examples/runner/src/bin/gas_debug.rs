@@ -230,6 +230,15 @@ struct JitHandler {
     trace: Vec<TraceEvent>,
 }
 
+#[inline]
+fn should_lookup_jit(
+    frame_is_create: bool,
+    bytecode_address: Option<Address>,
+    bytecode_is_empty: bool,
+) -> bool {
+    !frame_is_create && bytecode_address.is_some() && !bytecode_is_empty
+}
+
 impl Handler for JitHandler {
     type Evm = BenchEvm;
     type Error = BenchError;
@@ -248,8 +257,16 @@ impl Handler for JitHandler {
             let raw_fn = {
                 let frame_stack = &mut evm.0.frame_stack;
                 let frame = frame_stack.get();
-                let bytecode_hash = frame.interpreter.bytecode.get_or_calculate_hash();
-                self.functions.get(&bytecode_hash).copied()
+                if should_lookup_jit(
+                    frame.data.is_create(),
+                    frame.interpreter.input.bytecode_address,
+                    frame.interpreter.bytecode.is_empty(),
+                ) {
+                    let bytecode_hash = frame.interpreter.bytecode.get_or_calculate_hash();
+                    self.functions.get(&bytecode_hash).copied()
+                } else {
+                    None
+                }
             };
 
             let (compiled, call_or_result) = if let Some(raw_fn) = raw_fn {

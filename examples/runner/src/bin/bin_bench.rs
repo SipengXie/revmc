@@ -31,8 +31,9 @@ use revmc_context::RawEvmCompilerFn;
 
 use bin_common::{
     build_op_cfg, build_op_tx, collect_unique_bytecodes, compile_all_contracts,
-    compile_all_contracts_with_cache, extract_gas, BenchEvm, BinLoader, JitHandler, NativeHandler,
-    OpCtx,
+    compile_all_contracts_with_cache, extract_gas, read_jit_dispatch_stats, reset_jit_dispatch_stats,
+    set_jit_dispatch_stats_enabled, BenchEvm, BinLoader, JitDispatchStats, JitHandler,
+    NativeHandler, OpCtx,
 };
 
 // ── Block Execution ─────────────────────────────────────────────────────────
@@ -42,6 +43,7 @@ struct BlockResult {
     jit_results: Vec<(bool, u64)>,
     native_dur: Duration,
     jit_dur: Duration,
+    jit_dispatch: JitDispatchStats,
 }
 
 /// Run a full block: for each tx, execute native then JIT on independent EVMs.
@@ -49,6 +51,7 @@ struct BlockResult {
 fn run_block(
     loader: &BinLoader,
     functions: &Arc<HashMap<B256, RawEvmCompilerFn>>,
+    collect_dispatch_stats: bool,
 ) -> Result<BlockResult, String> {
     let chain_id = loader.raw_txs().first().and_then(|tx| tx.chain_id);
     let cfg = build_op_cfg(chain_id);
@@ -73,6 +76,9 @@ fn run_block(
     let mut jit_results = Vec::with_capacity(loader.tx_count());
     let mut native_dur = Duration::ZERO;
     let mut jit_dur = Duration::ZERO;
+    if collect_dispatch_stats {
+        reset_jit_dispatch_stats();
+    }
 
     for (i, tx_bin) in loader.raw_txs().iter().enumerate() {
         if tx_bin.tx_type == 0x7e {
@@ -120,6 +126,11 @@ fn run_block(
         jit_results,
         native_dur,
         jit_dur,
+        jit_dispatch: if collect_dispatch_stats {
+            read_jit_dispatch_stats()
+        } else {
+            JitDispatchStats::default()
+        },
     })
 }
 
@@ -133,6 +144,7 @@ struct BlockStats {
     total_native_gas: u64,
     total_jit_gas: u64,
     mismatches: usize,
+    jit_dispatch: JitDispatchStats,
 }
 
 impl BlockStats {
@@ -140,7 +152,7 @@ impl BlockStats {
         self.native_dur.as_secs_f64() / self.jit_dur.as_secs_f64()
     }
 
-    fn print_summary(&self) {
+    fn print_summary(&self, show_dispatch: bool) {
         println!(
             "Block {} | {:>3} txs | native {:.2}ms | jit {:.2}ms | {:.2}x | gas n={} j={} | {}",
             self.block_number,
@@ -156,6 +168,18 @@ impl BlockStats {
                 "OK".into()
             },
         );
+        if show_dispatch {
+            println!(
+                "  JIT dispatch: frames={} lookup={} (hit={} miss={}) skipped: create={} no_bytecode_addr={} empty_bytecode={}",
+                self.jit_dispatch.total_frames,
+                self.jit_dispatch.lookup_attempts,
+                self.jit_dispatch.lookup_hits,
+                self.jit_dispatch.lookup_misses,
+                self.jit_dispatch.skip_create,
+                self.jit_dispatch.skip_no_bytecode_address,
+                self.jit_dispatch.skip_empty_bytecode,
+            );
+        }
     }
 }
 
@@ -190,10 +214,15 @@ struct Args {
     /// Persistent AOT cache directory
     #[arg(long)]
     cache_dir: Option<String>,
+
+    /// Print temporary JIT dispatch diagnostics (adds measurement overhead)
+    #[arg(long)]
+    dispatch_stats: bool,
 }
 
 fn main() {
     let args = Args::parse();
+    set_jit_dispatch_stats_enabled(args.dispatch_stats);
     let bench_dir = Path::new(&args.dir);
     let block_range: Vec<u64> = if let Some(end) = args.end {
         (args.start..=end).collect()
@@ -266,7 +295,7 @@ fn main() {
     let mut skipped = 0u64;
 
     for loader in &loaders {
-        let block_result = match run_block(loader, &compiled.functions) {
+        let block_result = match run_block(loader, &compiled.functions, args.dispatch_stats) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("FAIL block {}: {e}", loader.block_number());
@@ -296,8 +325,9 @@ fn main() {
             total_native_gas: block_result.native_results.iter().map(|(_, g)| g).sum(),
             total_jit_gas: block_result.jit_results.iter().map(|(_, g)| g).sum(),
             mismatches,
+            jit_dispatch: block_result.jit_dispatch,
         };
-        stats.print_summary();
+        stats.print_summary(args.dispatch_stats);
         all_stats.push(stats);
     }
 
@@ -313,6 +343,20 @@ fn main() {
     let total_native_gas: u64 = all_stats.iter().map(|s| s.total_native_gas).sum();
     let total_jit_gas: u64 = all_stats.iter().map(|s| s.total_jit_gas).sum();
     let total_mismatches: usize = all_stats.iter().map(|s| s.mismatches).sum();
+    let total_dispatch = if args.dispatch_stats {
+        Some(all_stats.iter().fold(JitDispatchStats::default(), |mut acc, s| {
+            acc.total_frames += s.jit_dispatch.total_frames;
+            acc.lookup_attempts += s.jit_dispatch.lookup_attempts;
+            acc.lookup_hits += s.jit_dispatch.lookup_hits;
+            acc.lookup_misses += s.jit_dispatch.lookup_misses;
+            acc.skip_create += s.jit_dispatch.skip_create;
+            acc.skip_no_bytecode_address += s.jit_dispatch.skip_no_bytecode_address;
+            acc.skip_empty_bytecode += s.jit_dispatch.skip_empty_bytecode;
+            acc
+        }))
+    } else {
+        None
+    };
 
     println!("\n========== Aggregate ==========");
     println!(
@@ -337,6 +381,18 @@ fn main() {
         "Speedup:   {:.2}x (native/jit)",
         total_native.as_secs_f64() / total_jit.as_secs_f64(),
     );
+    if let Some(total_dispatch) = total_dispatch {
+        println!(
+            "Dispatch:  frames={} lookup={} (hit={} miss={}) skipped: create={} no_bytecode_addr={} empty_bytecode={}",
+            total_dispatch.total_frames,
+            total_dispatch.lookup_attempts,
+            total_dispatch.lookup_hits,
+            total_dispatch.lookup_misses,
+            total_dispatch.skip_create,
+            total_dispatch.skip_no_bytecode_address,
+            total_dispatch.skip_empty_bytecode,
+        );
+    }
     println!("Gas: native={total_native_gas}, jit={total_jit_gas}");
     if total_mismatches > 0 {
         println!(

@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use op_revm::{DefaultOp, OpEvm, OpHaltReason, OpSpecId, OpTransactionError};
@@ -30,6 +31,77 @@ use serde::Deserialize;
 pub type OpCtx<DB> = op_revm::OpContext<DB>;
 pub type BenchEvm = OpEvm<op_revm::OpContext<CacheDB<EmptyDB>>, ()>;
 pub type BenchError = EVMError<core::convert::Infallible, OpTransactionError>;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JitDispatchStats {
+    pub total_frames: u64,
+    pub lookup_attempts: u64,
+    pub lookup_hits: u64,
+    pub lookup_misses: u64,
+    pub skip_create: u64,
+    pub skip_no_bytecode_address: u64,
+    pub skip_empty_bytecode: u64,
+}
+
+static JIT_TOTAL_FRAMES: AtomicU64 = AtomicU64::new(0);
+static JIT_LOOKUP_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static JIT_LOOKUP_HITS: AtomicU64 = AtomicU64::new(0);
+static JIT_LOOKUP_MISSES: AtomicU64 = AtomicU64::new(0);
+static JIT_SKIP_CREATE: AtomicU64 = AtomicU64::new(0);
+static JIT_SKIP_NO_BYTECODE_ADDRESS: AtomicU64 = AtomicU64::new(0);
+static JIT_SKIP_EMPTY_BYTECODE: AtomicU64 = AtomicU64::new(0);
+static JIT_DISPATCH_STATS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JitLookupDecision {
+    Lookup,
+    SkipCreate,
+    SkipNoBytecodeAddress,
+    SkipEmptyBytecode,
+}
+
+#[inline]
+fn jit_lookup_decision(
+    frame_is_create: bool,
+    bytecode_address: Option<Address>,
+    bytecode_is_empty: bool,
+) -> JitLookupDecision {
+    if frame_is_create {
+        JitLookupDecision::SkipCreate
+    } else if bytecode_address.is_none() {
+        JitLookupDecision::SkipNoBytecodeAddress
+    } else if bytecode_is_empty {
+        JitLookupDecision::SkipEmptyBytecode
+    } else {
+        JitLookupDecision::Lookup
+    }
+}
+
+pub fn reset_jit_dispatch_stats() {
+    JIT_TOTAL_FRAMES.store(0, Ordering::Relaxed);
+    JIT_LOOKUP_ATTEMPTS.store(0, Ordering::Relaxed);
+    JIT_LOOKUP_HITS.store(0, Ordering::Relaxed);
+    JIT_LOOKUP_MISSES.store(0, Ordering::Relaxed);
+    JIT_SKIP_CREATE.store(0, Ordering::Relaxed);
+    JIT_SKIP_NO_BYTECODE_ADDRESS.store(0, Ordering::Relaxed);
+    JIT_SKIP_EMPTY_BYTECODE.store(0, Ordering::Relaxed);
+}
+
+pub fn set_jit_dispatch_stats_enabled(enabled: bool) {
+    JIT_DISPATCH_STATS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn read_jit_dispatch_stats() -> JitDispatchStats {
+    JitDispatchStats {
+        total_frames: JIT_TOTAL_FRAMES.load(Ordering::Relaxed),
+        lookup_attempts: JIT_LOOKUP_ATTEMPTS.load(Ordering::Relaxed),
+        lookup_hits: JIT_LOOKUP_HITS.load(Ordering::Relaxed),
+        lookup_misses: JIT_LOOKUP_MISSES.load(Ordering::Relaxed),
+        skip_create: JIT_SKIP_CREATE.load(Ordering::Relaxed),
+        skip_no_bytecode_address: JIT_SKIP_NO_BYTECODE_ADDRESS.load(Ordering::Relaxed),
+        skip_empty_bytecode: JIT_SKIP_EMPTY_BYTECODE.load(Ordering::Relaxed),
+    }
+}
 
 // ── Spec Constants ──────────────────────────────────────────────────────────
 
@@ -286,6 +358,17 @@ impl Handler for JitHandler {
 }
 
 /// Execute the current frame using JIT if available, otherwise fall back to the interpreter.
+#[inline]
+pub(crate) fn should_lookup_jit(
+    frame_is_create: bool,
+    bytecode_address: Option<Address>,
+    bytecode_is_empty: bool,
+) -> bool {
+    jit_lookup_decision(frame_is_create, bytecode_address, bytecode_is_empty)
+        == JitLookupDecision::Lookup
+}
+
+/// Execute the current frame using JIT if available, otherwise fall back to the interpreter.
 pub fn run_jit_or_native(
     evm: &mut BenchEvm,
     functions: &HashMap<B256, RawEvmCompilerFn>,
@@ -293,8 +376,44 @@ pub fn run_jit_or_native(
 {
     let (ctx, frame_stack) = (&mut evm.0.ctx, &mut evm.0.frame_stack);
     let frame = frame_stack.get();
+    let collect_stats = JIT_DISPATCH_STATS_ENABLED.load(Ordering::Relaxed);
+    let decision = jit_lookup_decision(
+        frame.data.is_create(),
+        frame.interpreter.input.bytecode_address,
+        frame.interpreter.bytecode.is_empty(),
+    );
+    if collect_stats {
+        JIT_TOTAL_FRAMES.fetch_add(1, Ordering::Relaxed);
+        match decision {
+            JitLookupDecision::Lookup => {
+                JIT_LOOKUP_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+            }
+            JitLookupDecision::SkipCreate => {
+                JIT_SKIP_CREATE.fetch_add(1, Ordering::Relaxed);
+                drop((ctx, frame_stack));
+                return Ok(evm.frame_run()?);
+            }
+            JitLookupDecision::SkipNoBytecodeAddress => {
+                JIT_SKIP_NO_BYTECODE_ADDRESS.fetch_add(1, Ordering::Relaxed);
+                drop((ctx, frame_stack));
+                return Ok(evm.frame_run()?);
+            }
+            JitLookupDecision::SkipEmptyBytecode => {
+                JIT_SKIP_EMPTY_BYTECODE.fetch_add(1, Ordering::Relaxed);
+                drop((ctx, frame_stack));
+                return Ok(evm.frame_run()?);
+            }
+        }
+    } else if decision != JitLookupDecision::Lookup {
+        drop((ctx, frame_stack));
+        return Ok(evm.frame_run()?);
+    }
+
     let bytecode_hash = frame.interpreter.bytecode.get_or_calculate_hash();
     if let Some(&raw_fn) = functions.get(&bytecode_hash) {
+        if collect_stats {
+            JIT_LOOKUP_HITS.fetch_add(1, Ordering::Relaxed);
+        }
         let f = EvmCompilerFn::new(raw_fn);
         let action = unsafe { f.call_with_interpreter(&mut frame.interpreter, ctx) };
         let result = frame
@@ -306,6 +425,9 @@ pub fn run_jit_or_native(
             })?;
         Ok(result)
     } else {
+        if collect_stats {
+            JIT_LOOKUP_MISSES.fetch_add(1, Ordering::Relaxed);
+        }
         drop((ctx, frame_stack));
         Ok(evm.frame_run()?)
     }
@@ -641,4 +763,29 @@ pub fn make_evm(loader: &BinLoader, chain_id: Option<u64>) -> BenchEvm {
         .with_db(db)
         .with_tx(dummy_tx);
     OpEvm::new(ctx, ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_lookup_jit;
+    use revm::primitives::Address;
+
+    #[test]
+    fn skips_create_frames() {
+        let addr = Address::new([0x11; 20]);
+        assert!(!should_lookup_jit(true, Some(addr), false));
+    }
+
+    #[test]
+    fn skips_eoa_or_empty_bytecode_frames() {
+        let addr = Address::new([0x22; 20]);
+        assert!(!should_lookup_jit(false, None, false));
+        assert!(!should_lookup_jit(false, Some(addr), true));
+    }
+
+    #[test]
+    fn looks_up_only_for_non_create_contract_frames() {
+        let addr = Address::new([0x33; 20]);
+        assert!(should_lookup_jit(false, Some(addr), false));
+    }
 }

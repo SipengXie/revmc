@@ -103,6 +103,15 @@ struct JitHandler {
     functions: Arc<HashMap<B256, RawEvmCompilerFn>>,
 }
 
+#[inline]
+fn should_lookup_jit(
+    frame_is_create: bool,
+    bytecode_address: Option<Address>,
+    bytecode_is_empty: bool,
+) -> bool {
+    !frame_is_create && bytecode_address.is_some() && !bytecode_is_empty
+}
+
 impl Handler for JitHandler {
     type Evm = BenchEvm<'static>;
     type Error = BenchError;
@@ -121,22 +130,30 @@ impl Handler for JitHandler {
         loop {
             let call_or_result = {
                 let frame = evm.frame_stack.get();
-                let bytecode_hash = frame.interpreter.bytecode.get_or_calculate_hash();
-
-                if let Some(&raw_fn) = self.functions.get(&bytecode_hash) {
-                    let ctx = &mut evm.ctx;
-                    let f = EvmCompilerFn::new(raw_fn);
-                    let action =
-                        unsafe { f.call_with_interpreter(&mut frame.interpreter, ctx) };
-                    frame
-                        .process_next_action::<_, BenchError>(ctx, action)
-                        .inspect(|i| {
-                            if i.is_result() {
-                                frame.set_finished(true);
-                            }
-                        })?
-                } else {
+                if !should_lookup_jit(
+                    frame.data.is_create(),
+                    frame.interpreter.input.bytecode_address,
+                    frame.interpreter.bytecode.is_empty(),
+                ) {
                     evm.frame_run()?
+                } else {
+                    let bytecode_hash = frame.interpreter.bytecode.get_or_calculate_hash();
+
+                    if let Some(&raw_fn) = self.functions.get(&bytecode_hash) {
+                        let ctx = &mut evm.ctx;
+                        let f = EvmCompilerFn::new(raw_fn);
+                        let action =
+                            unsafe { f.call_with_interpreter(&mut frame.interpreter, ctx) };
+                        frame
+                            .process_next_action::<_, BenchError>(ctx, action)
+                            .inspect(|i| {
+                                if i.is_result() {
+                                    frame.set_finished(true);
+                                }
+                            })?
+                    } else {
+                        evm.frame_run()?
+                    }
                 }
             };
 

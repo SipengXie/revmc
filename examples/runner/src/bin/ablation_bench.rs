@@ -30,7 +30,7 @@ use revmc_builtins as _;
 use revmc_context::RawEvmCompilerFn;
 
 use bin_common::{
-    build_op_cfg, build_op_tx, compile_all_contracts_with_cache, run_jit_or_native, BenchError,
+    build_op_cfg, build_op_tx, compile_all_contracts_with_cache, run_jit_or_native, should_lookup_jit, BenchError,
     BenchEvm, BinLoader, JitHandler, NativeHandler, OpCtx, TxBin,
 };
 
@@ -137,9 +137,15 @@ impl Handler for DiscoveryHandler {
         // Record the first frame
         {
             let frame = evm.0.frame_stack.get();
-            let hash = frame.interpreter.bytecode.get_or_calculate_hash();
-            if self.all_functions.contains_key(&hash) {
-                *self.counts.entry(hash).or_insert(0) += 1;
+            if should_lookup_jit(
+                frame.data.is_create(),
+                frame.interpreter.input.bytecode_address,
+                frame.interpreter.bytecode.is_empty(),
+            ) {
+                let hash = frame.interpreter.bytecode.get_or_calculate_hash();
+                if self.all_functions.contains_key(&hash) {
+                    *self.counts.entry(hash).or_insert(0) += 1;
+                }
             }
         }
 
@@ -150,9 +156,15 @@ impl Handler for DiscoveryHandler {
                     ItemOrResult::Item(_) => {
                         // Record newly entered frame
                         let frame = evm.0.frame_stack.get();
-                        let hash = frame.interpreter.bytecode.get_or_calculate_hash();
-                        if self.all_functions.contains_key(&hash) {
-                            *self.counts.entry(hash).or_insert(0) += 1;
+                        if should_lookup_jit(
+                            frame.data.is_create(),
+                            frame.interpreter.input.bytecode_address,
+                            frame.interpreter.bytecode.is_empty(),
+                        ) {
+                            let hash = frame.interpreter.bytecode.get_or_calculate_hash();
+                            if self.all_functions.contains_key(&hash) {
+                                *self.counts.entry(hash).or_insert(0) += 1;
+                            }
                         }
                         continue;
                     }
