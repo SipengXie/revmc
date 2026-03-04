@@ -28,8 +28,8 @@ use revmc::OptimizationLevel;
 use revmc_builtins as _;
 
 use bin_common::{
-    build_op_cfg, build_op_tx, compile_all_contracts_with_cache, BenchEvm, BenchError,
-    BinLoader, JitHandler, NativeHandler, OpCtx,
+    build_op_cfg, build_op_tx, compile_all_contracts_with_cache, run_jit_or_native, should_lookup_jit,
+    BenchEvm, BenchError, BinLoader, JitHandler, NativeHandler, OpCtx,
 };
 
 // ── Frame-tracing handler ────────────────────────────────────────────────────
@@ -41,7 +41,7 @@ struct FrameTracer {
     // Step timings (nanoseconds)
     pub t_hash: u64,
     pub t_lookup: u64,
-    pub t_frame_run: u64,
+    pub t_frame_exec: u64,
     pub t_frame_return: u64,
 }
 
@@ -70,13 +70,18 @@ impl Handler for FrameTracer {
             self.t_hash += t0.elapsed().as_nanos() as u64;
 
             let t1 = Instant::now();
-            let is_jit = self.jit_fns.contains_key(&hash);
+            let frame = evm.0.frame_stack.get();
+            let is_jit = should_lookup_jit(
+                frame.data.is_create(),
+                frame.interpreter.input.bytecode_address,
+                frame.interpreter.bytecode.is_empty(),
+            ) && self.jit_fns.contains_key(&hash);
             self.t_lookup += t1.elapsed().as_nanos() as u64;
             self.frames.push((hash, size, is_jit));
 
             let t2 = Instant::now();
-            let call_or_result = evm.frame_run()?;
-            self.t_frame_run += t2.elapsed().as_nanos() as u64;
+            let call_or_result = run_jit_or_native(evm, &self.jit_fns)?;
+            self.t_frame_exec += t2.elapsed().as_nanos() as u64;
 
             let result = match call_or_result {
                 ItemOrResult::Item(init) => match evm.frame_init(init)? {
@@ -337,7 +342,6 @@ fn main() {
     println!();
     println!("  If 'empty map' ≈ native: overhead comes from JIT-compiled .so memory pressure");
     println!("  If 'empty map' ≈ JIT:    overhead comes from dispatch logic itself");
-    let overhead_us = j_med - n_med;
     println!();
 
     // ── 6. Overhead attribution ───────────────────────────────────────────────
@@ -372,7 +376,7 @@ fn main() {
         frames: Vec::new(),
         jit_fns: compiled.functions.clone(),
         loop_iters: 0,
-        t_hash: 0, t_lookup: 0, t_frame_run: 0, t_frame_return: 0,
+        t_hash: 0, t_lookup: 0, t_frame_exec: 0, t_frame_return: 0,
     };
     let _ = tracer.run(&mut trace_evm);
 
@@ -404,9 +408,9 @@ fn main() {
     println!("  loop_iters:      {}", tracer.loop_iters);
     println!("  t_hash:          {:.1}µs  ← get_or_calculate_hash()", tracer.t_hash as f64 / 1000.0);
     println!("  t_lookup:        {:.1}µs  ← HashMap::get()", tracer.t_lookup as f64 / 1000.0);
-    println!("  t_frame_run:     {:.1}µs  ← evm.frame_run()", tracer.t_frame_run as f64 / 1000.0);
+    println!("  t_frame_exec:    {:.1}µs  ← run_jit_or_native()", tracer.t_frame_exec as f64 / 1000.0);
     println!("  t_frame_return:  {:.1}µs  ← evm.frame_return_result()", tracer.t_frame_return as f64 / 1000.0);
-    println!("  sum:             {:.1}µs", (tracer.t_hash + tracer.t_lookup + tracer.t_frame_run + tracer.t_frame_return) as f64 / 1000.0);
+    println!("  sum:             {:.1}µs", (tracer.t_hash + tracer.t_lookup + tracer.t_frame_exec + tracer.t_frame_return) as f64 / 1000.0);
     println!();
     println!("  JIT frame sizes:    {:?}", &jit_sizes[..jit_sizes.len().min(10)]);
     println!("  Native frame sizes: {:?}", &nat_sizes[..nat_sizes.len().min(5)]);
@@ -430,7 +434,6 @@ fn main() {
     // Also time hash_slow on an actually analyzed bytecode
     {
         use revm::bytecode::{Bytecode, LegacyRawBytecode};
-        let raw_bc = Bytecode::new_raw(revm::primitives::Bytes::from(initcode.clone()));
         // Analyze it via LegacyRawBytecode
         let raw2 = LegacyRawBytecode(revm::primitives::Bytes::from(initcode.clone()));
         let analyzed = Bytecode::LegacyAnalyzed(raw2.into_analyzed());

@@ -122,12 +122,19 @@ fn run_selected_txs(
         op_revm::OpEvm::new(ctx, ())
     };
 
+    let selected_pos: HashMap<usize, usize> = tx_indices
+        .iter()
+        .enumerate()
+        .map(|(pos, &tx_idx)| (tx_idx, pos))
+        .collect();
+
+    // Preserve real state transitions by replaying the full block in order.
+    // Only selected txs contribute to measured totals/samples.
     let mut total = Duration::ZERO;
-    let mut per_tx = Vec::with_capacity(tx_indices.len());
-    for &i in tx_indices {
-        let tx_bin = &loader.raw_txs()[i];
+    let mut per_tx = vec![Duration::ZERO; tx_indices.len()];
+    for (i, tx_bin) in loader.raw_txs().iter().enumerate() {
+        let selected_slot = selected_pos.get(&i).copied();
         if tx_bin.tx_type == 0x7e {
-            per_tx.push(Duration::ZERO);
             continue;
         }
         evm.0.ctx.tx = build_op_tx(tx_bin);
@@ -140,8 +147,10 @@ fn run_selected_txs(
             let _ = handler.run(&mut evm);
         }
         let elapsed = t0.elapsed();
-        total += elapsed;
-        per_tx.push(elapsed);
+        if let Some(slot) = selected_slot {
+            total += elapsed;
+            per_tx[slot] = elapsed;
+        }
     }
     (total, per_tx)
 }

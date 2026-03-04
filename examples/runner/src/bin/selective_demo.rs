@@ -14,6 +14,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "../jit_lookup.rs"]
+mod jit_lookup;
+
 use clap::Parser;
 use revm::{
     bytecode::Bytecode,
@@ -34,6 +37,7 @@ use revm::{
 use revmc::{EvmCompiler, EvmLlvmBackend, OptimizationLevel};
 use revmc_context::{EvmCompilerFn, RawEvmCompilerFn};
 use serde::Deserialize;
+use jit_lookup::should_lookup_jit;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -102,15 +106,6 @@ type BenchError = EVMError<core::convert::Infallible, InvalidTransaction>;
 
 struct JitHandler {
     functions: Arc<HashMap<B256, RawEvmCompilerFn>>,
-}
-
-#[inline]
-fn should_lookup_jit(
-    frame_is_create: bool,
-    bytecode_address: Option<Address>,
-    bytecode_is_empty: bool,
-) -> bool {
-    !frame_is_create && bytecode_address.is_some() && !bytecode_is_empty
 }
 
 impl Handler for JitHandler {

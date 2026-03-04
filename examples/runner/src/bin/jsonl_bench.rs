@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[path = "../jit_lookup.rs"]
+mod jit_lookup;
+
 use op_revm::{DefaultOp, OpEvm, OpHaltReason, OpSpecId, OpTransactionError};
 use op_revm::transaction::OpTransaction;
 use revm::{
@@ -32,6 +35,7 @@ use revmc::{EvmCompiler, EvmLlvmBackend, OptimizationLevel};
 use revmc_builtins as _;
 use revmc_context::{EvmCompilerFn, RawEvmCompilerFn};
 use serde::Deserialize;
+use jit_lookup::should_lookup_jit;
 
 // ── Spec Constants ──────────────────────────────────────────────────────────
 // Single source of truth: OpSpecId for execution, derived SpecId for JIT compilation.
@@ -673,15 +677,6 @@ impl Handler for NativeHandler {
 /// JIT exec loop: looks up compiled functions by bytecode hash, falls back to interpreter.
 struct JitHandler {
     functions: Arc<HashMap<B256, RawEvmCompilerFn>>,
-}
-
-#[inline]
-fn should_lookup_jit(
-    frame_is_create: bool,
-    bytecode_address: Option<Address>,
-    bytecode_is_empty: bool,
-) -> bool {
-    !frame_is_create && bytecode_address.is_some() && !bytecode_is_empty
 }
 
 impl Handler for JitHandler {

@@ -28,6 +28,11 @@ use revmc::{EvmCompiler, EvmLlvmBackend, OptimizationLevel};
 use revmc_context::{EvmCompilerFn, RawEvmCompilerFn};
 use serde::Deserialize;
 
+#[path = "jit_lookup.rs"]
+mod jit_lookup;
+
+pub use jit_lookup::should_lookup_jit;
+
 pub type OpCtx<DB> = op_revm::OpContext<DB>;
 pub type BenchEvm = OpEvm<op_revm::OpContext<CacheDB<EmptyDB>>, ()>;
 pub type BenchError = EVMError<core::convert::Infallible, OpTransactionError>;
@@ -66,14 +71,17 @@ fn jit_lookup_decision(
     bytecode_address: Option<Address>,
     bytecode_is_empty: bool,
 ) -> JitLookupDecision {
-    if frame_is_create {
+    if should_lookup_jit(frame_is_create, bytecode_address, bytecode_is_empty) {
+        JitLookupDecision::Lookup
+    } else if frame_is_create {
         JitLookupDecision::SkipCreate
     } else if bytecode_address.is_none() {
         JitLookupDecision::SkipNoBytecodeAddress
     } else if bytecode_is_empty {
         JitLookupDecision::SkipEmptyBytecode
     } else {
-        JitLookupDecision::Lookup
+        // All false negatives are handled above.
+        unreachable!("inconsistent JIT lookup decision inputs")
     }
 }
 
@@ -355,17 +363,6 @@ impl Handler for JitHandler {
             }
         }
     }
-}
-
-/// Execute the current frame using JIT if available, otherwise fall back to the interpreter.
-#[inline]
-pub(crate) fn should_lookup_jit(
-    frame_is_create: bool,
-    bytecode_address: Option<Address>,
-    bytecode_is_empty: bool,
-) -> bool {
-    jit_lookup_decision(frame_is_create, bytecode_address, bytecode_is_empty)
-        == JitLookupDecision::Lookup
 }
 
 /// Execute the current frame using JIT if available, otherwise fall back to the interpreter.

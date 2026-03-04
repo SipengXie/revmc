@@ -8,6 +8,9 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[path = "../jit_lookup.rs"]
+mod jit_lookup;
+
 use op_revm::{DefaultOp, OpEvm, OpHaltReason, OpSpecId, OpTransactionError};
 use op_revm::transaction::OpTransaction;
 use revm::{
@@ -27,6 +30,7 @@ use revmc::{EvmCompiler, EvmLlvmBackend, OptimizationLevel};
 use revmc_builtins as _;
 use revmc_context::{EvmCompilerFn, RawEvmCompilerFn};
 use serde::Deserialize;
+use jit_lookup::should_lookup_jit;
 
 const OP_SPEC: OpSpecId = OpSpecId::ISTHMUS;
 const ETH_SPEC: SpecId = OP_SPEC.into_eth_spec();
@@ -228,15 +232,6 @@ struct JitHandler {
     functions: Arc<HashMap<B256, RawEvmCompilerFn>>,
     trace_calls: bool,
     trace: Vec<TraceEvent>,
-}
-
-#[inline]
-fn should_lookup_jit(
-    frame_is_create: bool,
-    bytecode_address: Option<Address>,
-    bytecode_is_empty: bool,
-) -> bool {
-    !frame_is_create && bytecode_address.is_some() && !bytecode_is_empty
 }
 
 impl Handler for JitHandler {
