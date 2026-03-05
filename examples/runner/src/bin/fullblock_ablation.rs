@@ -54,6 +54,9 @@ struct Args {
     /// Path to write whitelist JSON
     #[arg(long)]
     output: Option<String>,
+    /// Benchmark mode: load whitelist JSON and compare native vs all-JIT vs selective
+    #[arg(long)]
+    benchmark: Option<String>,
 }
 
 // ── Discovery Handler ───────────────────────────────────────────────────────
@@ -346,6 +349,122 @@ fn verdict(p_value: f64, mean_diff: f64, alpha: f64) -> &'static str {
     }
 }
 
+// ── Benchmark Mode ──────────────────────────────────────────────────────────
+
+fn benchmark_whitelist(
+    loader: &BinLoader,
+    all_functions: &Arc<HashMap<B256, RawEvmCompilerFn>>,
+    whitelist_path: &str,
+    args: &Args,
+) {
+    // Load whitelist JSON
+    let json_str = std::fs::read_to_string(whitelist_path)
+        .unwrap_or_else(|e| panic!("read {whitelist_path}: {e}"));
+    let json: serde_json::Value =
+        serde_json::from_str(&json_str).expect("parse whitelist JSON");
+    let wl_hashes: Vec<B256> = json["whitelist"]
+        .as_array()
+        .expect("whitelist array")
+        .iter()
+        .filter_map(|v| {
+            let s = v.as_str()?;
+            let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s)).ok()?;
+            Some(B256::from_slice(&bytes))
+        })
+        .collect();
+
+    // Build selective function map
+    let selective_fns: Arc<HashMap<B256, RawEvmCompilerFn>> = Arc::new(
+        all_functions
+            .iter()
+            .filter(|(h, _)| wl_hashes.contains(h))
+            .map(|(&h, &f)| (h, f))
+            .collect(),
+    );
+
+    eprintln!(
+        "\n=== Benchmark: {} whitelist / {} total JIT ===",
+        selective_fns.len(),
+        all_functions.len()
+    );
+
+    // Warmup all three modes
+    for _ in 0..args.warmup {
+        run_full_block(loader, None);
+        run_full_block(loader, Some(all_functions));
+        run_full_block(loader, Some(&selective_fns));
+    }
+
+    // Timed rounds
+    let mut native_times = Vec::with_capacity(args.rounds);
+    let mut alljit_times = Vec::with_capacity(args.rounds);
+    let mut selective_times = Vec::with_capacity(args.rounds);
+
+    for r in 0..args.rounds {
+        let n = run_full_block(loader, None);
+        let a = run_full_block(loader, Some(all_functions));
+        let s = run_full_block(loader, Some(&selective_fns));
+
+        let sum_us = |v: &[Duration]| -> f64 {
+            v.iter().map(|d| d.as_secs_f64() * 1e6).sum()
+        };
+
+        native_times.push(sum_us(&n));
+        alljit_times.push(sum_us(&a));
+        selective_times.push(sum_us(&s));
+
+        if (r + 1) % 5 == 0 {
+            eprintln!("  round {}/{}", r + 1, args.rounds);
+        }
+    }
+
+    // Compute medians
+    let med = |v: &mut Vec<f64>| -> f64 {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+
+    let native_med = med(&mut native_times);
+    let alljit_med = med(&mut alljit_times);
+    let selective_med = med(&mut selective_times);
+
+    println!("\n=== Full-Block Benchmark: block {} ===\n", args.block);
+    println!(
+        "{:>16}  {:>8}  {:>10}  {:>8}",
+        "Mode", "JIT_Fns", "Time(ms)", "vs Native"
+    );
+    println!(
+        "{:>16}  {:>8}  {:>10.2}  {:>8}",
+        "Native", 0, native_med / 1000.0, "1.00x"
+    );
+    println!(
+        "{:>16}  {:>8}  {:>10.2}  {:>7.2}x",
+        "All-JIT",
+        all_functions.len(),
+        alljit_med / 1000.0,
+        native_med / alljit_med
+    );
+    println!(
+        "{:>16}  {:>8}  {:>10.2}  {:>7.2}x",
+        "Selective-JIT",
+        selective_fns.len(),
+        selective_med / 1000.0,
+        native_med / selective_med
+    );
+
+    // Per-round details to stderr
+    eprintln!("\nPer-round (ms): native / all-jit / selective");
+    for r in 0..args.rounds {
+        eprintln!(
+            "  R{:02}: {:.2} / {:.2} / {:.2}",
+            r,
+            native_times[r] / 1000.0,
+            alljit_times[r] / 1000.0,
+            selective_times[r] / 1000.0
+        );
+    }
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -371,6 +490,12 @@ fn main() {
     );
     let all_functions = compiled.functions;
     eprintln!("  {} JIT functions loaded", all_functions.len());
+
+    // ── Benchmark mode: load whitelist and compare ──────────────────────────
+    if let Some(ref whitelist_path) = args.benchmark {
+        benchmark_whitelist(&loader, &all_functions, whitelist_path, &args);
+        return;
+    }
 
     // ── Phase 0: Baseline ───────────────────────────────────────────────────
     eprintln!("\n=== Phase 0: Baseline ===");
