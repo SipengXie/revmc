@@ -73,6 +73,14 @@ path = "src/bin/ablation_bench.rs"
 name = "selective_demo"
 path = "src/bin/selective_demo.rs"
 
+[[bin]]
+name = "icache_experiment"
+path = "src/bin/icache_experiment.rs"
+
+[[bin]]
+name = "fullblock_ablation"
+path = "src/bin/fullblock_ablation.rs"
+
 [[bench]]
 name = "bench_airdrop"
 path = "src/bench_airdrop.rs"
