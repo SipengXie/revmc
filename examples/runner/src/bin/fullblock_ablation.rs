@@ -373,45 +373,66 @@ fn benchmark_whitelist(
         })
         .collect();
 
-    // Build selective function map
-    let selective_fns: Arc<HashMap<B256, RawEvmCompilerFn>> = Arc::new(
+    let parse_hashes = |key: &str| -> Vec<B256> {
+        json[key]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|v| {
+                let s = v.as_str()?;
+                let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s)).ok()?;
+                Some(B256::from_slice(&bytes))
+            })
+            .collect()
+    };
+    let bl_hashes: Vec<B256> = parse_hashes("blacklist");
+
+    // Build function maps
+    let good_only: Arc<HashMap<B256, RawEvmCompilerFn>> = Arc::new(
         all_functions
             .iter()
             .filter(|(h, _)| wl_hashes.contains(h))
             .map(|(&h, &f)| (h, f))
             .collect(),
     );
+    let no_bad: Arc<HashMap<B256, RawEvmCompilerFn>> = Arc::new(
+        all_functions
+            .iter()
+            .filter(|(h, _)| !bl_hashes.contains(h))
+            .map(|(&h, &f)| (h, f))
+            .collect(),
+    );
 
     eprintln!(
-        "\n=== Benchmark: {} whitelist / {} total JIT ===",
-        selective_fns.len(),
+        "\n=== Benchmark: good_only={} / no_bad={} / all={} ===",
+        good_only.len(),
+        no_bad.len(),
         all_functions.len()
     );
 
-    // Warmup all three modes
+    // Warmup all four modes
     for _ in 0..args.warmup {
         run_full_block(loader, None);
         run_full_block(loader, Some(all_functions));
-        run_full_block(loader, Some(&selective_fns));
+        run_full_block(loader, Some(&good_only));
+        run_full_block(loader, Some(&no_bad));
     }
 
     // Timed rounds
     let mut native_times = Vec::with_capacity(args.rounds);
     let mut alljit_times = Vec::with_capacity(args.rounds);
-    let mut selective_times = Vec::with_capacity(args.rounds);
+    let mut good_only_times = Vec::with_capacity(args.rounds);
+    let mut no_bad_times = Vec::with_capacity(args.rounds);
 
     for r in 0..args.rounds {
-        let n = run_full_block(loader, None);
-        let a = run_full_block(loader, Some(all_functions));
-        let s = run_full_block(loader, Some(&selective_fns));
-
         let sum_us = |v: &[Duration]| -> f64 {
             v.iter().map(|d| d.as_secs_f64() * 1e6).sum()
         };
 
-        native_times.push(sum_us(&n));
-        alljit_times.push(sum_us(&a));
-        selective_times.push(sum_us(&s));
+        native_times.push(sum_us(&run_full_block(loader, None)));
+        alljit_times.push(sum_us(&run_full_block(loader, Some(all_functions))));
+        good_only_times.push(sum_us(&run_full_block(loader, Some(&good_only))));
+        no_bad_times.push(sum_us(&run_full_block(loader, Some(&no_bad))));
 
         if (r + 1) % 5 == 0 {
             eprintln!("  round {}/{}", r + 1, args.rounds);
@@ -426,41 +447,38 @@ fn benchmark_whitelist(
 
     let native_med = med(&mut native_times);
     let alljit_med = med(&mut alljit_times);
-    let selective_med = med(&mut selective_times);
+    let good_only_med = med(&mut good_only_times);
+    let no_bad_med = med(&mut no_bad_times);
 
     println!("\n=== Full-Block Benchmark: block {} ===\n", args.block);
     println!(
-        "{:>16}  {:>8}  {:>10}  {:>8}",
+        "{:>16}  {:>8}  {:>10}  {:>9}",
         "Mode", "JIT_Fns", "Time(ms)", "vs Native"
     );
+    let print_row = |name: &str, fns: usize, ms: f64, baseline: f64| {
+        println!(
+            "{name:>16}  {fns:>8}  {ms:>10.2}  {speedup:>8.2}x",
+            speedup = baseline / ms
+        );
+    };
     println!(
-        "{:>16}  {:>8}  {:>10.2}  {:>8}",
+        "{:>16}  {:>8}  {:>10.2}  {:>9}",
         "Native", 0, native_med / 1000.0, "1.00x"
     );
-    println!(
-        "{:>16}  {:>8}  {:>10.2}  {:>7.2}x",
-        "All-JIT",
-        all_functions.len(),
-        alljit_med / 1000.0,
-        native_med / alljit_med
-    );
-    println!(
-        "{:>16}  {:>8}  {:>10.2}  {:>7.2}x",
-        "Selective-JIT",
-        selective_fns.len(),
-        selective_med / 1000.0,
-        native_med / selective_med
-    );
+    print_row("All-JIT", all_functions.len(), alljit_med / 1000.0, native_med / 1000.0);
+    print_row("No-Bad", no_bad.len(), no_bad_med / 1000.0, native_med / 1000.0);
+    print_row("Good-Only", good_only.len(), good_only_med / 1000.0, native_med / 1000.0);
 
     // Per-round details to stderr
-    eprintln!("\nPer-round (ms): native / all-jit / selective");
+    eprintln!("\nPer-round (ms): native / all-jit / no-bad / good-only");
     for r in 0..args.rounds {
         eprintln!(
-            "  R{:02}: {:.2} / {:.2} / {:.2}",
+            "  R{:02}: {:.2} / {:.2} / {:.2} / {:.2}",
             r,
             native_times[r] / 1000.0,
             alljit_times[r] / 1000.0,
-            selective_times[r] / 1000.0
+            no_bad_times[r] / 1000.0,
+            good_only_times[r] / 1000.0,
         );
     }
 }
