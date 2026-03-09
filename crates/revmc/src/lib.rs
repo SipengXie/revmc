@@ -12,6 +12,8 @@ use alloy_primitives as _;
 mod bytecode;
 pub use bytecode::*;
 
+pub mod skeleton;
+
 mod compiler;
 pub use compiler::{EvmCompiler, EvmCompilerInput};
 
