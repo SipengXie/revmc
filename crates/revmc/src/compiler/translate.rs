@@ -977,11 +977,37 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 self.push(value);
             }
             op::PUSH1..=op::PUSH32 => {
-                // NOTE: This can be None if the bytecode is invalid.
-                let imm = self.bytecode.get_imm(data);
-                let value = imm.map(U256::from_be_slice).unwrap_or_default();
-                let value = self.bcx.iconst_256(value);
-                self.push(value);
+                if data.flags.contains(InstFlags::VARIANT_PUSH) {
+                    // Load i256 from per-instance data table (32-byte LE entries).
+                    // 1. Load imm_data_ptr from EvmContext.
+                    let table_ptr_ptr = get_field(
+                        &mut self.bcx,
+                        self.ecx,
+                        mem::offset_of!(EvmContext<'_>, imm_data_ptr),
+                        "ecx.imm_data_ptr.addr",
+                    );
+                    let table_ptr =
+                        self.bcx.load(self.ptr_type, table_ptr_ptr, "imm_table_ptr");
+                    // 2. GEP to the entry: byte_offset = table_index * 32.
+                    let byte_offset = data.imm_table_offset as i64 * 32;
+                    let offset = self.bcx.iconst(self.isize_type, byte_offset);
+                    let elem_ptr = self.bcx.gep(
+                        self.bcx.type_int(8),
+                        table_ptr,
+                        &[offset],
+                        "imm.ptr",
+                    );
+                    // 3. Load i256 (LE on x86-64, matching U256 memory layout).
+                    let value = self.bcx.load(self.word_type, elem_ptr, "imm.val");
+                    self.push(value);
+                } else {
+                    // Existing path: compile-time constant.
+                    // NOTE: This can be None if the bytecode is invalid.
+                    let imm = self.bytecode.get_imm(data);
+                    let value = imm.map(U256::from_be_slice).unwrap_or_default();
+                    let value = self.bcx.iconst_256(value);
+                    self.push(value);
+                }
             }
 
             op::DUP1..=op::DUP16 => self.dup((opcode - op::DUP1 + 1) as usize),
