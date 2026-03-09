@@ -77,7 +77,7 @@ impl<'a> Bytecode<'a> {
 
             let section = Section::default();
 
-            insts.push(InstData { opcode, flags, base_gas, data, pc: pc as u32, section });
+            insts.push(InstData { opcode, flags, base_gas, data, pc: pc as u32, section, imm_table_offset: 0 });
         }
 
         let mut bytecode = Self {
@@ -173,6 +173,41 @@ impl<'a> Bytecode<'a> {
         self.construct_sections();
 
         Ok(())
+    }
+
+    /// Apply skeleton variance classification to instruction flags.
+    /// Must be called after `analyze()`.
+    ///
+    /// Marks variant PUSHes with `VARIANT_PUSH` flag and stores their data table offset.
+    /// PUSH0 is skipped (always invariant, not in variance map).
+    pub(crate) fn apply_variance(&mut self, variance: &crate::skeleton::SkeletonVariance) {
+        let mut push_index = 0usize;
+        for inst in &mut self.insts {
+            if inst.opcode >= op::PUSH1 && inst.opcode <= op::PUSH32 {
+                assert!(
+                    push_index < variance.pushes.len(),
+                    "variance map has fewer entries than bytecode PUSH instructions"
+                );
+                match variance.pushes[push_index] {
+                    crate::skeleton::PushClassification::Variant { table_index } => {
+                        debug_assert!(
+                            !inst.flags.contains(InstFlags::SKIP_LOGIC),
+                            "PUSH at index {} is both SKIP_LOGIC and Variant",
+                            push_index
+                        );
+                        inst.flags |= InstFlags::VARIANT_PUSH;
+                        inst.imm_table_offset = table_index;
+                    }
+                    crate::skeleton::PushClassification::Invariant => {}
+                }
+                push_index += 1;
+            }
+        }
+        assert_eq!(
+            push_index,
+            variance.pushes.len(),
+            "variance map has more entries than bytecode PUSH instructions"
+        );
     }
 
     /// Mark `PUSH<N>` followed by `JUMP[I]` as `STATIC_JUMP` and resolve the target.
@@ -413,6 +448,9 @@ pub(crate) struct InstData {
     pub(crate) pc: u32,
     /// The section this instruction belongs to.
     pub(crate) section: Section,
+    /// Offset into the per-instance data table (variant PUSH index).
+    /// Only meaningful when `VARIANT_PUSH` flag is set. Byte offset = value * 32.
+    pub(crate) imm_table_offset: u32,
 }
 
 impl PartialEq<u8> for InstData {
@@ -431,13 +469,16 @@ impl PartialEq<InstData> for u8 {
 
 impl fmt::Debug for InstData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InstData")
-            .field("opcode", &self.to_op())
+        let mut s = f.debug_struct("InstData");
+        s.field("opcode", &self.to_op())
             .field("flags", &format_args!("{:?}", self.flags))
             .field("data", &self.data)
             .field("pc", &self.pc)
-            .field("section", &self.section)
-            .finish()
+            .field("section", &self.section);
+        if self.flags.contains(InstFlags::VARIANT_PUSH) {
+            s.field("imm_table_offset", &self.imm_table_offset);
+        }
+        s.finish()
     }
 }
 
@@ -446,7 +487,7 @@ impl InstData {
     /// Note that this may not be a valid instruction.
     #[inline]
     fn new(opcode: u8) -> Self {
-        Self { opcode, ..Default::default() }
+        Self { opcode, imm_table_offset: 0, ..Default::default() }
     }
 
     /// Returns the length of the immediate data of this instruction.
@@ -579,6 +620,9 @@ bitflags::bitflags! {
         /// The instruction is unknown.
         /// Always returns [`InstructionResult::NotFound`] at runtime.
         const UNKNOWN = 1 << 4;
+
+        /// This PUSH loads its value from the per-instance data table (skeleton compilation).
+        const VARIANT_PUSH = 1 << 5;
 
         /// Skip generating instruction logic, but keep the gas calculation.
         const SKIP_LOGIC = 1 << 6;
