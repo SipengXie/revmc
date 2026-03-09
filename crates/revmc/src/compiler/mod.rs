@@ -229,6 +229,47 @@ impl<B: Backend> EvmCompiler<B> {
         self.translate_inner(name, &bytecode)
     }
 
+    /// Translates EVM bytecode using skeleton-aware compilation.
+    ///
+    /// Like [`translate`](Self::translate), but applies variance classification so that
+    /// variant PUSHes load from a per-instance data table instead of using inline constants.
+    /// The caller must set `EvmContext::imm_data_ptr` before invoking the compiled function.
+    ///
+    /// If `variance` has no variant PUSHes (all Invariant), this produces identical code
+    /// to `translate()` — zero overhead for singletons.
+    pub fn translate_skeleton<'a>(
+        &mut self,
+        name: &str,
+        input: impl Into<EvmCompilerInput<'a>>,
+        spec_id: SpecId,
+        variance: &crate::skeleton::SkeletonVariance,
+    ) -> Result<B::FuncId> {
+        ensure!(cfg!(target_endian = "little"), "only little-endian is supported");
+        ensure!(!self.finalized, "cannot compile more functions after finalizing the module");
+        let mut bytecode = self.parse(input.into(), spec_id)?;
+        bytecode.apply_variance(variance);
+        self.translate_inner(name, &bytecode)
+    }
+
+    /// (JIT) Compiles skeleton-aware EVM bytecode into a JIT function.
+    ///
+    /// See [`translate_skeleton`](Self::translate_skeleton) for more information.
+    ///
+    /// # Safety
+    ///
+    /// The returned function pointer is owned by the module, and must not be called after the
+    /// module is cleared or the function is freed.
+    pub unsafe fn jit_skeleton<'a>(
+        &mut self,
+        name: &str,
+        bytecode: impl Into<EvmCompilerInput<'a>>,
+        spec_id: SpecId,
+        variance: &crate::skeleton::SkeletonVariance,
+    ) -> Result<EvmCompilerFn> {
+        let id = self.translate_skeleton(name, bytecode.into(), spec_id, variance)?;
+        unsafe { self.jit_function(id) }
+    }
+
     /// (JIT) Compiles the given EVM bytecode into a JIT function.
     ///
     /// See [`translate`](Self::translate) for more information.
