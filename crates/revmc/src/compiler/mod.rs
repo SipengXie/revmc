@@ -258,7 +258,9 @@ impl<B: Backend> EvmCompiler<B> {
     /// # Safety
     ///
     /// The returned function pointer is owned by the module, and must not be called after the
-    /// module is cleared or the function is freed.
+    /// module is cleared or the function is freed. If the variance map contains variant PUSHes,
+    /// the caller must set `EvmContext::imm_data_ptr` to a valid data table before calling
+    /// the returned function; otherwise the function will dereference a null pointer.
     pub unsafe fn jit_skeleton<'a>(
         &mut self,
         name: &str,
