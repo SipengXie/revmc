@@ -97,6 +97,10 @@ path = "src/bin/skeleton_identify.rs"
 name = "push_variance"
 path = "src/bin/push_variance.rs"
 
+[[bin]]
+name = "skeleton_bench"
+path = "src/bin/skeleton_bench.rs"
+
 [[bench]]
 name = "bench_airdrop"
 path = "src/bench_airdrop.rs"
