@@ -101,17 +101,25 @@ pub struct SkeletonVariance {
     pub pushes: Vec<PushClassification>,
 }
 
-/// Per-instance data table: packed bytes of variant PUSH values, big-endian.
+/// Per-instance data table: array of 32-byte little-endian i256 values,
+/// one entry per variant PUSH. Offset = variant_index * 32.
 pub struct ImmDataTable {
-    pub data: Vec<u8>,
+    pub data: Vec<u8>,  // len = num_variant_pushes * 32
 }
 
 /// Build variance map by comparing PUSH values across bytecodes of same skeleton.
+/// PUSH0 is always skipped (value is always 0).
 pub fn analyze_skeleton_group(bytecodes: &[&[u8]]) -> SkeletonVariance { ... }
 
 /// Build data table for a specific bytecode instance given a variance map.
+/// Each variant PUSH value is stored as 32-byte little-endian i256.
 pub fn build_data_table(bytecode: &[u8], variance: &SkeletonVariance) -> ImmDataTable { ... }
 ```
+
+**Data table format**: Each variant PUSH value is stored as a 32-byte little-endian `i256`,
+regardless of original PUSH width (PUSH1..PUSH32). This avoids bswap/zext complexity —
+the generated code is a single `load i256` per variant PUSH. Cost: ~20% larger data tables
+(e.g., UniV3 Pool: 1056B vs 882B packed), but tables are tiny and fit in L1d.
 
 ### Layer 3: InstData Extension
 
@@ -144,9 +152,18 @@ pub(crate) fn apply_variance(&mut self, variance: &SkeletonVariance) {
     let mut push_index = 0;
     for inst in &mut self.insts {
         if inst.opcode >= op::PUSH1 && inst.opcode <= op::PUSH32 {
-            if let PushClassification::Variant { table_offset } = variance.pushes[push_index] {
-                inst.flags |= InstFlags::VARIANT_PUSH;
-                inst.imm_table_offset = table_offset;
+            match variance.pushes[push_index] {
+                PushClassification::Variant { table_offset } => {
+                    // SKIP_LOGIC PUSHes (static jump targets) must be invariant
+                    debug_assert!(
+                        !inst.flags.contains(InstFlags::SKIP_LOGIC),
+                        "PUSH at opcode index {} is both SKIP_LOGIC and Variant",
+                        push_index
+                    );
+                    inst.flags |= InstFlags::VARIANT_PUSH;
+                    inst.imm_table_offset = table_offset;
+                }
+                PushClassification::Invariant => {}
             }
             push_index += 1;
         }
@@ -161,24 +178,22 @@ pub(crate) fn apply_variance(&mut self, variance: &SkeletonVariance) {
 ```rust
 op::PUSH1..=op::PUSH32 => {
     if data.flags.contains(InstFlags::VARIANT_PUSH) {
-        // Load from per-instance data table
+        // Load i256 from per-instance data table (32-byte LE entries)
         let table_ptr_ptr = self.get_field(
             self.ecx,
             mem::offset_of!(EvmContext<'_>, imm_data_ptr),
             "ecx.imm_data_ptr.addr",
         );
         let table_ptr = self.bcx.load(self.ptr_type, table_ptr_ptr, "imm_table_ptr");
-        let offset = self.bcx.iconst(self.isize_type, data.imm_table_offset as i64);
+        // Each entry is 32 bytes, offset = imm_table_offset * 32
+        let byte_offset = data.imm_table_offset as i64 * 32;
+        let offset = self.bcx.iconst(self.isize_type, byte_offset);
         let elem_ptr = self.bcx.gep(self.bcx.type_int(8), table_ptr, &[offset], "imm.ptr");
-
-        let imm_len = data.imm_len() as u32;
-        let load_ty = self.bcx.type_int(imm_len * 8);
-        let raw = self.bcx.load(load_ty, elem_ptr, "imm.raw");
-        let swapped = self.bcx.bswap(raw);  // big-endian → native
-        let value = self.bcx.zext(self.word_type, swapped, "imm.val");
+        // Uniform load: always i256, stored little-endian (native on x86)
+        let value = self.bcx.load(self.word_type, elem_ptr, "imm.val");
         self.push(value);
     } else {
-        // Existing path: compile-time constant
+        // Existing path: compile-time constant (unchanged)
         let imm = self.bytecode.get_imm(data);
         let value = imm.map(U256::from_be_slice).unwrap_or_default();
         let value = self.bcx.iconst_256(value);
@@ -186,6 +201,9 @@ op::PUSH1..=op::PUSH32 => {
     }
 }
 ```
+
+Note: `imm_table_offset` is the variant PUSH **index** (0, 1, 2, ...), not byte offset.
+The byte offset is computed as `index * 32` since every entry is a 32-byte LE i256.
 
 ### Compiler Entry Point
 
