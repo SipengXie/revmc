@@ -49,18 +49,22 @@ pub struct EvmContext<'a> {
     pub bytecode_ptr: *const u8,
     /// Length of the contract bytecode.
     pub bytecode_len: usize,
+    /// Pointer to per-instance immediate data table for skeleton-compiled code.
+    /// Null when not using skeleton compilation or when all PUSHes are invariant.
+    pub imm_data_ptr: *const u8,
 }
 
 // Static assertions to ensure the struct layout matches expectations.
 // These offsets are used by the JIT compiler to access fields.
 const _: () = {
     use core::mem::offset_of;
-    assert!(core::mem::size_of::<EvmContext<'_>>() == 96);
+    assert!(core::mem::size_of::<EvmContext<'_>>() == 104);
     // Key fields accessed by JIT code
     assert!(offset_of!(EvmContext<'_>, memory) == 0);
     assert!(offset_of!(EvmContext<'_>, resume_at) == 72);
     assert!(offset_of!(EvmContext<'_>, bytecode_ptr) == 80);
     assert!(offset_of!(EvmContext<'_>, bytecode_len) == 88);
+    assert!(offset_of!(EvmContext<'_>, imm_data_ptr) == 96);
 };
 
 impl fmt::Debug for EvmContext<'_> {
@@ -100,6 +104,7 @@ impl<'a> EvmContext<'a> {
             resume_at,
             bytecode_ptr,
             bytecode_len,
+            imm_data_ptr: std::ptr::null(),
         };
         (this, stack, stack_len)
     }
