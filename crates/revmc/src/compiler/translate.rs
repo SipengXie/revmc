@@ -989,7 +989,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                     let table_ptr =
                         self.bcx.load(self.ptr_type, table_ptr_ptr, "imm_table_ptr");
                     // 2. GEP to the entry: byte_offset = table_index * 32.
-                    let byte_offset = data.imm_table_offset as i64 * 32;
+                    let byte_offset = data.data as i64 * 32;
                     let offset = self.bcx.iconst(self.isize_type, byte_offset);
                     let elem_ptr = self.bcx.gep(
                         self.bcx.type_int(8),

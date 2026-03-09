@@ -77,7 +77,7 @@ impl<'a> Bytecode<'a> {
 
             let section = Section::default();
 
-            insts.push(InstData { opcode, flags, base_gas, data, pc: pc as u32, section, imm_table_offset: 0 });
+            insts.push(InstData { opcode, flags, base_gas, data, pc: pc as u32, section });
         }
 
         let mut bytecode = Self {
@@ -190,13 +190,13 @@ impl<'a> Bytecode<'a> {
                 );
                 match variance.pushes[push_index] {
                     crate::skeleton::PushClassification::Variant { table_index } => {
-                        debug_assert!(
+                        assert!(
                             !inst.flags.contains(InstFlags::SKIP_LOGIC),
                             "PUSH at index {} is both SKIP_LOGIC and Variant",
                             push_index
                         );
                         inst.flags |= InstFlags::VARIANT_PUSH;
-                        inst.imm_table_offset = table_index;
+                        inst.data = table_index;
                     }
                     crate::skeleton::PushClassification::Invariant => {}
                 }
@@ -442,15 +442,13 @@ pub(crate) struct InstData {
     /// - if the instruction has immediate data, this is a packed offset+length into the bytecode;
     /// - `JUMP{,I} && STATIC_JUMP in kind`: the jump target, `Instr`;
     /// - `JUMPDEST`: `1` if the jump destination is reachable, `0` otherwise;
+    /// - `PUSH1..PUSH32 && VARIANT_PUSH`: data table index (byte offset = value * 32);
     /// - otherwise: no meaning.
     pub(crate) data: u32,
     /// The program counter, meaning `code[pc]` is this instruction's opcode.
     pub(crate) pc: u32,
     /// The section this instruction belongs to.
     pub(crate) section: Section,
-    /// Offset into the per-instance data table (variant PUSH index).
-    /// Only meaningful when `VARIANT_PUSH` flag is set. Byte offset = value * 32.
-    pub(crate) imm_table_offset: u32,
 }
 
 impl PartialEq<u8> for InstData {
@@ -476,7 +474,7 @@ impl fmt::Debug for InstData {
             .field("pc", &self.pc)
             .field("section", &self.section);
         if self.flags.contains(InstFlags::VARIANT_PUSH) {
-            s.field("imm_table_offset", &self.imm_table_offset);
+            s.field("imm_table_index", &self.data);
         }
         s.finish()
     }
@@ -487,7 +485,7 @@ impl InstData {
     /// Note that this may not be a valid instruction.
     #[inline]
     fn new(opcode: u8) -> Self {
-        Self { opcode, imm_table_offset: 0, ..Default::default() }
+        Self { opcode, ..Default::default() }
     }
 
     /// Returns the length of the immediate data of this instruction.
