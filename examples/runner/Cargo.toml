@@ -81,6 +81,18 @@ path = "src/bin/icache_experiment.rs"
 name = "fullblock_ablation"
 path = "src/bin/fullblock_ablation.rs"
 
+[[bin]]
+name = "opcode_dedup"
+path = "src/bin/opcode_dedup.rs"
+
+[[bin]]
+name = "skeleton_export"
+path = "src/bin/skeleton_export.rs"
+
+[[bin]]
+name = "skeleton_identify"
+path = "src/bin/skeleton_identify.rs"
+
 [[bench]]
 name = "bench_airdrop"
 path = "src/bench_airdrop.rs"
