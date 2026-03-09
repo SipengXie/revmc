@@ -723,6 +723,7 @@ fn call_jit_with_resume<H: revmc::HostExt>(
         resume_at,
         bytecode_ptr,
         bytecode_len,
+        imm_data_ptr: core::ptr::null(),
     };
 
     let result = unsafe { jit_fn.call(Some(stack), Some(stack_len), &mut ecx) };

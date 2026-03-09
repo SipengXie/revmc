@@ -104,7 +104,7 @@ impl<'a> EvmContext<'a> {
             resume_at,
             bytecode_ptr,
             bytecode_len,
-            imm_data_ptr: std::ptr::null(),
+            imm_data_ptr: ptr::null(),
         };
         (this, stack, stack_len)
     }
