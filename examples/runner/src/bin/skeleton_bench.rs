@@ -395,117 +395,137 @@ fn main() {
         );
     }
 
-    // ── Phase 3: Compilation with cache ──────────────────────────────────
+    // ── Phase 3: Compilation ────────────────────────────────────────────
+    //
+    // Both strategies share a common base of 254 non-skeleton per-hash
+    // compilations. The only difference is how the 50 skeleton-member
+    // contracts are handled:
+    //   Strategy A: compile each of the 50 members per-hash
+    //   Strategy B: compile 11 skeleton groups (shared functions + data tables)
 
-    // 3a. Strategy A: all per-hash (with AOT cache)
-    let all_code_map: HashMap<B256, Bytecode> = loader
+    // Split code maps
+    let base_code_map: HashMap<B256, Bytecode> = loader
         .code_values()
         .iter()
+        .filter(|(h, _)| !skeleton_member_hashes.contains(*h))
         .map(|(h, bc)| (*h, bc.clone()))
         .collect();
+    let member_code_map: HashMap<B256, Bytecode> = loader
+        .code_values()
+        .iter()
+        .filter(|(h, _)| skeleton_member_hashes.contains(*h))
+        .map(|(h, bc)| (*h, bc.clone()))
+        .collect();
+
+    // 3a. Shared base: compile 254 non-skeleton per-hash (with AOT cache)
     println!(
-        "\n--- Strategy A: {} per-hash compilations (with cache) ---",
-        all_code_map.len()
+        "\n--- Shared base: {} non-skeleton per-hash (with cache) ---",
+        base_code_map.len()
     );
-    let t_a = Instant::now();
-    let compiled_all = compile_all_contracts_with_cache(&all_code_map, OPT, &cache_dir);
-    let dur_a = t_a.elapsed();
+    let t_base = Instant::now();
+    let compiled_base = compile_all_contracts_with_cache(&base_code_map, OPT, &cache_dir);
+    let dur_base = t_base.elapsed();
     println!(
         "  {:.3}s ({} functions)",
-        dur_a.as_secs_f64(),
-        compiled_all.functions.len()
+        dur_base.as_secs_f64(),
+        compiled_base.functions.len()
     );
 
-    // 3b. Strategy B: non-skeleton per-hash + skeleton AOT (both cached)
-    let t_b = Instant::now();
-
-    // Non-skeleton per-hash: filter Strategy A's in-memory functions (no re-dlopen)
-    let non_skeleton_fns: Arc<HashMap<B256, RawEvmCompilerFn>> = Arc::new(
-        compiled_all
-            .functions
-            .iter()
-            .filter(|(h, _)| !skeleton_member_hashes.contains(*h))
-            .map(|(h, f)| (*h, *f))
-            .collect(),
-    );
+    // 3b. Strategy A delta: compile 50 skeleton-member per-hash (with AOT cache)
     println!(
-        "\n--- Strategy B: {} per-hash + {} skeleton (with cache) ---",
-        non_skeleton_fns.len(),
+        "\n--- Strategy A delta: {} skeleton-member per-hash (with cache) ---",
+        member_code_map.len()
+    );
+    let t_da = Instant::now();
+    let compiled_members = compile_all_contracts_with_cache(&member_code_map, OPT, &cache_dir);
+    let dur_da = t_da.elapsed();
+    println!(
+        "  {:.3}s ({} functions)",
+        dur_da.as_secs_f64(),
+        compiled_members.functions.len()
+    );
+
+    // Merge base + members for per-hash execution
+    let all_per_hash_fns: Arc<HashMap<B256, RawEvmCompilerFn>> = {
+        let mut merged = (*compiled_base.functions).clone();
+        merged.extend(compiled_members.functions.iter().map(|(h, f)| (*h, *f)));
+        Arc::new(merged)
+    };
+    let non_skeleton_fns = compiled_base.functions.clone();
+
+    // 3c. Strategy B delta: compile 11 skeleton groups (with AOT cache)
+    println!(
+        "\n--- Strategy B delta: {} skeleton groups (with cache) ---",
         n_groups
     );
+    let t_db = Instant::now();
 
-    // Skeleton groups: check AOT cache
     let mut skeleton_dispatch: HashMap<B256, (EvmCompilerFn, Vec<u8>)> = HashMap::new();
     let mut skeleton_libs: Vec<libloading::Library> = Vec::new();
-    let mut cache_hits = 0u32;
-    let mut cache_misses = 0u32;
     let mut new_registry_groups: Vec<RegistryGroup> = Vec::new();
 
-    for g in &analyzed {
+    // Phase 1: try loading all from cache, collect misses
+    let mut cached: Vec<(usize, RawEvmCompilerFn)> = Vec::new();
+    let mut to_compile: Vec<usize> = Vec::new();
+    for (i, g) in analyzed.iter().enumerate() {
         let artifacts = skeleton_cache_artifacts(&cache_dir, g.skel_hash);
-
-        // Try loading from cache
-        let raw_fn = match load_skeleton_cached(&artifacts) {
+        match load_skeleton_cached(&artifacts) {
             Ok((f, lib)) => {
                 skeleton_libs.push(lib);
-                cache_hits += 1;
-                Some(f)
+                cached.push((i, f));
             }
-            Err(_) => None,
-        };
+            Err(_) => to_compile.push(i),
+        }
+    }
+    println!(
+        "  cache: {} hit, {} to compile",
+        cached.len(),
+        to_compile.len()
+    );
 
-        // Compile if not cached
-        let raw_fn = match raw_fn {
-            Some(f) => f,
-            None => {
-                cache_misses += 1;
-                if let Err(e) = compile_skeleton_to_cache(
-                    &g.members[0].1,
-                    &g.variance,
-                    &artifacts,
-                ) {
-                    eprintln!("  WARN: skel {:016x} AOT failed: {e}", g.skel_hash);
-                    // Fallback to JIT
-                    let context = Box::leak(Box::new(
-                        revmc::llvm::inkwell::context::Context::create(),
-                    ));
-                    let backend = EvmLlvmBackend::new(context, false, OPT)
-                        .expect("LLVM backend");
-                    let compiler: &'static mut EvmCompiler<EvmLlvmBackend<'static>> =
-                        Box::leak(Box::new(EvmCompiler::new(backend)));
-                    match unsafe {
-                        compiler.jit_skeleton(
-                            &artifacts.symbol,
-                            g.members[0].1.as_slice(),
-                            bin_common::ETH_SPEC,
+    // Phase 2: compile all misses in parallel
+    let compiled_skeletons: Vec<(usize, Result<(), String>)> =
+        std::thread::scope(|s| {
+            let handles: Vec<_> = to_compile
+                .iter()
+                .map(|&i| {
+                    let g = &analyzed[i];
+                    let artifacts = skeleton_cache_artifacts(&cache_dir, g.skel_hash);
+                    s.spawn(move || {
+                        let result = compile_skeleton_to_cache(
+                            &g.members[0].1,
                             &g.variance,
-                        )
-                    } {
-                        Ok(f) => f.into_inner(),
-                        Err(e2) => {
-                            eprintln!("  WARN: skel {:016x} JIT also failed: {e2}", g.skel_hash);
-                            continue;
-                        }
-                    }
-                } else {
-                    match load_skeleton_cached(&artifacts) {
-                        Ok((f, lib)) => {
-                            skeleton_libs.push(lib);
-                            f
-                        }
-                        Err(e) => {
-                            eprintln!("  WARN: skel {:016x} load after compile failed: {e}", g.skel_hash);
-                            continue;
-                        }
-                    }
-                }
-            }
-        };
+                            &artifacts,
+                        );
+                        (i, result)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
 
-        let skel_fn = EvmCompilerFn::new(raw_fn);
+    // Phase 3: load compiled results
+    for (i, result) in compiled_skeletons {
+        let g = &analyzed[i];
+        let artifacts = skeleton_cache_artifacts(&cache_dir, g.skel_hash);
+        match result {
+            Ok(()) => match load_skeleton_cached(&artifacts) {
+                Ok((f, lib)) => {
+                    skeleton_libs.push(lib);
+                    cached.push((i, f));
+                }
+                Err(e) => eprintln!("  WARN: skel {:016x} load failed: {e}", g.skel_hash),
+            },
+            Err(e) => eprintln!("  WARN: skel {:016x} compile failed: {e}", g.skel_hash),
+        }
+    }
+
+    // Phase 4: build data tables for all loaded groups
+    for (i, raw_fn) in &cached {
+        let g = &analyzed[*i];
+        let skel_fn = EvmCompilerFn::new(*raw_fn);
         let member_hashes: Vec<B256> = g.members.iter().map(|(h, _)| *h).collect();
 
-        // Build data tables for each member
         for (hash, bytes) in &g.members {
             let table = build_data_table(bytes, &g.variance);
             skeleton_dispatch.insert(*hash, (skel_fn, table.data));
@@ -518,7 +538,6 @@ fn main() {
         ));
     }
 
-    // Save updated registry
     save_registry(
         &cache_dir,
         &SkeletonRegistry {
@@ -526,37 +545,38 @@ fn main() {
         },
     );
 
-    let dur_b = t_b.elapsed();
-    println!(
-        "  {:.3}s ({} per-hash + {} skeleton, cache: {} hit / {} miss)",
-        dur_b.as_secs_f64(),
-        non_skeleton_fns.len(),
-        n_groups,
-        cache_hits,
-        cache_misses,
-    );
+    let dur_db = t_db.elapsed();
+    println!("  {:.3}s ({} groups)", dur_db.as_secs_f64(), n_groups);
 
+    // Compilation summary — fair comparison of only the differing part
     println!("\n--- Compilation Summary ---");
     println!(
-        "  Strategy A (per-hash):  {:.3}s, {} compilations",
-        dur_a.as_secs_f64(),
-        compiled_all.functions.len()
+        "  Shared base:       {:.3}s  ({} non-skeleton per-hash)",
+        dur_base.as_secs_f64(),
+        compiled_base.functions.len()
     );
     println!(
-        "  Strategy B (skeleton):  {:.3}s, {} compilations ({} + {})",
-        dur_b.as_secs_f64(),
-        non_skeleton_fns.len() + n_groups,
-        non_skeleton_fns.len(),
-        n_groups,
+        "  Strategy A delta:  {:.3}s  ({} skeleton-member per-hash)",
+        dur_da.as_secs_f64(),
+        compiled_members.functions.len()
     );
-    let saved = dur_a.as_secs_f64() - dur_b.as_secs_f64();
-    if dur_a.as_secs_f64() > 0.001 {
+    println!(
+        "  Strategy B delta:  {:.3}s  ({} skeleton groups → {} contracts)",
+        dur_db.as_secs_f64(),
+        n_groups,
+        total_skeleton_members,
+    );
+    if dur_da.as_secs_f64() > 0.001 {
         println!(
-            "  Delta: {:.3}s ({:.1}%)",
-            saved,
-            saved / dur_a.as_secs_f64() * 100.0
+            "  Speedup (A delta / B delta): {:.1}x",
+            dur_da.as_secs_f64() / dur_db.as_secs_f64()
         );
     }
+    println!(
+        "  Total A: {:.3}s  |  Total B: {:.3}s",
+        dur_base.as_secs_f64() + dur_da.as_secs_f64(),
+        dur_base.as_secs_f64() + dur_db.as_secs_f64(),
+    );
 
     // ── Phase 4: Execution ───────────────────────────────────────────────
     println!(
@@ -573,10 +593,9 @@ fn main() {
         }
     });
 
-    let fns_all = compiled_all.functions.clone();
     let per_hash = execute_block(&loader, chain_id, |evm| {
         let mut h = JitHandler {
-            functions: fns_all.clone(),
+            functions: all_per_hash_fns.clone(),
         };
         match h.run(evm) {
             Ok(r) => extract_gas(&r),
