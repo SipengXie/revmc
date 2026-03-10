@@ -263,10 +263,30 @@ impl EvmCompilerFn {
         interpreter: &mut Interpreter,
         host: &mut dyn HostExt,
     ) -> InterpreterAction {
+        self.call_with_interpreter_data(interpreter, host, ptr::null())
+    }
+
+    /// Like [`call_with_interpreter`](Self::call_with_interpreter), but sets
+    /// `EvmContext::imm_data_ptr` to the given pointer before calling the function.
+    ///
+    /// Used by skeleton-aware compilation to supply the per-instance data table.
+    ///
+    /// # Safety
+    ///
+    /// `imm_data_ptr` must point to a valid data table for the duration of the call,
+    /// or be null if the compiled function does not access it.
+    #[inline]
+    pub unsafe fn call_with_interpreter_data(
+        self,
+        interpreter: &mut Interpreter,
+        host: &mut dyn HostExt,
+        imm_data_ptr: *const u8,
+    ) -> InterpreterAction {
         interpreter.bytecode.action = None;
 
         let (mut ecx, stack, stack_len) =
             EvmContext::from_interpreter_with_stack(interpreter, host);
+        ecx.imm_data_ptr = imm_data_ptr;
         let result = self.call(Some(stack), Some(stack_len), &mut ecx);
 
         // Save resume_at (Copy usize) before ecx's borrow ends.
