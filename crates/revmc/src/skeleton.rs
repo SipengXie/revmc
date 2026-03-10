@@ -24,7 +24,7 @@ pub enum PushClassification {
 /// Variance map for an opcode skeleton.
 /// One entry per PUSH1..PUSH32 instruction, in opcode order.
 /// PUSH0 is excluded (value is always 0, always invariant).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SkeletonVariance {
     /// Classification of each PUSH1..PUSH32, in opcode order.
     pub pushes: Vec<PushClassification>,

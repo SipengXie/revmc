@@ -101,6 +101,10 @@ path = "src/bin/push_variance.rs"
 name = "skeleton_bench"
 path = "src/bin/skeleton_bench.rs"
 
+[[bin]]
+name = "skeleton_precompile"
+path = "src/bin/skeleton_precompile.rs"
+
 [[bench]]
 name = "bench_airdrop"
 path = "src/bench_airdrop.rs"
