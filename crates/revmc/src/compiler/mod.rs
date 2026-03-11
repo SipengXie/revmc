@@ -213,6 +213,18 @@ impl<B: Backend> EvmCompiler<B> {
         self.config.gas_metering = yes;
     }
 
+    /// Sets the branch profile for PGO-guided compilation.
+    /// When set, JUMPI instructions will emit branch weight hints based on
+    /// the provided taken/not-taken counts.
+    pub fn set_branch_profile(&mut self, profile: crate::profile::BranchProfile) {
+        self.config.branch_profile = Some(profile);
+    }
+
+    /// Clears the branch profile.
+    pub fn clear_branch_profile(&mut self) {
+        self.config.branch_profile = None;
+    }
+
     /// Translates the given EVM bytecode into an internal function.
     ///
     /// NOTE: `name` must be unique for each function, as it is used as the name of the final
@@ -372,7 +384,7 @@ impl<B: Backend> EvmCompiler<B> {
         ensure!(self.backend.function_name_is_unique(name), "function name `{name}` is not unique");
         let linkage = Linkage::Public;
         let (bcx, id) = Self::make_builder(&mut self.backend, &self.config, name, linkage)?;
-        FunctionCx::translate(bcx, self.config, &mut self.builtins, bytecode)?;
+        FunctionCx::translate(bcx, self.config.clone(), &mut self.builtins, bytecode)?;
         Ok(id)
     }
 

@@ -14,7 +14,7 @@ use std::{fmt::Write, mem, sync::atomic::AtomicPtr};
 const STACK_CAP: usize = 1024;
 // const WORD_SIZE: usize = 32;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct FcxConfig {
     pub(super) comments: bool,
     pub(super) debug_assertions: bool,
@@ -24,6 +24,8 @@ pub(super) struct FcxConfig {
     pub(super) inspect_stack_length: bool,
     pub(super) stack_bound_checks: bool,
     pub(super) gas_metering: bool,
+
+    pub(super) branch_profile: Option<crate::profile::BranchProfile>,
 }
 
 impl Default for FcxConfig {
@@ -36,6 +38,7 @@ impl Default for FcxConfig {
             inspect_stack_length: false,
             stack_bound_checks: true,
             gas_metering: true,
+            branch_profile: None,
         }
     }
 }
@@ -272,18 +275,18 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
         };
 
         // We store the stack length if requested or necessary due to the bytecode.
-        let stack_length_observable = config.inspect_stack_length || bytecode.may_suspend();
+        let stack_length_observable = fx.config.inspect_stack_length || bytecode.may_suspend();
 
         // Add debug assertions for the parameters.
-        if config.debug_assertions {
+        if fx.config.debug_assertions {
             fx.pointer_panic_with_bool(
-                config.gas_metering,
+                fx.config.gas_metering,
                 gas_ptr,
                 "gas pointer",
                 "gas metering is enabled",
             );
             fx.pointer_panic_with_bool(
-                !config.local_stack,
+                !fx.config.local_stack,
                 sp_arg,
                 "stack pointer",
                 "local stack is disabled",
@@ -292,7 +295,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 stack_length_observable,
                 stack_len_arg,
                 "stack length pointer",
-                if config.inspect_stack_length {
+                if fx.config.inspect_stack_length {
                     "stack length inspection is enabled"
                 } else {
                     "bytecode suspends execution"
@@ -344,9 +347,10 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
 
         // Finalize the suspend and resume blocks. Must come before the return block.
         // Also here is where the stack length is initialized.
+        let inspect_stack_length = fx.config.inspect_stack_length;
         let load_len_at_start = |fx: &mut Self| {
             // Loaded from args only for the config.
-            if config.inspect_stack_length {
+            if inspect_stack_length {
                 let stack_len = fx.bcx.load(fx.isize_type, stack_len_arg, "stack_len");
                 fx.stack_len.store(&mut fx.bcx, stack_len);
             } else {
