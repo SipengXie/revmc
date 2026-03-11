@@ -189,9 +189,13 @@ impl Fixture {
             .next()
             .ok_or_else(|| "fixture does not contain any transactions".to_owned())?;
 
-        let block = build_block_env(&raw_case.env)?;
+        let mut block = build_block_env(&raw_case.env)?;
         let cfg = CfgEnv::new_with_spec(SpecId::CANCUN);
         let tx = build_tx_env(&cfg, &first_tx)?;
+        // Ensure block gas limit accommodates the transaction
+        if block.gas_limit < tx.gas_limit {
+            block.gas_limit = tx.gas_limit;
+        }
         let accounts = parse_accounts(raw_case.pre)?;
         let compiled = compile_contracts(&accounts)?;
 
