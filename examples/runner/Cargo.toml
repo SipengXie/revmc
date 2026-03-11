@@ -105,6 +105,10 @@ path = "src/bin/skeleton_bench.rs"
 name = "skeleton_precompile"
 path = "src/bin/skeleton_precompile.rs"
 
+[[bin]]
+name = "collect_profile"
+path = "src/bin/collect_profile.rs"
+
 [[bench]]
 name = "bench_airdrop"
 path = "src/bench_airdrop.rs"
