@@ -937,7 +937,29 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                         if target == self.return_block.unwrap() {
                             self.add_invalid_jump();
                         }
-                        self.bcx.brif(cond, target, next);
+                        // PGO: if we have branch profile, emit weighted branch.
+                        // cond=true -> jump to target (taken), cond=false -> fall through (not-taken).
+                        let used_pgo = if let Some(ref profile) = self.config.branch_profile {
+                            let pc = data.pc;
+                            if let Some(&(taken, not_taken)) = profile.branches.get(&pc) {
+                                let total = taken + not_taken;
+                                if total > 0 && (taken * 5 < total || not_taken * 5 < total) {
+                                    // One side is <20% -> use brif_cold
+                                    let then_is_cold = taken * 5 < total;
+                                    self.bcx.brif_cold(cond, target, next, then_is_cold);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if !used_pgo {
+                            self.bcx.brif(cond, target, next);
+                        }
                     } else {
                         self.bcx.br(target);
                     }

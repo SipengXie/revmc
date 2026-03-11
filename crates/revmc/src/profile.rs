@@ -49,3 +49,34 @@ impl BranchProfile {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cold_detection() {
+        let mut p = BranchProfile::new();
+        // 100 taken, 5 not-taken -> not-taken is cold
+        p.record(10, true);
+        for _ in 0..99 { p.record(10, true); }
+        for _ in 0..5 { p.record(10, false); }
+
+        assert_eq!(p.is_taken_cold(10), Some(false));
+        assert_eq!(p.is_not_taken_cold(10), Some(true));
+
+        // No data for PC 99
+        assert_eq!(p.is_taken_cold(99), None);
+    }
+
+    #[test]
+    fn test_balanced_not_cold() {
+        let mut p = BranchProfile::new();
+        for _ in 0..50 { p.record(20, true); }
+        for _ in 0..50 { p.record(20, false); }
+
+        // 50/50 -- neither is cold
+        assert_eq!(p.is_taken_cold(20), Some(false));
+        assert_eq!(p.is_not_taken_cold(20), Some(false));
+    }
+}
