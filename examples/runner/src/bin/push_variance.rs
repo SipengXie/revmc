@@ -381,27 +381,305 @@ fn main() {
             label, n_groups, n_bytecodes, avg_variant_pushes, avg_variant_bytes, avg_variant_pct);
     }
 
-    // Full table: every group, sorted by variant%
-    println!("\n  Full table (all {} groups, sorted by variant%):", all_group_stats.len());
-    println!("  {:>4}  {:>6}  {:>7}  {:>6}  {:>6}  {:>6}  {:>8}  {:>7}",
-        "rank", "copies", "bcLen", "pushes", "invar", "var", "var%", "varB");
+    // ── Variant Depth Analysis ────────────────────────────────────────────
+    // For each variant PUSH position: how many distinct values? Is it
+    // "one bad apple" (majority value + 1-2 outliers) or truly diverse?
+    println!("\n=== Variant Depth Analysis (\"耗子屎\" detection) ===");
+    println!("For each variant PUSH: how many distinct values exist across all instances?\n");
 
-    // Sort by variant percentage descending
-    let mut indexed: Vec<(usize, &GroupStats)> = all_group_stats.iter().enumerate().collect();
-    indexed.sort_by(|a, b| {
-        let pct_a = if a.1.n_pushes > 0 { a.1.variant_count as f64 / a.1.n_pushes as f64 } else { 0.0 };
-        let pct_b = if b.1.n_pushes > 0 { b.1.variant_count as f64 / b.1.n_pushes as f64 } else { 0.0 };
-        pct_b.partial_cmp(&pct_a).unwrap()
-    });
+    // Per-position stats across ALL groups
+    let mut total_variant_positions = 0u64;
+    let mut near_invariant_positions = 0u64;  // majority >= 99% of members
+    let mut low_diversity_positions = 0u64;   // 2-5 distinct values
+    let mut high_diversity_positions = 0u64;  // many distinct values (truly variant)
 
-    for (table_rank, (_orig_idx, g)) in indexed.iter().enumerate() {
-        let var_pct = if g.n_pushes > 0 {
-            g.variant_count as f64 / g.n_pushes as f64 * 100.0
-        } else {
-            0.0
-        };
-        println!("  {:>4}  {:>6}  {:>6}B  {:>6}  {:>6}  {:>6}  {:>7.1}%  {:>6}B",
-            table_rank + 1, g.copies, g.bytecode_len, g.n_pushes,
-            g.invariant_count, g.variant_count, var_pct, g.variant_bytes);
+    // Histogram: distinct value count → how many PUSH positions
+    let mut distinct_count_histogram: HashMap<usize, usize> = HashMap::new();
+
+    // Collect detailed per-position data for top groups
+    struct VariantPositionStats {
+        group_rank: usize,
+        group_copies: usize,
+        push_idx: usize,
+        opcode: u8,
+        distinct_values: usize,
+        majority_count: usize,     // how many instances have the most common value
+        outlier_count: usize,      // members - majority_count
     }
+    let mut all_variant_positions: Vec<VariantPositionStats> = Vec::new();
+
+    for (rank, (_skel_hash, members)) in dup_groups.iter().enumerate() {
+        let n = members.len();
+        let all_pushes: Vec<Vec<PushInfo>> =
+            members.iter().map(|(_, b)| extract_pushes(b)).collect();
+        let ref_pushes = &all_pushes[0];
+        let n_pushes = ref_pushes.len();
+
+        for push_idx in 0..n_pushes {
+            let ref_push = &ref_pushes[push_idx];
+
+            // Check if variant
+            let all_same = all_pushes.iter().all(|pushes| {
+                pushes.get(push_idx).map_or(false, |p| p.value == ref_push.value)
+            });
+            if all_same {
+                continue;
+            }
+
+            total_variant_positions += 1;
+
+            // Count distinct values and find majority
+            let mut value_counts: HashMap<Vec<u8>, usize> = HashMap::new();
+            for pushes in &all_pushes {
+                if let Some(p) = pushes.get(push_idx) {
+                    *value_counts.entry(p.value.clone()).or_default() += 1;
+                }
+            }
+            let distinct = value_counts.len();
+            let majority_count = *value_counts.values().max().unwrap_or(&0);
+            let outlier_count = n - majority_count;
+
+            *distinct_count_histogram.entry(distinct).or_default() += 1;
+
+            let majority_pct = majority_count as f64 / n as f64 * 100.0;
+            if majority_pct >= 99.0 {
+                near_invariant_positions += 1;
+            }
+            if distinct <= 5 {
+                low_diversity_positions += 1;
+            } else {
+                high_diversity_positions += 1;
+            }
+
+            all_variant_positions.push(VariantPositionStats {
+                group_rank: rank,
+                group_copies: n,
+                push_idx,
+                opcode: ref_push.opcode,
+                distinct_values: distinct,
+                majority_count,
+                outlier_count,
+            });
+        }
+    }
+
+    // Summary
+    println!("Total variant PUSH positions: {total_variant_positions}");
+    println!(
+        "  Near-invariant (majority >= 99%): {} ({:.1}%) ← \"耗子屎\" scenario",
+        near_invariant_positions,
+        if total_variant_positions > 0 { near_invariant_positions as f64 / total_variant_positions as f64 * 100.0 } else { 0.0 }
+    );
+    println!(
+        "  Low diversity (2-5 distinct values): {} ({:.1}%)",
+        low_diversity_positions,
+        if total_variant_positions > 0 { low_diversity_positions as f64 / total_variant_positions as f64 * 100.0 } else { 0.0 }
+    );
+    println!(
+        "  High diversity (>5 distinct values): {} ({:.1}%) ← truly variant",
+        high_diversity_positions,
+        if total_variant_positions > 0 { high_diversity_positions as f64 / total_variant_positions as f64 * 100.0 } else { 0.0 }
+    );
+
+    // Distinct value count histogram
+    println!("\n  Distinct value count histogram:");
+    println!("  {:>12}  {:>8}  {:>8}", "distinct_vals", "positions", "pct");
+    let mut hist_entries: Vec<(usize, usize)> = distinct_count_histogram.into_iter().collect();
+    hist_entries.sort_by_key(|(k, _)| *k);
+    // Bucket large values
+    let mut bucketed: Vec<(String, usize)> = Vec::new();
+    let mut large_sum = 0usize;
+    for (distinct, count) in &hist_entries {
+        if *distinct <= 10 {
+            bucketed.push((format!("{}", distinct), *count));
+        } else if *distinct <= 50 {
+            large_sum += count;
+        }
+    }
+    if large_sum > 0 {
+        bucketed.push(("11-50".to_string(), large_sum));
+    }
+    let mut very_large_sum = 0usize;
+    for (distinct, count) in &hist_entries {
+        if *distinct > 50 && *distinct <= 200 {
+            very_large_sum += count;
+        }
+    }
+    if very_large_sum > 0 {
+        bucketed.push(("51-200".to_string(), very_large_sum));
+    }
+    let mut huge_sum = 0usize;
+    for (distinct, count) in &hist_entries {
+        if *distinct > 200 {
+            huge_sum += count;
+        }
+    }
+    if huge_sum > 0 {
+        bucketed.push((">200".to_string(), huge_sum));
+    }
+    for (label, count) in &bucketed {
+        println!(
+            "  {:>12}  {:>8}  {:>7.1}%",
+            label, count,
+            *count as f64 / total_variant_positions as f64 * 100.0
+        );
+    }
+
+    // Top "near-invariant" positions (耗子屎 examples)
+    let mut near_inv: Vec<&VariantPositionStats> = all_variant_positions.iter()
+        .filter(|v| {
+            let majority_pct = v.majority_count as f64 / v.group_copies as f64 * 100.0;
+            majority_pct >= 95.0 && v.group_copies >= 10
+        })
+        .collect();
+    near_inv.sort_by_key(|v| std::cmp::Reverse(v.group_copies));
+
+    if !near_inv.is_empty() {
+        println!("\n  Top \"耗子屎\" positions (majority >= 95%, group >= 10 members):");
+        println!("  {:>6}  {:>6}  {:>8}  {:>8}  {:>9}  {:>10}  {:>10}",
+            "group#", "copies", "push_idx", "opcode", "distinct", "majority", "outliers");
+        for (i, v) in near_inv.iter().enumerate().take(30) {
+            let push_name = format!("PUSH{}", v.opcode - 0x5f);
+            println!(
+                "  {:>6}  {:>6}  {:>8}  {:>8}  {:>9}  {:>9} ({:>4.1}%)  {:>10}",
+                v.group_rank + 1, v.group_copies, v.push_idx, push_name,
+                v.distinct_values, v.majority_count,
+                v.majority_count as f64 / v.group_copies as f64 * 100.0,
+                v.outlier_count
+            );
+            if i >= 29 { break; }
+        }
+    }
+
+    // Top "truly variant" positions
+    let mut truly_var: Vec<&VariantPositionStats> = all_variant_positions.iter()
+        .filter(|v| v.distinct_values > 5 && v.group_copies >= 10)
+        .collect();
+    truly_var.sort_by_key(|v| std::cmp::Reverse(v.distinct_values));
+
+    if !truly_var.is_empty() {
+        println!("\n  Top \"truly variant\" positions (>5 distinct values, group >= 10 members):");
+        println!("  {:>6}  {:>6}  {:>8}  {:>8}  {:>9}  {:>10}  {:>10}",
+            "group#", "copies", "push_idx", "opcode", "distinct", "majority", "outliers");
+        for (i, v) in truly_var.iter().enumerate().take(30) {
+            let push_name = format!("PUSH{}", v.opcode - 0x5f);
+            println!(
+                "  {:>6}  {:>6}  {:>8}  {:>8}  {:>9}  {:>9} ({:>4.1}%)  {:>10}",
+                v.group_rank + 1, v.group_copies, v.push_idx, push_name,
+                v.distinct_values, v.majority_count,
+                v.majority_count as f64 / v.group_copies as f64 * 100.0,
+                v.outlier_count
+            );
+            if i >= 29 { break; }
+        }
+    }
+
+    // Per-group summary: how many sub-variants would lazy promotion need?
+    println!("\n=== Lazy Promotion Impact Estimate ===");
+    println!("If we use majority value as invariant and lazy-promote outliers:\n");
+
+    struct LazyPromotionStats {
+        group_rank: usize,
+        copies: usize,
+        variant_positions: usize,
+        near_invariant_positions: usize,   // could be treated as invariant in primary
+        truly_variant_positions: usize,     // must stay in data table
+        max_outliers: usize,               // max outlier count across all near-invariant positions
+        total_outlier_bytecodes: usize,    // unique bytecodes that are outliers on any position
+    }
+    let mut lazy_stats: Vec<LazyPromotionStats> = Vec::new();
+
+    // Regroup variant positions by group
+    let mut group_variant_positions: HashMap<usize, Vec<&VariantPositionStats>> = HashMap::new();
+    for v in &all_variant_positions {
+        group_variant_positions.entry(v.group_rank).or_default().push(v);
+    }
+
+    for (rank, (_skel_hash, members)) in dup_groups.iter().enumerate() {
+        let positions = match group_variant_positions.get(&rank) {
+            Some(p) => p,
+            None => continue,
+        };
+        let n = members.len();
+        let mut near_inv_count = 0usize;
+        let mut truly_var_count = 0usize;
+        let mut max_outliers = 0usize;
+
+        // Track which bytecodes are outliers on any position
+        let all_pushes: Vec<Vec<PushInfo>> =
+            members.iter().map(|(_, b)| extract_pushes(b)).collect();
+
+        let mut outlier_bytecodes = std::collections::HashSet::new();
+
+        for v in positions {
+            let majority_pct = v.majority_count as f64 / n as f64 * 100.0;
+            if majority_pct >= 90.0 {
+                near_inv_count += 1;
+                if v.outlier_count > max_outliers {
+                    max_outliers = v.outlier_count;
+                }
+                // Find which bytecodes are outliers at this position
+                let ref_pushes_for_pos = &all_pushes[0];
+                if let Some(ref_push) = ref_pushes_for_pos.get(v.push_idx) {
+                    // Find majority value
+                    let mut value_counts: HashMap<Vec<u8>, usize> = HashMap::new();
+                    for pushes in &all_pushes {
+                        if let Some(p) = pushes.get(v.push_idx) {
+                            *value_counts.entry(p.value.clone()).or_default() += 1;
+                        }
+                    }
+                    let majority_value = value_counts.iter().max_by_key(|(_, c)| **c).map(|(v, _)| v.clone());
+                    if let Some(maj_val) = majority_value {
+                        for (idx, pushes) in all_pushes.iter().enumerate() {
+                            if let Some(p) = pushes.get(v.push_idx) {
+                                if p.value != maj_val {
+                                    outlier_bytecodes.insert(idx);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                truly_var_count += 1;
+            }
+        }
+
+        if near_inv_count > 0 || truly_var_count > 0 {
+            lazy_stats.push(LazyPromotionStats {
+                group_rank: rank,
+                copies: n,
+                variant_positions: positions.len(),
+                near_invariant_positions: near_inv_count,
+                truly_variant_positions: truly_var_count,
+                max_outliers,
+                total_outlier_bytecodes: outlier_bytecodes.len(),
+            });
+        }
+    }
+
+    lazy_stats.sort_by_key(|s| std::cmp::Reverse(s.copies));
+
+    println!("  {:>6}  {:>6}  {:>8}  {:>10}  {:>10}  {:>12}  {:>14}",
+        "group#", "copies", "var_pos", "near_inv", "truly_var", "max_outliers", "outlier_bcs");
+    for s in lazy_stats.iter().take(30) {
+        println!(
+            "  {:>6}  {:>6}  {:>8}  {:>10}  {:>10}  {:>12}  {:>13} ({:.1}%)",
+            s.group_rank + 1, s.copies, s.variant_positions,
+            s.near_invariant_positions, s.truly_variant_positions,
+            s.max_outliers, s.total_outlier_bytecodes,
+            s.total_outlier_bytecodes as f64 / s.copies as f64 * 100.0
+        );
+    }
+
+    // Grand total
+    let total_bytecodes_in_groups: usize = lazy_stats.iter().map(|s| s.copies).sum();
+    let total_outlier_bcs: usize = lazy_stats.iter().map(|s| s.total_outlier_bytecodes).sum();
+    let total_could_promote: usize = lazy_stats.iter().map(|s| s.near_invariant_positions).sum();
+    let total_truly_var: usize = lazy_stats.iter().map(|s| s.truly_variant_positions).sum();
+    println!("\n  Grand total:");
+    println!("    Bytecodes in variant groups: {total_bytecodes_in_groups}");
+    println!("    Variant positions that are near-invariant (promotable): {total_could_promote}");
+    println!("    Variant positions that are truly variant: {total_truly_var}");
+    println!("    Total outlier bytecodes needing sub-variants: {total_outlier_bcs} ({:.1}%)",
+        if total_bytecodes_in_groups > 0 { total_outlier_bcs as f64 / total_bytecodes_in_groups as f64 * 100.0 } else { 0.0 });
 }
