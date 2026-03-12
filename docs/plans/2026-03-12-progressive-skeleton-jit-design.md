@@ -279,6 +279,12 @@ pub struct CompiledSkeleton {
 
     /// Recompilation version counter.
     pub version: u32,
+
+    /// Outlier protection: invariant violation counter.
+    pub violation_count: AtomicU32,
+
+    /// Total resolve attempts via this skeleton (for violation rate calculation).
+    pub resolve_count: AtomicU64,
 }
 
 pub enum CompileRequest {
@@ -364,12 +370,79 @@ When `validate_invariants()` returns false:
 
 1. **Immediate**: the contract runs via interpreter this time (Tier 0 fallback)
 2. **Background**: schedule per-hash compile for this specific contract (Tier 1)
-3. **Background**: schedule skeleton recompile with the violating bytecode added to samples:
-   - Re-run `analyze_skeleton_group()` with all known samples + new one
-   - Positions that were Invariant but now differ → reclassified as Variant
-   - Compile new skeleton version (v1)
-   - Atomic swap: replace old fn_ptr + update invariant_values
-   - `ResourceTracker::remove()` on old version
+3. **Recompile decision**: only recompile the skeleton if violation rate exceeds threshold
+
+The violating contract always gets its own Tier 1 per-hash compilation (full constant
+folding, optimal code). The skeleton is only recompiled when the variance analysis was
+genuinely wrong — not for rare outliers.
+
+#### Outlier Protection ("耗子屎" Defense)
+
+A single outlier contract must not degrade the skeleton for thousands of normal instances.
+Example: 3,323 UniV3 Pool contracts have PUSH[7]=0x42, but 1 outlier has PUSH[7]=0x99.
+Without protection, recompiling would make PUSH[7] Variant for all 3,323 contracts —
+destroying constant folding for a position that is invariant in 99.97% of cases.
+
+```rust
+struct CompiledSkeleton {
+    // ... existing fields ...
+    violation_count: AtomicU32,   // invariant violation counter
+    resolve_count: AtomicU64,     // total resolve attempts via this skeleton
+}
+```
+
+Recompile trigger logic:
+
+```rust
+if !validate_invariants(bytecode, &skel.variance, &skel.invariant_values) {
+    let violations = skel.violation_count.fetch_add(1, Relaxed);
+    let total = skel.resolve_count.load(Relaxed);
+
+    // Only recompile if violation rate > 10% AND at least 10 violations observed.
+    // This prevents a single outlier from degrading the skeleton.
+    if violations > 10 && (violations as f64 / total as f64) > 0.10 {
+        self.schedule_recompile(skel_hash, bytecode);
+    }
+
+    // The outlier always gets its own optimal per-hash compilation.
+    self.schedule_per_hash(hash, bytecode);
+    return Resolution::Interpreter;
+}
+```
+
+| Scenario | Behavior |
+|----------|----------|
+| 1 outlier / 3323 normal (0.03%) | Outlier → per-hash; skeleton unchanged; 3322 keep full optimization |
+| 500 variants / 3323 total (15%) | Violation rate > 10% → recompile; position is genuinely variant |
+| 3rd sample violates after N=2 analysis | Violation rate = 33% → recompile; 2-sample analysis was inaccurate |
+
+#### Recompile Flow (when triggered)
+
+Uses copy-on-write to avoid holding DashMap locks during LLVM compilation:
+
+```rust
+// 1. Short read lock: clone samples
+let (samples, old_version) = {
+    let entry = registry.skeletons.get(&skel_hash).unwrap();
+    // ... clone data, release lock immediately
+};
+
+// 2. Lock-free: LLVM compilation (seconds)
+let mut all_samples = samples;
+all_samples.push(new_sample);
+let new_variance = analyze_skeleton_group(&all_samples);
+let new_fn_ptr = compile_skeleton(..., &new_variance);
+
+// 3. Short write lock: atomic swap
+registry.skeletons.insert(skel_hash, SkeletonEntry::Compiled(CompiledSkeleton {
+    fn_ptr: new_fn_ptr,
+    variance: new_variance,
+    samples: all_samples,
+    version: old_version + 1,
+    ...
+}));
+// Old ResourceTracker::remove() frees old machine code
+```
 
 The old skeleton version remains valid and in use for existing compatible contracts until
 the new version is ready. No service disruption.
@@ -530,27 +603,45 @@ fn background_compiler(
                 }
 
                 CompileRequest::Recompile { skel_hash, new_sample } => {
-                    // Re-analyze with expanded sample set
-                    let mut entry = registry.skeletons.get_mut(&skel_hash).unwrap();
-                    if let SkeletonEntry::Compiled(skel) = entry.value_mut() {
-                        skel.samples.push(new_sample);
-                        let bytecodes: Vec<&[u8]> = skel.samples.iter()
-                            .map(|(_, b)| b.as_slice()).collect();
-                        let new_variance = analyze_skeleton_group(&bytecodes);
+                    // Copy-on-write: short read lock to clone data, then compile lock-free.
+                    let (mut samples, old_version) = {
+                        let entry = registry.skeletons.get(&skel_hash).unwrap();
+                        if let SkeletonEntry::Compiled(skel) = entry.value() {
+                            (skel.samples.clone(), skel.version)
+                        } else { continue; }
+                    }; // read lock released here
 
-                        // Recompile with updated variance
-                        let ts_ctx = ThreadSafeContext::new();
-                        let mut compiler = EvmCompiler::new(EvmOrcBackend::new(lljit, ts_ctx));
-                        let id = compiler.translate_skeleton(..., &new_variance).unwrap();
-                        let new_fn_ptr = unsafe { compiler.jit_function(id) }.unwrap();
+                    // Lock-free: re-analyze + LLVM compilation (seconds)
+                    samples.push(new_sample);
+                    let bytecodes: Vec<&[u8]> = samples.iter()
+                        .map(|(_, b)| b.as_slice()).collect();
+                    let new_variance = analyze_skeleton_group(&bytecodes);
 
-                        // Swap: remove old, install new
-                        let old_rt = std::mem::replace(&mut skel.resource_tracker, new_rt);
-                        old_rt.remove().ok();  // free old machine code
-                        skel.fn_ptr = new_fn_ptr;
-                        skel.variance = new_variance;
-                        skel.invariant_values = extract_invariant_values(...);
-                        skel.version += 1;
+                    let ts_ctx = ThreadSafeContext::new();
+                    let mut compiler = EvmCompiler::new(EvmOrcBackend::new(lljit, ts_ctx));
+                    let id = compiler.translate_skeleton(
+                        &format!("skel_{skel_hash:016x}_v{}", old_version + 1),
+                        &bytecodes[0], spec, &new_variance,
+                    ).unwrap();
+                    let new_fn_ptr = unsafe { compiler.jit_function(id) }.unwrap();
+
+                    // Short write lock: atomic swap
+                    let invariant_values = extract_invariant_values(&bytecodes[0], &new_variance);
+                    let old_entry = registry.skeletons.insert(skel_hash,
+                        SkeletonEntry::Compiled(CompiledSkeleton {
+                            fn_ptr: new_fn_ptr,
+                            variance: new_variance,
+                            invariant_values,
+                            samples,
+                            resource_tracker: new_rt,
+                            version: old_version + 1,
+                            violation_count: AtomicU32::new(0),
+                            resolve_count: AtomicU64::new(0),
+                        })
+                    );
+                    // Free old machine code
+                    if let Some(SkeletonEntry::Compiled(old)) = old_entry {
+                        old.resource_tracker.remove().ok();
                     }
                 }
             }
@@ -679,7 +770,9 @@ fn evict_cold_contracts(&self, block_threshold: u64, current_block: u64) {
 |------|-----------|
 | ORC v2 Backend API mismatch with existing Backend trait | Implement same trait; old backend kept for A/B |
 | DashMap contention on hot resolve path | Per-hash path is read-only; skeleton path is read-mostly |
-| Invariant recompile storm (many violations at once) | Debounce: at most one recompile per skeleton per block |
+| Invariant recompile storm (many violations at once) | Outlier protection: recompile only when violation rate > 10% AND > 10 violations |
+| Single outlier degrades skeleton for all instances | Outlier uses per-hash (full optimization); skeleton untouched unless violation rate exceeds threshold |
+| DashMap lock held during LLVM compilation | Copy-on-write: clone data under short read lock, compile lock-free, atomic swap under short write lock |
 | Sample bytecode memory (kept for recompile) | Cap at 10 samples per skeleton; evict oldest |
 | ResourceTracker removal while function executing | Atomic swap in registry; old RT removed after grace period |
 | LLJIT symbol name collision across skeletons | Unique names: `skel_{hash}_v{version}`, `evm_{code_hash}` |
