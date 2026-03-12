@@ -240,7 +240,13 @@ pub struct SkeletonRegistry {
     /// Tier 2: skeleton state machine.
     skeletons: DashMap<u64, SkeletonEntry>,
 
-    /// Async compilation queue.
+    /// Cache: code_hash → skeleton_hash (avoids re-scanning bytecode).
+    hash_cache: DashMap<B256, u64>,
+
+    /// Cache: code_hash → ImmDataTable (avoids re-scanning bytecode on Tier 2 re-entry).
+    data_tables: DashMap<B256, ImmDataTable>,
+
+    /// Async compilation queue (bounded, cap=1024).
     compile_tx: crossbeam::channel::Sender<CompileRequest>,
 }
 
@@ -267,9 +273,9 @@ pub struct CompiledSkeleton {
     /// Precise variance classification from sample analysis.
     pub variance: SkeletonVariance,
 
-    /// Expected values for each Invariant position.
-    /// Used by validate_invariants() to detect violations.
-    pub invariant_values: Vec<U256>,
+    /// Precomputed invariant checks: byte offsets + expected values.
+    /// Avoids linear bytecode scanning during validation.
+    pub invariant_checks: Vec<InvariantCheck>,
 
     /// All known samples (kept for recompilation on violation).
     pub samples: Vec<(B256, Vec<u8>)>,
@@ -326,43 +332,56 @@ fn collect_sample(&self, skel_hash: u64, hash: B256, bytecode: &[u8]) {
 
 ### Invariant Validation
 
-Microsecond-level check before using a skeleton function:
+Precomputed offset-based check — no linear bytecode scanning needed:
 
 ```rust
-/// Verify that all Invariant PUSH positions in `bytecode` match expected values.
-/// Returns false if any mismatch (the skeleton cannot be used for this bytecode).
-///
-/// Time complexity: O(bytecode_len), zero allocation.
-pub fn validate_invariants(
-    bytecode: &[u8],
-    variance: &SkeletonVariance,
-    expected: &[U256],
-) -> bool {
+/// Precomputed check for one Invariant PUSH position.
+pub struct InvariantCheck {
+    pub byte_offset: usize,  // offset of PUSH immediate in bytecode
+    pub len: u8,             // PUSH width (1-32 bytes)
+    pub expected: U256,      // expected value
+}
+
+/// Verify that all Invariant PUSH positions match expected values.
+/// Jumps directly to precomputed offsets — O(num_invariant_pushes), not O(bytecode_len).
+pub fn validate_invariants(bytecode: &[u8], checks: &[InvariantCheck]) -> bool {
+    for check in checks {
+        let end = check.byte_offset + check.len as usize;
+        if end > bytecode.len() { return false; }
+        let val = U256::from_be_slice(&bytecode[check.byte_offset..end]);
+        if val != check.expected {
+            return false;
+        }
+    }
+    true
+}
+
+/// Build InvariantCheck list during skeleton compilation (one-time cost).
+pub fn build_invariant_checks(bytecode: &[u8], variance: &SkeletonVariance) -> Vec<InvariantCheck> {
+    let mut checks = Vec::new();
     let mut push_idx = 0;
-    let mut inv_idx = 0;
     let mut i = 0;
     while i < bytecode.len() {
         let op = bytecode[i];
         i += 1;
         if op >= 0x60 && op <= 0x7f {
             let n = (op - 0x5f) as usize;
-            let end = (i + n).min(bytecode.len());
             if variance.pushes[push_idx] == PushClassification::Invariant {
-                let val = U256::from_be_slice(&bytecode[i..end]);
-                if val != expected[inv_idx] {
-                    return false;
-                }
-                inv_idx += 1;
+                checks.push(InvariantCheck {
+                    byte_offset: i,
+                    len: n as u8,
+                    expected: U256::from_be_slice(&bytecode[i..i + n]),
+                });
             }
             push_idx += 1;
-            i = end;
+            i += n;
         }
     }
-    true
+    checks
 }
 ```
 
-Cost: single linear scan of bytecode, no allocation. Typical: <1us for a 15KB contract.
+Cost: only touches invariant positions (~tens of checks), not entire bytecode. Typical: <100ns.
 
 ### Invariant Violation Handling
 
@@ -474,16 +493,34 @@ impl SkeletonRegistry {
             return Resolution::Direct(f.fn_ptr);
         }
 
-        // Fast path 2: skeleton compiled (Tier 2)
-        let skel_hash = skeleton_hash(bytecode);
+        // Fast path 2: cached data table (Tier 2 re-entry) — ~15ns
+        if let Some(table) = self.data_tables.get(&hash) {
+            let skel_hash = *self.hash_cache.get(&hash).unwrap();
+            if let Some(entry) = self.skeletons.get(&skel_hash) {
+                if let SkeletonEntry::Compiled(skel) = entry.value() {
+                    return Resolution::Skeleton(skel.fn_ptr, table.clone());
+                }
+            }
+        }
+
+        // Moderate path: skeleton compiled, first time for this code_hash — ~100ns
+        let skel_hash = self.get_or_compute_skel_hash(hash, bytecode);
         if let Some(entry) = self.skeletons.get(&skel_hash) {
             if let SkeletonEntry::Compiled(skel) = entry.value() {
-                if validate_invariants(bytecode, &skel.variance, &skel.invariant_values) {
+                skel.resolve_count.fetch_add(1, Relaxed);
+                if validate_invariants(bytecode, &skel.invariant_checks) {
                     let table = build_data_table(bytecode, &skel.variance);
+                    self.data_tables.insert(hash, table.clone());  // cache for next time
                     return Resolution::Skeleton(skel.fn_ptr, table);
                 } else {
-                    // Invariant violated — fallback + schedule recompile
-                    self.schedule_recompile(skel_hash, hash, bytecode);
+                    // Invariant violated — per-hash fallback + maybe recompile
+                    let violations = skel.violation_count.fetch_add(1, Relaxed);
+                    let total = skel.resolve_count.load(Relaxed);
+                    if violations > 10 && (violations as f64 / total as f64) > 0.10 {
+                        self.schedule_recompile(skel_hash, hash, bytecode);
+                    }
+                    self.schedule_per_hash(hash, bytecode);
+                    return Resolution::Interpreter;
                 }
             }
             // Entry exists but still Collecting — fall through
@@ -494,6 +531,15 @@ impl SkeletonRegistry {
         self.schedule_per_hash(hash, bytecode);
         Resolution::Interpreter
     }
+
+    fn get_or_compute_skel_hash(&self, hash: B256, bytecode: &[u8]) -> u64 {
+        if let Some(cached) = self.hash_cache.get(&hash) {
+            return *cached;
+        }
+        let skel_hash = skeleton_hash(bytecode);
+        self.hash_cache.insert(hash, skel_hash);
+        skel_hash
+    }
 }
 ```
 
@@ -501,8 +547,9 @@ impl SkeletonRegistry {
 
 | Path | Latency | When |
 |------|---------|------|
-| Per-hash hit (Tier 1) | ~15ns (DashMap get) | Contract seen before, already compiled |
-| Skeleton hit (Tier 2) | ~1-5us (validate + build_data_table) | New contract, known skeleton |
+| Per-hash hit (Tier 1) | ~15ns (DashMap get) | Contract seen before, Tier 1 compiled |
+| Skeleton re-entry (Tier 2, cached) | ~30ns (2× DashMap get) | Same contract, Tier 2 with cached data_table |
+| Skeleton first hit (Tier 2, cold) | ~100-500ns (validate + build_data_table + cache) | New code_hash, known skeleton |
 | Miss (Tier 0) | ~0 (just queues compile) | Completely new contract |
 
 ### Handler Integration
@@ -758,7 +805,7 @@ fn evict_cold_contracts(&self, block_threshold: u64, current_block: u64) {
 | `crates/revmc-llvm/src/orc_backend.rs` | NEW: EvmOrcBackend implementing Backend trait | 1 |
 | `crates/revmc-llvm/src/lib.rs` | Add orc_backend module, keep old backend | 1 |
 | `crates/revmc/src/registry.rs` | NEW: SkeletonRegistry, SkeletonEntry, resolve() | 2, 3 |
-| `crates/revmc/src/skeleton.rs` | Add validate_invariants(), extract_invariant_values() | 2 |
+| `crates/revmc/src/skeleton.rs` | Add InvariantCheck, validate_invariants(), build_invariant_checks() | 2 |
 | `crates/revmc/src/lib.rs` | Re-export registry module | 2 |
 | `crates/revmc-context/src/lib.rs` | No changes (imm_data_ptr already exists) | — |
 | `examples/runner/src/bin_common.rs` | ProgressiveJitHandler using SkeletonRegistry | 3 |
@@ -776,6 +823,8 @@ fn evict_cold_contracts(&self, block_threshold: u64, current_block: u64) {
 | Sample bytecode memory (kept for recompile) | Cap at 10 samples per skeleton; evict oldest |
 | ResourceTracker removal while function executing | Atomic swap in registry; old RT removed after grace period |
 | LLJIT symbol name collision across skeletons | Unique names: `skel_{hash}_v{version}`, `evm_{code_hash}` |
+| LLVM compilation failure (IR verify, O2 crash, OOM) | Silent degradation: mark contract as uncompilable, permanent interpreter fallback, log error |
+| Compile queue overflow | Bounded channel (cap=1024); full → drop request; contract uses interpreter, re-triggers on next call |
 
 ## Verification Strategy
 
