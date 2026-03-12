@@ -1,7 +1,7 @@
 # Progressive Skeleton JIT with ORC v2
 
 **Date**: 2026-03-12
-**Status**: Draft
+**Status**: Reviewed (spec interview complete)
 **Branch**: jit-integration
 **Prerequisite**: Skeleton-Aware Compilation (Phase 1, completed 2026-03-09)
 
@@ -88,12 +88,15 @@ Problems:
 // crates/revmc-llvm/src/orc_backend.rs (new file)
 
 pub struct EvmOrcBackend<'ctx> {
-    // ORC v2 engine
+    // ORC v2 engine (shared across compilations, thread-safe)
     lljit: OrcLLJIT,
 
     // Compilation support (reused across modules)
     machine: TargetMachine,
     opt_level: OptimizationLevel,
+
+    // Current module being built (one at a time, consumed by jit_function)
+    pending: Option<PendingModule>,
 
     // Track compiled modules for cleanup
     trackers: HashMap<u32, ResourceTracker>,  // func_id → RT
@@ -104,6 +107,13 @@ pub struct EvmOrcBackend<'ctx> {
     ty_void: VoidType<'ctx>,
     ty_i1: IntType<'ctx>,
     // ... etc
+}
+
+/// A module currently being built, not yet submitted to LLJIT.
+struct PendingModule {
+    ts_ctx: ThreadSafeContext,
+    module: Module,
+    // Builder state for the function being constructed
 }
 ```
 
@@ -845,3 +855,17 @@ fn evict_cold_contracts(&self, block_threshold: u64, current_block: u64) {
 - **Sub-function compilation**: One contract = one LLVM function; splitting adds complexity
   for inter-function stack/gas passing with unclear benefit
 - **Persistent AOT cache integration**: Phase 3 concern; this design focuses on in-process JIT
+
+## Spec Interview Decisions (2026-03-12)
+
+| Topic | Decision | Rationale |
+|-------|----------|-----------|
+| Concurrency: recompile locking | Copy-on-write | Short read lock → lock-free compile → short write lock. Never hold DashMap lock during LLVM compilation. |
+| Outlier protection | Recompile only if violation rate > 10% | A single outlier uses per-hash (full optimization); skeleton unchanged for majority. |
+| Backend trait compatibility | Keep trait unchanged, use internal `PendingModule` | OrcBackend uses `Option<PendingModule>` to track current module. `build_function` creates it, `jit_function` consumes it. |
+| Independent module per function | Required by ORC v2 | `add_module()` transfers ownership; independent modules enable per-function `ResourceTracker` eviction. No cross-function optimization loss (EVM contracts don't call each other at LLVM level). |
+| Parallel compilation impact | < 5% overhead | 99% of work (IR + O2) is fully parallel. Only `add_module()` has brief internal lock (~ms). |
+| Hot path caching | skel_hash cache + data_table cache + precomputed invariant offsets | Tier 2 re-entry: ~30ns (2× DashMap get). First hit: ~100-500ns (validate + build + cache). |
+| Compile failure | Silent degradation to interpreter | Mark contract as uncompilable, log error, no panic. |
+| Queue overflow | Bounded (1024), drop on full | Contract falls back to interpreter, re-triggers on next call. |
+| Tier 1 lifetime | Preserve, no cleanup | Tier 1 per-hash has better constant folding than Tier 2 skeleton. Let LRU eviction handle natural cleanup. |
