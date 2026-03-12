@@ -154,6 +154,26 @@ impl Fixture {
             .map_err(|e| format!("Plain execution failed: {:?}", e))
     }
 
+    /// Access the pre-built CacheDB.
+    pub fn prebuilt_db(&self) -> &Arc<CacheDB<EmptyDB>> {
+        &self.prebuilt_db
+    }
+
+    /// Access the block environment.
+    pub fn block(&self) -> &BlockEnv {
+        &self.block
+    }
+
+    /// Access the cfg environment.
+    pub fn cfg(&self) -> &CfgEnv {
+        &self.cfg
+    }
+
+    /// Access the transaction environment.
+    pub fn tx(&self) -> &TxEnv {
+        &self.tx
+    }
+
     /// Run JIT-compiled EVM execution (with interpreter fallback for non-JIT contracts).
     pub fn run_jit(&self) -> Result<ResultAndState, String> {
         let mut evm = self.make_plain_evm();
@@ -237,8 +257,8 @@ impl Fixture {
 type BenchEvm<'a> = MainnetEvm<revm::handler::MainnetContext<&'a mut CacheDB<EmptyDB>>>;
 type BenchError = EVMError<core::convert::Infallible, InvalidTransaction>;
 
-struct JitHandler {
-    functions: Arc<HashMap<B256, RawEvmCompilerFn>>,
+pub struct JitHandler {
+    pub functions: Arc<HashMap<B256, RawEvmCompilerFn>>,
 }
 
 impl Handler for JitHandler {

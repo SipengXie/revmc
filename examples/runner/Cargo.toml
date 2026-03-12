@@ -32,10 +32,10 @@ hex = "0.4"
 libloading = "0.8"
 bincode = "1.3"
 clap = { version = "4", features = ["derive"] }
+k256 = "0.13"
 
 [dev-dependencies]
 criterion = "0.5"
-k256 = "0.13"
 
 [[bin]]
 name = "jsonl_bench"
@@ -112,6 +112,10 @@ path = "src/bin/collect_profile.rs"
 [[bin]]
 name = "pgo_bench"
 path = "src/bin/pgo_bench.rs"
+
+[[bin]]
+name = "pgo_single_bench"
+path = "src/bin/pgo_single_bench.rs"
 
 [[bench]]
 name = "bench_airdrop"
