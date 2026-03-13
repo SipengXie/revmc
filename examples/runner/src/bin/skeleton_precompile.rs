@@ -196,7 +196,7 @@ struct Args {
     dir: String,
 
     /// AOT cache output directory
-    #[arg(long, default_value = "/tmp/jit_cache")]
+    #[arg(long, default_value = "./jit_cache")]
     cache_dir: String,
 
     /// First block number

@@ -233,7 +233,7 @@ struct Args {
     dir: String,
     #[arg(long, default_value_t = 38004930)]
     block: u64,
-    #[arg(long, default_value = "/tmp/jit_cache")]
+    #[arg(long, default_value = "./jit_cache")]
     cache_dir: String,
     #[arg(long, default_value_t = 20)]
     rounds: usize,

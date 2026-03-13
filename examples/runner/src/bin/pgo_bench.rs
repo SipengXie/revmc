@@ -363,8 +363,8 @@ fn main() {
         .nth(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(38004930);
-    let cache_dir = PathBuf::from("/tmp/jit_cache");
-    let pgo_cache_dir = PathBuf::from("/tmp/jit_cache_pgo");
+    let cache_dir = PathBuf::from("./jit_cache");
+    let pgo_cache_dir = PathBuf::from("./jit_cache_pgo");
 
     println!("=== PGO Branch Profiling Benchmark ===");
     println!("Block {block} | Cache: {}\n", cache_dir.display());

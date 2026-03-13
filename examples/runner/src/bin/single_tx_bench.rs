@@ -44,7 +44,7 @@ struct Args {
     block: u64,
     #[arg(long)]
     tx_index: usize,
-    #[arg(long, default_value = "/tmp/jit_cache")]
+    #[arg(long, default_value = "./jit_cache")]
     cache_dir: String,
     #[arg(long, default_value_t = 10)]
     rounds: usize,

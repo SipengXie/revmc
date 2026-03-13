@@ -310,7 +310,7 @@ fn main() {
         .nth(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(38004930);
-    let cache_dir = PathBuf::from("/tmp/jit_cache");
+    let cache_dir = PathBuf::from("./jit_cache");
 
     println!("=== Skeleton Compilation Benchmark ===");
     println!("Block {block} | Cache: {}\n", cache_dir.display());
