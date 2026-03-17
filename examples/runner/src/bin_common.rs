@@ -448,10 +448,18 @@ pub fn collect_unique_bytecodes(loaders: &[BinLoader]) -> HashMap<B256, Bytecode
     all_codes
 }
 
+/// Returns true if a bytecode should be skipped during JIT compilation.
+///
+/// Bytecodes starting with 0xEF are either EIP-7702 delegated code (resolved at the
+/// frame level, not executed directly) or legacy INVALID — compiling either is incorrect.
+fn should_skip_compilation(bc: &Bytecode) -> bool {
+    bc.original_byte_slice().first() == Some(&0xEF)
+}
+
 pub fn compile_all_contracts(code_values: &HashMap<B256, Bytecode>) -> CompiledContracts {
     let mut contracts: Vec<(B256, &Bytecode)> = code_values
         .iter()
-        .filter(|(_, bc)| !bc.is_empty())
+        .filter(|(_, bc)| !bc.is_empty() && !should_skip_compilation(bc))
         .map(|(h, bc)| (*h, bc))
         .collect();
     contracts.sort_by_key(|(_, bc)| std::cmp::Reverse(bc.original_byte_slice().len()));
@@ -637,7 +645,7 @@ pub fn compile_all_contracts_with_cache(
 
     let mut contracts: Vec<(B256, &Bytecode)> = code_values
         .iter()
-        .filter(|(_, bc)| !bc.is_empty())
+        .filter(|(_, bc)| !bc.is_empty() && !should_skip_compilation(bc))
         .map(|(h, bc)| (*h, bc))
         .collect();
     contracts.sort_by_key(|(_, bc)| std::cmp::Reverse(bc.original_byte_slice().len()));

@@ -67,6 +67,10 @@ struct RegistryGroup {
     member_hashes: Vec<[u8; 32]>,
     num_variant: u32,
     num_members: u32,
+    /// Serialized variance: -1 = Invariant, >=0 = Variant { table_index }.
+    /// One entry per PUSH1..PUSH32 instruction.
+    #[serde(default)]
+    variance_map: Vec<i32>,
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -259,7 +263,7 @@ fn main() {
             Err(_) => continue,
         };
         for (hash, bytecode) in snapshot.codes {
-            if !bytecode.is_empty() {
+            if !bytecode.is_empty() && bytecode.original_byte_slice().first() != Some(&0xEF) {
                 all_codes
                     .entry(hash)
                     .or_insert_with(|| bytecode.original_byte_slice().to_vec());
@@ -360,11 +364,18 @@ fn main() {
         } else {
             group_to_compile.push((*skel_hash, members[0].1.clone(), variance.clone()));
         }
+        let variance_map: Vec<i32> = variance.pushes.iter().map(|p| {
+            match p {
+                revmc::skeleton::PushClassification::Invariant => -1,
+                revmc::skeleton::PushClassification::Variant { table_index } => *table_index as i32,
+            }
+        }).collect();
         registry_groups.push(RegistryGroup {
             skeleton_hash: *skel_hash,
             member_hashes: members.iter().map(|(h, _)| h.0).collect(),
             num_variant: variance.num_variant,
             num_members: members.len() as u32,
+            variance_map,
         });
     }
     // Sort by bytecode size descending
