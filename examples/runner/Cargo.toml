@@ -121,6 +121,10 @@ path = "src/bin/pgo_single_bench.rs"
 name = "per_contract_ablation"
 path = "src/bin/per_contract_ablation.rs"
 
+[[bin]]
+name = "compile_hex"
+path = "src/bin/compile_hex.rs"
+
 [[bench]]
 name = "bench_airdrop"
 path = "src/bench_airdrop.rs"

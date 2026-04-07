@@ -10,3 +10,4 @@ clif
 .worktrees/
 /jit_cache/
 /jit_cache_pgo/
+/revmc_cache/
