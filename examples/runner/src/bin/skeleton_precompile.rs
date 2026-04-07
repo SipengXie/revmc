@@ -23,7 +23,7 @@ use revm::{
     primitives::{Address, B256, HashMap as RevmHashMap, U256},
     state::AccountInfo,
 };
-use revmc::skeleton::{analyze_skeleton_group, SkeletonVariance};
+use revmc::skeleton::{analyze_skeleton_group, build_data_table, SkeletonVariance};
 use revmc::{EvmCompiler, EvmLlvmBackend, OptimizationLevel};
 use serde::{Deserialize, Serialize};
 
@@ -491,6 +491,9 @@ fn main() {
     // ── Phase 5: Save registry ──────────────────────────────────────────
     save_registry(&cache_dir, &registry_groups);
 
+    // ── Phase 5b: Save pre-serialized data tables ──────────────────────
+    save_data_tables(&cache_dir, &group_variances);
+
     // ── Summary ─────────────────────────────────────────────────────────
     println!("\n=== Summary ===");
     println!("  Singletons: {} compiled, {} cached", singleton_to_compile.len().saturating_sub(failed), singleton_cached);
@@ -506,6 +509,28 @@ fn main() {
         singletons.len(),
         group_variances.len(),
         singletons.len() + group_member_count,
+    );
+}
+
+fn save_data_tables(
+    cache_dir: &Path,
+    group_variances: &[(u64, Vec<(B256, Vec<u8>)>, SkeletonVariance)],
+) {
+    let mut data_tables: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+    for (_skel_hash, members, variance) in group_variances {
+        for (code_hash, bytecode) in members {
+            let table = build_data_table(bytecode, variance);
+            data_tables.insert(code_hash.0, table.data);
+        }
+    }
+    let path = cache_dir.join("data_tables.bin");
+    let data = bincode::serialize(&data_tables).expect("serialize data_tables");
+    std::fs::write(&path, &data).expect("write data_tables");
+    println!(
+        "  Data tables saved: {} entries ({:.1} KB) → {}",
+        data_tables.len(),
+        data.len() as f64 / 1024.0,
+        path.display()
     );
 }
 
