@@ -7,6 +7,8 @@
 )]
 
 use crate::*;
+use crate::skeleton;
+use crate::skeleton_admission;
 use context_interface;
 use revm_bytecode::opcode as op;
 use revm_interpreter as interpreter;
@@ -27,6 +29,19 @@ mod smod_zero_opaque;
 
 mod runner;
 pub use runner::*;
+
+#[test]
+fn skeleton_admission_matches_existing_data_table_semantics() {
+    let a = &[op::PUSH1, 0x11, op::PUSH1, 0x01, op::PUSH1, 0xaa, op::STOP];
+    let b = &[op::PUSH1, 0x11, op::PUSH1, 0x02, op::PUSH1, 0xaa, op::STOP];
+
+    let variance = skeleton::analyze_skeleton_group(&[a, b]);
+    let descriptor = skeleton_admission::AdmissionDescriptor::from_bytecode(42, a, &variance);
+    let admitted = skeleton_admission::check_admission(42, b, &descriptor).unwrap();
+    let expected = skeleton::build_data_table(b, &variance);
+
+    assert_eq!(admitted.data, expected.data);
+}
 
 const I256_MAX: U256 = U256::from_limbs([
     0xFFFFFFFFFFFFFFFF,

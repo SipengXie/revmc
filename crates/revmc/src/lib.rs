@@ -14,6 +14,7 @@ pub use bytecode::*;
 
 pub mod profile;
 pub mod skeleton;
+pub(crate) mod skeleton_admission;
 
 mod compiler;
 pub use compiler::{EvmCompiler, EvmCompilerInput};

@@ -99,8 +99,7 @@ pub fn build_data_table(bytecode: &[u8], variance: &SkeletonVariance) -> ImmData
     for (imm, classification) in pushes.iter().zip(variance.pushes.iter()) {
         if let PushClassification::Variant { table_index } = classification {
             let offset = *table_index as usize * 32;
-            let value = U256::from_be_slice(imm);
-            let le_bytes = value.to_le_bytes::<32>();
+            let le_bytes = normalize_push_immediate(imm);
             data[offset..offset + 32].copy_from_slice(&le_bytes);
         }
     }
@@ -108,9 +107,13 @@ pub fn build_data_table(bytecode: &[u8], variance: &SkeletonVariance) -> ImmData
     ImmDataTable { data }
 }
 
+pub(crate) fn normalize_push_immediate(imm: &[u8]) -> [u8; 32] {
+    U256::from_be_slice(imm).to_le_bytes::<32>()
+}
+
 /// Extract PUSH1..PUSH32 immediate byte slices from bytecode, in opcode order.
 /// Skips PUSH0 (no immediate bytes, always zero).
-fn extract_push_immediates(bytecode: &[u8]) -> Vec<&[u8]> {
+pub(crate) fn extract_push_immediates(bytecode: &[u8]) -> Vec<&[u8]> {
     let mut result = Vec::new();
     let mut i = 0;
     while i < bytecode.len() {
@@ -181,6 +184,20 @@ mod tests {
 
         let table = build_data_table(&bc1, &variance);
         assert!(table.data.iter().all(|&b| b == 0xff));
+    }
+
+    #[test]
+    fn test_normalize_push_immediate_matches_build_data_table_semantics() {
+        let mut bc = vec![0x60, 0x2a, 0x7f];
+        bc.extend_from_slice(&[0xff; 32]);
+
+        let pushes = extract_push_immediates(&bc);
+        let a = normalize_push_immediate(pushes[0]);
+        let b = normalize_push_immediate(pushes[1]);
+
+        assert_eq!(a[0], 0x2a);
+        assert_eq!(a[1..], [0u8; 31]);
+        assert_eq!(b, [0xff; 32]);
     }
 
     #[test]
