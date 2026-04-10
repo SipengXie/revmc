@@ -16,23 +16,24 @@
 //!   compile_hex --cache-dir ./revmc_cache --file contracts.hex --skeleton
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use clap::Parser;
-use revm::primitives::hardfork::SpecId;
 use revm::primitives::keccak256;
 use revm::primitives::B256;
 use revmc::skeleton::{analyze_skeleton_group, PushClassification, SkeletonVariance};
-use revmc::{EvmCompiler, EvmLlvmBackend, OptimizationLevel};
+use revmc::OptimizationLevel;
 use serde::{Deserialize, Serialize};
 
-use op_revm::OpSpecId;
+#[path = "../skelot_common.rs"]
+mod skelot_common;
 
-const OP_SPEC: OpSpecId = OpSpecId::ISTHMUS;
-const ETH_SPEC: SpecId = OP_SPEC.into_eth_spec();
+use skelot_common::{
+    compile_per_hash, compile_skeleton_group, extract_opcode_skeleton, hash_bytes, opt_tag,
+    per_hash_paths, skeleton_paths, PerHashArtifacts, SkeletonArtifacts,
+};
 
 // ── Registry format (compatible with skeleton_precompile) ──────────────────
 
@@ -49,87 +50,6 @@ struct RegistryGroup {
 #[derive(Serialize, Deserialize)]
 struct SkeletonRegistry {
     groups: Vec<RegistryGroup>,
-}
-
-// ── Helpers ────────────────────────────────────────────────────────────────
-
-fn spec_tag() -> String {
-    format!("{ETH_SPEC:?}").to_lowercase()
-}
-
-fn opt_tag(opt: OptimizationLevel) -> &'static str {
-    match opt {
-        OptimizationLevel::None => "o0",
-        OptimizationLevel::Less => "o1",
-        OptimizationLevel::Default => "o2",
-        OptimizationLevel::Aggressive => "o3",
-    }
-}
-
-fn per_hash_paths(cache_dir: &Path, hash: &B256, opt: OptimizationLevel) -> (String, PathBuf, PathBuf) {
-    let hash_hex = hex::encode(hash);
-    let key = format!("{hash_hex}__{}__{}", spec_tag(), opt_tag(opt));
-    let stem = cache_dir.join(&key);
-    (format!("c_{hash_hex}"), stem.with_extension("o"), stem.with_extension("so"))
-}
-
-fn skeleton_paths(cache_dir: &Path, skel_hash: u64, opt: OptimizationLevel) -> (String, PathBuf, PathBuf) {
-    let key = format!("skel_{skel_hash:016x}__{}__{}", spec_tag(), opt_tag(opt));
-    let stem = cache_dir.join(&key);
-    (format!("skel_{skel_hash:016x}"), stem.with_extension("o"), stem.with_extension("so"))
-}
-
-fn extract_opcode_skeleton(bytes: &[u8]) -> Vec<u8> {
-    let mut skeleton = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let op = bytes[i];
-        skeleton.push(op);
-        i += 1;
-        if (0x60..=0x7f).contains(&op) {
-            i += (op - 0x5f) as usize;
-        }
-    }
-    skeleton
-}
-
-fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn compile_per_hash(bytecode: &[u8], symbol: &str, obj: &Path, lib: &Path, opt: OptimizationLevel) -> Result<(), String> {
-    if let Some(parent) = obj.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let context = Box::leak(Box::new(revmc::llvm::inkwell::context::Context::create()));
-    let backend = EvmLlvmBackend::new(context, true, opt).map_err(|e| format!("backend: {e}"))?;
-    let mut compiler = EvmCompiler::new(backend);
-    compiler.translate(symbol, bytecode, ETH_SPEC).map_err(|e| format!("translate: {e}"))?;
-    compiler.write_object_to_file(obj).map_err(|e| format!("write: {e}"))?;
-    revmc::Linker::new().link(lib, [obj]).map_err(|e| format!("link: {e}"))?;
-    Ok(())
-}
-
-fn compile_skeleton_group(
-    bytecode: &[u8],
-    variance: &SkeletonVariance,
-    symbol: &str,
-    obj: &Path,
-    lib: &Path,
-    opt: OptimizationLevel,
-) -> Result<(), String> {
-    if let Some(parent) = obj.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let context = Box::leak(Box::new(revmc::llvm::inkwell::context::Context::create()));
-    let backend = EvmLlvmBackend::new(context, true, opt).map_err(|e| format!("backend: {e}"))?;
-    let mut compiler = EvmCompiler::new(backend);
-    compiler.translate_skeleton(symbol, bytecode, ETH_SPEC, variance).map_err(|e| format!("translate_skeleton: {e}"))?;
-    compiler.write_object_to_file(obj).map_err(|e| format!("write: {e}"))?;
-    revmc::Linker::new().link(lib, [obj]).map_err(|e| format!("link: {e}"))?;
-    Ok(())
 }
 
 // ── Input parsing ──────────────────────────────────────────────────────────
@@ -265,8 +185,8 @@ fn compile_all_per_hash(
     let mut cached = 0usize;
 
     for (hash, bytes) in contracts {
-        let (_, _, lib) = per_hash_paths(cache_dir, hash, opt);
-        if lib.exists() {
+        let PerHashArtifacts { library, .. } = per_hash_paths(cache_dir, hash, opt);
+        if library.exists() {
             cached += 1;
         } else {
             to_compile.push((*hash, bytes.clone()));
@@ -298,8 +218,9 @@ fn compile_all_per_hash(
             let failed_ref = &failed_count;
             s.spawn(move || {
                 for (hash, bytes) in &chunk {
-                    let (sym, obj, lib) = per_hash_paths(cache_dir, hash, opt);
-                    match compile_per_hash(bytes, &sym, &obj, &lib, opt) {
+                    let PerHashArtifacts { symbol, object, library } =
+                        per_hash_paths(cache_dir, hash, opt);
+                    match compile_per_hash(bytes, &symbol, &object, &library, opt) {
                         Ok(()) => {
                             let done = compiled_ref.fetch_add(1, Ordering::Relaxed) + 1;
                             if done % 50 == 0 || done == total {
@@ -373,8 +294,8 @@ fn compile_with_skeleton(
     let mut singleton_to_compile: Vec<(B256, Vec<u8>)> = Vec::new();
     let mut singleton_cached = 0usize;
     for (hash, bytes) in &singletons {
-        let (_, _, lib) = per_hash_paths(cache_dir, hash, opt);
-        if lib.exists() {
+        let PerHashArtifacts { library, .. } = per_hash_paths(cache_dir, hash, opt);
+        if library.exists() {
             singleton_cached += 1;
         } else {
             singleton_to_compile.push((*hash, bytes.clone()));
@@ -386,8 +307,8 @@ fn compile_with_skeleton(
     let mut skel_to_compile: Vec<(u64, Vec<(B256, Vec<u8>)>, SkeletonVariance)> = Vec::new();
     let mut skel_cached = 0usize;
     for (skel_hash, members, variance) in &group_variances {
-        let (_, _, lib) = skeleton_paths(cache_dir, *skel_hash, opt);
-        if lib.exists() {
+        let SkeletonArtifacts { library, .. } = skeleton_paths(cache_dir, *skel_hash, opt);
+        if library.exists() {
             skel_cached += 1;
         } else {
             skel_to_compile.push((*skel_hash, members.clone(), variance.clone()));
@@ -450,8 +371,9 @@ fn compile_with_skeleton(
                     for job in chunk {
                         match job {
                             Job::Single(hash, bytes) => {
-                                let (sym, obj, lib) = per_hash_paths(cache_dir, &hash, opt);
-                                match compile_per_hash(&bytes, &sym, &obj, &lib, opt) {
+                                let PerHashArtifacts { symbol, object, library } =
+                                    per_hash_paths(cache_dir, &hash, opt);
+                                match compile_per_hash(&bytes, &symbol, &object, &library, opt) {
                                     Ok(()) => { compiled_ref.fetch_add(1, Ordering::Relaxed); }
                                     Err(e) => {
                                         failed_ref.fetch_add(1, Ordering::Relaxed);
@@ -460,11 +382,12 @@ fn compile_with_skeleton(
                                 }
                             }
                             Job::Skeleton(skel_hash, members, variance) => {
-                                let (sym, obj, lib) = skeleton_paths(cache_dir, skel_hash, opt);
+                                let SkeletonArtifacts { symbol, object, library } =
+                                    skeleton_paths(cache_dir, skel_hash, opt);
                                 let representative = members[0].1.clone();
                                 // catch_unwind: skeleton compiler may panic on certain bytecodes
                                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    compile_skeleton_group(&representative, &variance, &sym, &obj, &lib, opt)
+                                    compile_skeleton_group(&representative, &variance, &symbol, &object, &library, opt)
                                 }));
                                 match result {
                                     Ok(Ok(())) => {
@@ -515,12 +438,13 @@ fn compile_with_skeleton(
                     let failed_ref = &fb_failed;
                     s.spawn(move || {
                         for (hash, bytes) in &chunk {
-                            let (sym, obj, lib) = per_hash_paths(cache_dir, hash, opt);
-                            if lib.exists() {
+                            let PerHashArtifacts { symbol, object, library } =
+                                per_hash_paths(cache_dir, hash, opt);
+                            if library.exists() {
                                 compiled_ref.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
-                            match compile_per_hash(bytes, &sym, &obj, &lib, opt) {
+                            match compile_per_hash(bytes, &symbol, &object, &library, opt) {
                                 Ok(()) => { compiled_ref.fetch_add(1, Ordering::Relaxed); }
                                 Err(e) => {
                                     failed_ref.fetch_add(1, Ordering::Relaxed);
@@ -542,8 +466,8 @@ fn compile_with_skeleton(
     let registry_groups: Vec<RegistryGroup> = group_variances
         .iter()
         .filter(|(skel_hash, _, _)| {
-            let (_, _, lib) = skeleton_paths(cache_dir, *skel_hash, opt);
-            lib.exists()
+            let SkeletonArtifacts { library, .. } = skeleton_paths(cache_dir, *skel_hash, opt);
+            library.exists()
         })
         .map(|(skel_hash, members, variance)| {
             let variance_map: Vec<i32> = variance.pushes.iter().map(|p| match p {

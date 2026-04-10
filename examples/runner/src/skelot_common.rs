@@ -1,0 +1,489 @@
+//! Shared helpers for SkelOT paper binaries.
+//!
+//! Included via `#[path = "../skelot_common.rs"] mod skelot_common;` in each
+//! binary under `examples/runner/src/bin/`, matching the `bin_common.rs`
+//! pattern used elsewhere in this crate.
+
+#![allow(dead_code)]
+
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+
+use revm::bytecode::Bytecode;
+use revm::primitives::hardfork::SpecId;
+use revm::primitives::{Address, B256};
+use revmc::skeleton::SkeletonVariance;
+use revmc::{EvmCompiler, EvmLlvmBackend, OptimizationLevel};
+
+use op_revm::OpSpecId;
+
+pub const OP_SPEC: OpSpecId = OpSpecId::ISTHMUS;
+pub const ETH_SPEC: SpecId = OP_SPEC.into_eth_spec();
+
+// ── Spec / opt tags ────────────────────────────────────────────────────────
+
+pub fn spec_tag() -> String {
+    format!("{ETH_SPEC:?}").to_lowercase()
+}
+
+pub fn opt_tag(opt: OptimizationLevel) -> &'static str {
+    match opt {
+        OptimizationLevel::None => "o0",
+        OptimizationLevel::Less => "o1",
+        OptimizationLevel::Default => "o2",
+        OptimizationLevel::Aggressive => "o3",
+    }
+}
+
+// ── Skeleton extraction ────────────────────────────────────────────────────
+
+/// Extract the opcode skeleton from EVM bytecode.
+/// Keeps all opcodes but strips PUSH1-PUSH32 immediate bytes.
+pub fn extract_opcode_skeleton(bytes: &[u8]) -> Vec<u8> {
+    let mut skeleton = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let op = bytes[i];
+        skeleton.push(op);
+        i += 1;
+        if (0x60..=0x7f).contains(&op) {
+            i += (op - 0x5f) as usize;
+        }
+    }
+    skeleton
+}
+
+/// Same as `extract_opcode_skeleton` but also returns `(opcode_count, imm_bytes)`
+/// for Stage A's Table 1 bucket statistics.
+pub fn extract_opcode_skeleton_with_counts(bytes: &[u8]) -> (Vec<u8>, usize, usize) {
+    let mut skeleton = Vec::with_capacity(bytes.len());
+    let mut opcode_count = 0usize;
+    let mut imm_bytes = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        let op = bytes[i];
+        skeleton.push(op);
+        opcode_count += 1;
+        i += 1;
+        if (0x60..=0x7f).contains(&op) {
+            let n = (op - 0x5f) as usize;
+            imm_bytes += n;
+            i += n;
+        }
+    }
+    (skeleton, opcode_count, imm_bytes)
+}
+
+/// FNV-style hash using `DefaultHasher`. Matches existing
+/// `compile_hex.rs`/`opcode_dedup.rs` hashing semantics.
+pub fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+// ── Skip filters ───────────────────────────────────────────────────────────
+
+/// Filter for bytecodes that `revmc` must not compile.
+/// Bytecodes starting with `0xEF` are EIP-7702 delegated or legacy INVALID;
+/// compiling them breaks gas semantics (see memory `eip7702-gas-bug`).
+pub fn should_skip_bytes(bytes: &[u8]) -> bool {
+    bytes.first() == Some(&0xEF) || bytes.is_empty()
+}
+
+pub fn should_skip_compilation(bc: &Bytecode) -> bool {
+    let bytes = bc.original_byte_slice();
+    should_skip_bytes(bytes)
+}
+
+// ── Per-hash compile ───────────────────────────────────────────────────────
+
+pub struct PerHashArtifacts {
+    pub symbol: String,
+    pub object: PathBuf,
+    pub library: PathBuf,
+}
+
+pub fn per_hash_paths(cache_dir: &Path, hash: &B256, opt: OptimizationLevel) -> PerHashArtifacts {
+    let hash_hex = hex::encode(hash);
+    let key = format!("{hash_hex}__{}__{}", spec_tag(), opt_tag(opt));
+    let stem = cache_dir.join(&key);
+    PerHashArtifacts {
+        symbol: format!("c_{hash_hex}"),
+        object: stem.with_extension("o"),
+        library: stem.with_extension("so"),
+    }
+}
+
+pub fn compile_per_hash(
+    bytecode: &[u8],
+    symbol: &str,
+    obj: &Path,
+    lib: &Path,
+    opt: OptimizationLevel,
+) -> Result<(), String> {
+    if let Some(parent) = obj.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let context = Box::leak(Box::new(revmc::llvm::inkwell::context::Context::create()));
+    let backend = EvmLlvmBackend::new(context, true, opt).map_err(|e| format!("backend: {e}"))?;
+    let mut compiler = EvmCompiler::new(backend);
+    compiler
+        .translate(symbol, bytecode, ETH_SPEC)
+        .map_err(|e| format!("translate: {e}"))?;
+    compiler
+        .write_object_to_file(obj)
+        .map_err(|e| format!("write: {e}"))?;
+    revmc::Linker::new()
+        .link(lib, [obj])
+        .map_err(|e| format!("link: {e}"))?;
+    Ok(())
+}
+
+// ── Skeleton compile ───────────────────────────────────────────────────────
+
+pub struct SkeletonArtifacts {
+    pub symbol: String,
+    pub object: PathBuf,
+    pub library: PathBuf,
+}
+
+pub fn skeleton_paths(
+    cache_dir: &Path,
+    skel_hash: u64,
+    opt: OptimizationLevel,
+) -> SkeletonArtifacts {
+    let key = format!("skel_{skel_hash:016x}__{}__{}", spec_tag(), opt_tag(opt));
+    let stem = cache_dir.join(&key);
+    SkeletonArtifacts {
+        symbol: format!("skel_{skel_hash:016x}"),
+        object: stem.with_extension("o"),
+        library: stem.with_extension("so"),
+    }
+}
+
+pub fn compile_skeleton_group(
+    bytecode: &[u8],
+    variance: &SkeletonVariance,
+    symbol: &str,
+    obj: &Path,
+    lib: &Path,
+    opt: OptimizationLevel,
+) -> Result<(), String> {
+    if let Some(parent) = obj.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let context = Box::leak(Box::new(revmc::llvm::inkwell::context::Context::create()));
+    let backend = EvmLlvmBackend::new(context, true, opt).map_err(|e| format!("backend: {e}"))?;
+    let mut compiler = EvmCompiler::new(backend);
+    compiler
+        .translate_skeleton(symbol, bytecode, ETH_SPEC, variance)
+        .map_err(|e| format!("translate_skeleton: {e}"))?;
+    compiler
+        .write_object_to_file(obj)
+        .map_err(|e| format!("write: {e}"))?;
+    revmc::Linker::new()
+        .link(lib, [obj])
+        .map_err(|e| format!("link: {e}"))?;
+    Ok(())
+}
+
+// ── Protocol identification (lifted from skeleton_identify.rs) ─────────────
+
+pub struct KnownSelector {
+    pub bytes: [u8; 4],
+    pub name: &'static str,
+}
+
+pub const KNOWN_SELECTORS: &[KnownSelector] = &[
+    // ERC-20
+    KnownSelector { bytes: [0xa9, 0x05, 0x9c, 0xbb], name: "transfer(address,uint256)" },
+    KnownSelector { bytes: [0x23, 0xb8, 0x72, 0xdd], name: "transferFrom(address,address,uint256)" },
+    KnownSelector { bytes: [0x09, 0x5e, 0xa7, 0xb3], name: "approve(address,uint256)" },
+    KnownSelector { bytes: [0x70, 0xa0, 0x82, 0x31], name: "balanceOf(address)" },
+    KnownSelector { bytes: [0x18, 0x16, 0x0d, 0xdd], name: "totalSupply()" },
+    KnownSelector { bytes: [0xdd, 0x62, 0xed, 0x3e], name: "allowance(address,address)" },
+    // ERC-721
+    KnownSelector { bytes: [0x42, 0x84, 0x2e, 0x0e], name: "safeTransferFrom(address,address,uint256)" },
+    KnownSelector { bytes: [0x63, 0x52, 0x21, 0x1e], name: "ownerOf(uint256)" },
+    // Uniswap V2
+    KnownSelector { bytes: [0x02, 0x2c, 0x0d, 0x9f], name: "UniV2:swap(uint256,uint256,address,bytes)" },
+    KnownSelector { bytes: [0x09, 0x02, 0xf1, 0xac], name: "UniV2:getReserves()" },
+    KnownSelector { bytes: [0x6a, 0x62, 0x78, 0x42], name: "UniV2:mint(address)" },
+    KnownSelector { bytes: [0xd2, 0x12, 0x20, 0xa7], name: "UniV2:factory()" },
+    // Uniswap V3
+    KnownSelector { bytes: [0x12, 0x8a, 0xcb, 0x08], name: "UniV3:swap(address,bool,int256,uint160,bytes)" },
+    KnownSelector { bytes: [0x3c, 0x8a, 0x7d, 0x8d], name: "UniV3:collect(CollectParams)" },
+    KnownSelector { bytes: [0x25, 0x14, 0x00, 0x00], name: "UniV3:positions(uint256)" },
+    KnownSelector { bytes: [0xf3, 0x05, 0x83, 0x99], name: "UniV3:observe(uint32[])" },
+    KnownSelector { bytes: [0x1a, 0x68, 0x65, 0x02], name: "UniV3:slot0()" },
+    KnownSelector { bytes: [0x49, 0x04, 0x88, 0x76], name: "UniV3:flash(address,uint256,uint256,bytes)" },
+    // Uniswap V3 Router
+    KnownSelector { bytes: [0xac, 0x96, 0x50, 0xd8], name: "UniV3Router:multicall(uint256,bytes[])" },
+    KnownSelector { bytes: [0x04, 0xe4, 0x5a, 0xaf], name: "UniV3Router:exactInputSingle(ExactInputSingleParams)" },
+    // Aave V3
+    KnownSelector { bytes: [0xe8, 0xed, 0xa9, 0xdf], name: "Aave:supply(address,uint256,address,uint16)" },
+    KnownSelector { bytes: [0x69, 0x32, 0x8d, 0xec], name: "Aave:withdraw(address,uint256,address)" },
+    KnownSelector { bytes: [0xa4, 0x15, 0xbc, 0xad], name: "Aave:borrow(address,uint256,uint256,uint16,address)" },
+    KnownSelector { bytes: [0x57, 0x3e, 0xad, 0x4c], name: "Aave:repay(address,uint256,uint256,address)" },
+    // Compound
+    KnownSelector { bytes: [0xa0, 0x71, 0x2d, 0x68], name: "Compound:mint(uint256)" },
+    KnownSelector { bytes: [0xdb, 0x00, 0x6a, 0x75], name: "Compound:redeem(uint256)" },
+    // Proxy patterns
+    KnownSelector { bytes: [0x5c, 0x60, 0xda, 0x1b], name: "Proxy:implementation()" },
+    KnownSelector { bytes: [0xf8, 0x51, 0xa4, 0x40], name: "Proxy:admin()" },
+    KnownSelector { bytes: [0x36, 0x59, 0xcf, 0xe6], name: "Proxy:upgradeTo(address)" },
+    KnownSelector { bytes: [0x4f, 0x1e, 0xf2, 0x86], name: "Proxy:upgradeToAndCall(address,bytes)" },
+    // OpenZeppelin AccessControl / Ownable
+    KnownSelector { bytes: [0x8d, 0xa5, 0xcb, 0x5b], name: "OZ:renounceOwnership()" },
+    KnownSelector { bytes: [0xf2, 0xfd, 0xe3, 0x8b], name: "OZ:transferOwnership(address)" },
+    KnownSelector { bytes: [0x8d, 0xa5, 0xcb, 0x5b], name: "OZ:owner()" },
+    // Safe (Gnosis Safe)
+    KnownSelector { bytes: [0x6a, 0x76, 0x12, 0x02], name: "Safe:execTransaction(...)" },
+    KnownSelector { bytes: [0xaf, 0xfe, 0xd0, 0xe0], name: "Safe:nonce()" },
+    // Multicall
+    KnownSelector { bytes: [0xac, 0x96, 0x50, 0xd8], name: "Multicall:multicall(uint256,bytes[])" },
+    KnownSelector { bytes: [0x25, 0x2d, 0xba, 0x42], name: "Multicall:multicall(bytes[])" },
+    // Curve
+    KnownSelector { bytes: [0x3d, 0xf0, 0x21, 0x24], name: "Curve:exchange(int128,int128,uint256,uint256)" },
+    // 1inch
+    KnownSelector { bytes: [0x12, 0xaa, 0x3c, 0xaf], name: "1inch:swap(IAggregationExecutor,SwapDescription,bytes,bytes)" },
+    // EIP-4337 Account Abstraction
+    KnownSelector { bytes: [0x1f, 0xad, 0x94, 0x8c], name: "AA:validateUserOp(UserOperation,bytes32,uint256)" },
+    KnownSelector { bytes: [0xb6, 0x1d, 0x27, 0xf6], name: "AA:execute(address,uint256,bytes)" },
+    KnownSelector { bytes: [0x18, 0xdf, 0xb3, 0xc7], name: "AA:handleOps(UserOperation[],address)" },
+    // Create2 / Deployer
+    KnownSelector { bytes: [0xcd, 0xcb, 0x76, 0x0a], name: "Create2:deploy(uint256,bytes32,bytes)" },
+];
+
+/// Scan bytecode for known 4-byte selectors (checking PUSH4 opcodes).
+pub fn find_selectors_in_bytecode(bytes: &[u8]) -> Vec<&'static str> {
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let op = bytes[i];
+        i += 1;
+        if (0x60..=0x7f).contains(&op) {
+            let n = (op - 0x5f) as usize;
+            if op == 0x63 && i + 4 <= bytes.len() {
+                let sel: [u8; 4] = bytes[i..i + 4].try_into().unwrap();
+                for ks in KNOWN_SELECTORS {
+                    if ks.bytes == sel && !found.contains(&ks.name) {
+                        found.push(ks.name);
+                    }
+                }
+            }
+            i += n;
+        }
+    }
+    found
+}
+
+/// Scan bytecode for ANY 4-byte selectors via PUSH4, return unique hex strings.
+pub fn find_all_push4_selectors(bytes: &[u8]) -> Vec<String> {
+    let mut selectors = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let op = bytes[i];
+        i += 1;
+        if (0x60..=0x7f).contains(&op) {
+            let n = (op - 0x5f) as usize;
+            if op == 0x63 && i + 4 <= bytes.len() {
+                let sel: [u8; 4] = bytes[i..i + 4].try_into().unwrap();
+                if seen.insert(sel) {
+                    selectors.push(hex::encode(sel));
+                }
+            }
+            i += n;
+        }
+    }
+    selectors
+}
+
+/// Identify a contract pattern (EIP-1167, Uniswap, ERC-20, etc.) from raw bytecode.
+pub fn identify_pattern(bytes: &[u8]) -> &'static str {
+    if bytes.is_empty() {
+        return "empty";
+    }
+
+    // EIP-1167 minimal proxy: 363d3d373d3d3d363d73...5af43d82803e903d91602b57fd5bf3
+    if bytes.len() == 45 && bytes.starts_with(&[0x36, 0x3d, 0x3d, 0x37]) {
+        return "EIP-1167 minimal proxy (45B)";
+    }
+
+    // EIP-1167 variant with 3d prefix
+    if bytes.len() <= 50
+        && (bytes.starts_with(&[0x36, 0x3d]) || bytes.starts_with(&[0x3d, 0x3d]))
+        && bytes.contains(&0xf4)
+    {
+        return "EIP-1167 minimal proxy variant";
+    }
+
+    // EIP-2535 Diamond proxy pattern: usually has diamondCut, facets, facetAddress selectors
+    // facetAddress: 0xcdffacc6, diamondCut: 0x1f931c1c
+    if bytes.len() > 1000 && contains_bytes(bytes, &[0xcd, 0xff, 0xac, 0xc6]) {
+        return "EIP-2535 Diamond proxy";
+    }
+
+    // Transparent / UUPS upgradeable proxy: has implementation(), admin(), upgradeTo()
+    let has_implementation = contains_bytes(bytes, &[0x5c, 0x60, 0xda, 0x1b]);
+    let has_upgrade_to = contains_bytes(bytes, &[0x36, 0x59, 0xcf, 0xe6]);
+    if has_implementation && has_upgrade_to {
+        return "Transparent/UUPS upgradeable proxy";
+    }
+
+    // UUPS / Transparent proxy: short, DELEGATECALL-based
+    if bytes.len() < 200 && bytes.contains(&0xf4) {
+        return "small DELEGATECALL proxy";
+    }
+
+    // Check for Uniswap V3 Pool: swap(0x128acb08), slot0(0x1a686502), observe(0xf3058399)
+    let has_uni_v3_swap = contains_bytes(bytes, &[0x12, 0x8a, 0xcb, 0x08]);
+    let has_uni_v3_slot0 = contains_bytes(bytes, &[0x1a, 0x68, 0x65, 0x02]);
+    if has_uni_v3_swap && has_uni_v3_slot0 {
+        return "Uniswap V3 Pool";
+    }
+
+    // Uniswap V2 Pair: swap(0x022c0d9f), getReserves(0x0902f1ac)
+    let has_uni_v2_swap = contains_bytes(bytes, &[0x02, 0x2c, 0x0d, 0x9f]);
+    let has_uni_v2_reserves = contains_bytes(bytes, &[0x09, 0x02, 0xf1, 0xac]);
+    if has_uni_v2_swap && has_uni_v2_reserves {
+        return "Uniswap V2 Pair";
+    }
+
+    // ERC-20 token: transfer, balanceOf, approve
+    let has_transfer = contains_bytes(bytes, &[0xa9, 0x05, 0x9c, 0xbb]);
+    let has_balance = contains_bytes(bytes, &[0x70, 0xa0, 0x82, 0x31]);
+    let has_approve = contains_bytes(bytes, &[0x09, 0x5e, 0xa7, 0xb3]);
+    if has_transfer && has_balance && has_approve {
+        // Might also be ERC-721 if it has ownerOf
+        let has_owner_of = contains_bytes(bytes, &[0x63, 0x52, 0x21, 0x1e]);
+        if has_owner_of {
+            return "ERC-721 token (with ERC-20 interface)";
+        }
+        return "ERC-20 token";
+    }
+
+    // Aave aToken / lending pool
+    let has_supply = contains_bytes(bytes, &[0xe8, 0xed, 0xa9, 0xdf]);
+    let has_borrow = contains_bytes(bytes, &[0xa4, 0x15, 0xbc, 0xad]);
+    if has_supply && has_borrow {
+        return "Aave V3 Lending Pool";
+    }
+
+    // EIP-4337 Account (EntryPoint or SmartAccount)
+    let has_validate_userop = contains_bytes(bytes, &[0x1f, 0xad, 0x94, 0x8c]);
+    let has_handle_ops = contains_bytes(bytes, &[0x18, 0xdf, 0xb3, 0xc7]);
+    let has_aa_execute = contains_bytes(bytes, &[0xb6, 0x1d, 0x27, 0xf6]);
+    if has_validate_userop {
+        return "EIP-4337 Smart Account";
+    }
+    if has_handle_ops {
+        return "EIP-4337 EntryPoint";
+    }
+    if has_aa_execute {
+        return "EIP-4337 Smart Account (execute)";
+    }
+
+    // Gnosis Safe / Safe
+    let has_exec_tx = contains_bytes(bytes, &[0x6a, 0x76, 0x12, 0x02]);
+    if has_exec_tx {
+        return "Gnosis Safe";
+    }
+
+    // GnosisSafeProxy (very short, just fallback with DELEGATECALL)
+    if bytes.len() < 100 && bytes.contains(&0xf4) && bytes.contains(&0x54) {
+        return "Safe proxy (short DELEGATECALL+SLOAD)";
+    }
+
+    // Simple STOP / INVALID / REVERT only contracts
+    if bytes.len() <= 2 {
+        return "trivial (<=2 bytes)";
+    }
+    if bytes == [0x00] {
+        return "STOP-only";
+    }
+    if bytes == [0xfe] {
+        return "INVALID-only";
+    }
+
+    // Analyze opcode composition for hints
+    let mut has_delegatecall = false;
+    let mut has_create2 = false;
+    let mut sload_count = 0u32;
+    let mut _call_count = 0u32;
+    let mut _log_count = 0u32;
+    let mut opcode_count = 0u32;
+    let mut i = 0;
+    while i < bytes.len() {
+        let op = bytes[i];
+        opcode_count += 1;
+        match op {
+            0x54 => sload_count += 1,
+            0xf1 | 0xf2 | 0xfa => _call_count += 1,
+            0xf4 => {
+                _call_count += 1;
+                has_delegatecall = true;
+            }
+            0xf5 => has_create2 = true,
+            0xa0..=0xa4 => _log_count += 1,
+            _ => {}
+        }
+        i += 1;
+        if (0x60..=0x7f).contains(&op) {
+            i += (op - 0x5f) as usize;
+        }
+    }
+
+    if has_create2 && bytes.len() > 5000 {
+        return "factory (contains CREATE2)";
+    }
+    if has_delegatecall && bytes.len() < 500 {
+        return "proxy (DELEGATECALL)";
+    }
+    if opcode_count > 0 {
+        let storage_pct = sload_count as f64 / opcode_count as f64;
+        if storage_pct > 0.05 {
+            return "storage-heavy contract";
+        }
+    }
+
+    if bytes.len() > 20000 {
+        return "large contract (>20KB)";
+    }
+    if bytes.len() > 5000 {
+        return "medium contract (5-20KB)";
+    }
+    if bytes.len() > 500 {
+        return "small contract (500B-5KB)";
+    }
+
+    "micro contract (<500B)"
+}
+
+/// Check if a 4-byte sequence appears as PUSH4 immediate data in the bytecode.
+pub fn contains_bytes(bytecode: &[u8], needle: &[u8; 4]) -> bool {
+    let mut i = 0;
+    while i < bytecode.len() {
+        let op = bytecode[i];
+        i += 1;
+        if (0x60..=0x7f).contains(&op) {
+            let n = (op - 0x5f) as usize;
+            if op == 0x63 && i + 4 <= bytecode.len() && &bytecode[i..i + 4] == needle {
+                return true;
+            }
+            i += n;
+        }
+    }
+    false
+}
+
+/// For EIP-1167: extract embedded implementation address (bytes 10..30).
+pub fn eip1167_impl_addr(bytes: &[u8]) -> Option<Address> {
+    if bytes.len() == 45 && bytes.starts_with(&[0x36, 0x3d, 0x3d, 0x37]) && bytes[9] == 0x73 {
+        Some(Address::from_slice(&bytes[10..30]))
+    } else {
+        None
+    }
+}
