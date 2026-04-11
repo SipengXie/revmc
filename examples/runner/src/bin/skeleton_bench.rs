@@ -11,7 +11,9 @@
 //! - After first run, all subsequent runs load from cache.
 //!
 //! Usage:
-//!   cargo run -p revmc-examples-runner --bin skeleton_bench --release [bench_dir] [block]
+//!   cargo run -p revmc-examples-runner --bin skeleton_bench --release -- \
+//!       [--bench-dir DIR] [--block N] [--rounds N] [--warmup N] \
+//!       [--alpha F] [--out PATH]
 
 #[allow(dead_code)]
 #[path = "../bin_common.rs"]
@@ -22,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use clap::Parser;
 use op_revm::transaction::OpTransaction;
 use op_revm::DefaultOp;
 use revm::bytecode::Bytecode;
@@ -33,6 +36,104 @@ use revmc::{EvmCompiler, EvmLlvmBackend, OptimizationLevel};
 use revmc_builtins as _;
 use revmc_context::{EvmCompilerFn, RawEvmCompilerFn};
 use serde::{Deserialize, Serialize};
+
+#[derive(Parser)]
+#[command(name = "skeleton_bench")]
+struct Cli {
+    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data")]
+    bench_dir: String,
+    #[arg(long, default_value_t = 38004930)]
+    block: u64,
+    #[arg(long, default_value_t = 10)]
+    rounds: usize,
+    #[arg(long, default_value_t = 3)]
+    warmup: usize,
+    #[arg(long, default_value_t = 0.05)]
+    alpha: f64,
+    #[arg(long)]
+    out: Option<String>,
+}
+
+// ── JSON output schema ──────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct PerTxRecord {
+    success: bool,
+    gas: u64,
+}
+
+#[derive(Serialize)]
+struct ModeRecord {
+    rounds_ms: Vec<f64>,
+    mean_ms: f64,
+    std_ms: f64,
+    per_tx: Vec<PerTxRecord>,
+}
+
+#[derive(Serialize)]
+struct PairMatch {
+    matches: usize,
+    total: usize,
+    mismatches: usize,
+}
+
+#[derive(Serialize)]
+struct NoiseFloor {
+    mean_ms: f64,
+    std_ms: f64,
+    cv: f64,
+}
+
+#[derive(Serialize)]
+struct ExecSanity {
+    block: u64,
+    rounds: usize,
+    warmup: usize,
+    alpha: f64,
+    noise_floor: NoiseFloor,
+    modes: std::collections::HashMap<String, ModeRecord>,
+    pairwise_match: std::collections::HashMap<String, PairMatch>,
+    gas_totals: std::collections::HashMap<String, u64>,
+    welch_per_hash_vs_native: (f64, f64),
+    welch_skelot_vs_native: (f64, f64),
+    welch_skelot_vs_per_hash: (f64, f64),
+}
+
+fn build_mode(rounds: &[f64], per_tx: &[(bool, u64)]) -> ModeRecord {
+    let mean = rounds.iter().sum::<f64>() / rounds.len() as f64;
+    let var = rounds
+        .iter()
+        .map(|v| (v - mean).powi(2))
+        .sum::<f64>()
+        / (rounds.len() as f64 - 1.0).max(1.0);
+    ModeRecord {
+        rounds_ms: rounds.to_vec(),
+        mean_ms: mean,
+        std_ms: var.sqrt(),
+        per_tx: per_tx
+            .iter()
+            .map(|(s, g)| PerTxRecord {
+                success: *s,
+                gas: *g,
+            })
+            .collect(),
+    }
+}
+
+fn welch_t(a: &[f64], b: &[f64]) -> (f64, f64) {
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let var = |v: &[f64], m: f64| {
+        v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (v.len() as f64 - 1.0).max(1.0)
+    };
+    let ma = mean(a);
+    let mb = mean(b);
+    let va = var(a, ma);
+    let vb = var(b, mb);
+    let t = (ma - mb) / ((va / a.len() as f64) + (vb / b.len() as f64)).sqrt();
+    let z = t.abs();
+    let p = 2.0 * (1.0 - 0.5 * (1.0 + libm::erf(z / std::f64::consts::SQRT_2)));
+    (t, p)
+}
 
 use bin_common::{
     build_op_cfg, build_op_tx, compile_all_contracts_with_cache, extract_gas, BenchEvm,
@@ -302,18 +403,18 @@ fn execute_block(
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
-    let dir = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "/home/ubuntu/sipeng/bench_data".into());
-    let bench_dir = Path::new(&dir);
-    let block: u64 = std::env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(38004930);
+    let cli = Cli::parse();
+    let bench_dir = Path::new(&cli.bench_dir);
+    let block = cli.block;
     let cache_dir = PathBuf::from("./jit_cache");
 
     println!("=== Skeleton Compilation Benchmark ===");
-    println!("Block {block} | Cache: {}\n", cache_dir.display());
+    println!(
+        "Block {block} | rounds={} warmup={} | Cache: {}\n",
+        cli.rounds,
+        cli.warmup,
+        cache_dir.display()
+    );
 
     // ── Phase 1: Load ────────────────────────────────────────────────────
     let loader = BinLoader::new(bench_dir, block).unwrap_or_else(|e| {
@@ -326,6 +427,44 @@ fn main() {
         loader.code_count(),
         loader.tx_count()
     );
+
+    let chain_id = loader.raw_txs().first().and_then(|tx| tx.chain_id);
+
+    // ── Noise floor pre-flight (native-only, before any compilation) ─────
+    println!("\n--- Noise floor pre-flight ({} native runs) ---", cli.rounds);
+    let pre = {
+        let mut vals: Vec<f64> = Vec::new();
+        for _ in 0..cli.rounds {
+            let run = execute_block(&loader, chain_id, |evm| {
+                let mut h = NativeHandler;
+                match h.run(evm) {
+                    Ok(rr) => extract_gas(&rr),
+                    Err(_) => (false, 0),
+                }
+            });
+            vals.push(run.dur.as_secs_f64() * 1000.0);
+        }
+        let mean: f64 = vals.iter().sum::<f64>() / vals.len() as f64;
+        let var: f64 =
+            vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / vals.len() as f64;
+        let std = var.sqrt();
+        (mean, std)
+    };
+    let cv = pre.1 / pre.0;
+    println!(
+        "  noise floor: mean={:.3}ms std={:.3}ms cv={:.3}",
+        pre.0, pre.1, cv
+    );
+    if cv > 0.10 {
+        eprintln!(
+            "ABORT: noise floor cv={:.3} > 0.10; raise --rounds or pin the CPU core",
+            cv
+        );
+        std::process::exit(2);
+    }
+    if cv > 0.05 {
+        eprintln!("WARN: noise floor cv={:.3} > 0.05", cv);
+    }
 
     // ── Phase 2: Skeleton grouping ───────────────────────────────────────
     let all_codes: HashMap<B256, Vec<u8>> = loader
@@ -578,68 +717,92 @@ fn main() {
         dur_base.as_secs_f64() + dur_db.as_secs_f64(),
     );
 
-    // ── Phase 4: Execution ───────────────────────────────────────────────
+    // ── Phase 4: Execution (warmup + rounds) ─────────────────────────────
     println!(
-        "\n--- Executing block {block} ({} txs) ---",
-        loader.tx_count()
+        "\n--- Executing block {block} ({} txs, {} warmup + {} rounds each) ---",
+        loader.tx_count(),
+        cli.warmup,
+        cli.rounds
     );
-    let chain_id = loader.raw_txs().first().and_then(|tx| tx.chain_id);
 
-    let native = execute_block(&loader, chain_id, |evm| {
-        let mut h = NativeHandler;
-        match h.run(evm) {
-            Ok(r) => extract_gas(&r),
-            Err(_) => (false, 0),
+    let mut native_rounds: Vec<f64> = Vec::with_capacity(cli.rounds);
+    let mut native_last: Option<ExecResults> = None;
+    for r in 0..(cli.warmup + cli.rounds) {
+        let run = execute_block(&loader, chain_id, |evm| {
+            let mut h = NativeHandler;
+            match h.run(evm) {
+                Ok(rr) => extract_gas(&rr),
+                Err(_) => (false, 0),
+            }
+        });
+        if r >= cli.warmup {
+            native_rounds.push(run.dur.as_secs_f64() * 1000.0);
         }
-    });
+        native_last = Some(run);
+    }
+    let native = native_last.unwrap();
 
-    let per_hash = execute_block(&loader, chain_id, |evm| {
-        let mut h = JitHandler {
-            functions: all_per_hash_fns.clone(),
-        };
-        match h.run(evm) {
-            Ok(r) => extract_gas(&r),
-            Err(_) => (false, 0),
+    let mut per_hash_rounds: Vec<f64> = Vec::with_capacity(cli.rounds);
+    let mut per_hash_last: Option<ExecResults> = None;
+    for r in 0..(cli.warmup + cli.rounds) {
+        let run = execute_block(&loader, chain_id, |evm| {
+            let mut h = JitHandler {
+                functions: all_per_hash_fns.clone(),
+            };
+            match h.run(evm) {
+                Ok(rr) => extract_gas(&rr),
+                Err(_) => (false, 0),
+            }
+        });
+        if r >= cli.warmup {
+            per_hash_rounds.push(run.dur.as_secs_f64() * 1000.0);
         }
-    });
+        per_hash_last = Some(run);
+    }
+    let per_hash = per_hash_last.unwrap();
 
     let fns_ns = non_skeleton_fns.clone();
     let sd = Arc::new(skeleton_dispatch);
-    let skeleton = execute_block(&loader, chain_id, |evm| {
-        let mut h = SkeletonHandler {
-            per_hash_fns: fns_ns.clone(),
-            skeleton_dispatch: sd.clone(),
-        };
-        match h.run(evm) {
-            Ok(r) => extract_gas(&r),
-            Err(_) => (false, 0),
+    let mut skeleton_rounds: Vec<f64> = Vec::with_capacity(cli.rounds);
+    let mut skeleton_last: Option<ExecResults> = None;
+    for r in 0..(cli.warmup + cli.rounds) {
+        let run = execute_block(&loader, chain_id, |evm| {
+            let mut h = SkeletonHandler {
+                per_hash_fns: fns_ns.clone(),
+                skeleton_dispatch: sd.clone(),
+            };
+            match h.run(evm) {
+                Ok(rr) => extract_gas(&rr),
+                Err(_) => (false, 0),
+            }
+        });
+        if r >= cli.warmup {
+            skeleton_rounds.push(run.dur.as_secs_f64() * 1000.0);
         }
-    });
+        skeleton_last = Some(run);
+    }
+    let skeleton = skeleton_last.unwrap();
 
     // ── Phase 5: Results ─────────────────────────────────────────────────
     let gas_n: u64 = native.results.iter().map(|(_, g)| g).sum();
     let gas_p: u64 = per_hash.results.iter().map(|(_, g)| g).sum();
     let gas_s: u64 = skeleton.results.iter().map(|(_, g)| g).sum();
 
-    println!("\n=== Execution Results ===");
-    println!(
-        "  Native:       {:.6}s  gas={gas_n}",
-        native.dur.as_secs_f64()
-    );
-    println!(
-        "  Per-hash JIT: {:.6}s  gas={gas_p}",
-        per_hash.dur.as_secs_f64()
-    );
-    println!(
-        "  Skeleton JIT: {:.6}s  gas={gas_s}",
-        skeleton.dur.as_secs_f64()
-    );
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let native_mean = mean(&native_rounds);
+    let per_hash_mean = mean(&per_hash_rounds);
+    let skeleton_mean = mean(&skeleton_rounds);
 
-    if native.dur.as_secs_f64() > 0.0 {
+    println!("\n=== Execution Results (mean over {} rounds) ===", cli.rounds);
+    println!("  Native:       {:.3}ms  gas={gas_n}", native_mean);
+    println!("  Per-hash JIT: {:.3}ms  gas={gas_p}", per_hash_mean);
+    println!("  Skeleton JIT: {:.3}ms  gas={gas_s}", skeleton_mean);
+
+    if native_mean > 0.0 {
         println!(
             "\n  Speedup vs native: per-hash {:.2}x, skeleton {:.2}x",
-            native.dur.as_secs_f64() / per_hash.dur.as_secs_f64(),
-            native.dur.as_secs_f64() / skeleton.dur.as_secs_f64(),
+            native_mean / per_hash_mean,
+            native_mean / skeleton_mean,
         );
     }
 
@@ -661,7 +824,7 @@ fn main() {
 
     println!("\n=== Correctness ===");
     println!(
-        "  {}/{} match ({mismatches} mismatches)",
+        "  {}/{} per-hash vs skelot match ({mismatches} mismatches)",
         per_hash.results.len() - mismatches as usize,
         per_hash.results.len()
     );
@@ -670,8 +833,115 @@ fn main() {
         if gas_p == gas_s { "EQUAL" } else { "DIFFER!" }
     );
 
-    if mismatches == 0 {
-        println!("\n  PASS");
+    // ── Hardened mismatch policy ─────────────────────────────────────────
+    if mismatches > 0 {
+        eprintln!(
+            "\nABORT: {mismatches} SkelOT/per-hash mismatches detected — blocking paper run"
+        );
+        std::process::exit(3);
+    }
+    if gas_p != gas_s {
+        eprintln!("\nABORT: block-total gas differs between per-hash and skeleton");
+        std::process::exit(3);
+    }
+    let mut sk_native_mismatch = 0u32;
+    for (sk_r, nat_r) in skeleton.results.iter().zip(native.results.iter()) {
+        if sk_r != nat_r {
+            sk_native_mismatch += 1;
+        }
+    }
+    if sk_native_mismatch > 0 {
+        eprintln!(
+            "\nABORT: {sk_native_mismatch} SkelOT vs native mismatches — blocking paper run"
+        );
+        std::process::exit(3);
+    }
+    println!("\n  PASS");
+
+    // ── JSON output ──────────────────────────────────────────────────────
+    if let Some(ref out) = cli.out {
+        let mut modes = std::collections::HashMap::new();
+        modes.insert(
+            "native".into(),
+            build_mode(&native_rounds, &native.results),
+        );
+        modes.insert(
+            "per_hash".into(),
+            build_mode(&per_hash_rounds, &per_hash.results),
+        );
+        modes.insert(
+            "skelot".into(),
+            build_mode(&skeleton_rounds, &skeleton.results),
+        );
+
+        let total = per_hash.results.len();
+        let mut pairs = std::collections::HashMap::new();
+        let ph_vs_n = per_hash
+            .results
+            .iter()
+            .zip(native.results.iter())
+            .filter(|(a, b)| a == b)
+            .count();
+        pairs.insert(
+            "per_hash_vs_native".into(),
+            PairMatch {
+                matches: ph_vs_n,
+                total,
+                mismatches: total - ph_vs_n,
+            },
+        );
+        let sk_vs_n = skeleton
+            .results
+            .iter()
+            .zip(native.results.iter())
+            .filter(|(a, b)| a == b)
+            .count();
+        pairs.insert(
+            "skelot_vs_native".into(),
+            PairMatch {
+                matches: sk_vs_n,
+                total,
+                mismatches: total - sk_vs_n,
+            },
+        );
+        let sk_vs_ph = total - mismatches as usize;
+        pairs.insert(
+            "skelot_vs_per_hash".into(),
+            PairMatch {
+                matches: sk_vs_ph,
+                total,
+                mismatches: mismatches as usize,
+            },
+        );
+
+        let mut gas = std::collections::HashMap::new();
+        gas.insert("native".into(), gas_n);
+        gas.insert("per_hash".into(), gas_p);
+        gas.insert("skelot".into(), gas_s);
+
+        let exec = ExecSanity {
+            block: cli.block,
+            rounds: cli.rounds,
+            warmup: cli.warmup,
+            alpha: cli.alpha,
+            noise_floor: NoiseFloor {
+                mean_ms: pre.0,
+                std_ms: pre.1,
+                cv,
+            },
+            modes,
+            pairwise_match: pairs,
+            gas_totals: gas,
+            welch_per_hash_vs_native: welch_t(&per_hash_rounds, &native_rounds),
+            welch_skelot_vs_native: welch_t(&skeleton_rounds, &native_rounds),
+            welch_skelot_vs_per_hash: welch_t(&skeleton_rounds, &per_hash_rounds),
+        };
+        std::fs::write(
+            out,
+            serde_json::to_vec_pretty(&exec).expect("serialize"),
+        )
+        .expect("write out");
+        eprintln!("wrote {out}");
     }
 
     println!("\nDone.");
