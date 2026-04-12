@@ -125,19 +125,21 @@ pub fn compile_per_hash(
     if let Some(parent) = obj.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let context = Box::leak(Box::new(revmc::llvm::inkwell::context::Context::create()));
-    let backend = EvmLlvmBackend::new(context, true, opt).map_err(|e| format!("backend: {e}"))?;
-    let mut compiler = EvmCompiler::new(backend);
-    compiler
-        .translate(symbol, bytecode, ETH_SPEC)
-        .map_err(|e| format!("translate: {e}"))?;
-    compiler
-        .write_object_to_file(obj)
-        .map_err(|e| format!("write: {e}"))?;
-    revmc::Linker::new()
-        .link(lib, [obj])
-        .map_err(|e| format!("link: {e}"))?;
-    Ok(())
+    let ctx_ptr = Box::into_raw(Box::new(revmc::llvm::inkwell::context::Context::create()));
+    let result = (|| {
+        let context = unsafe { &*ctx_ptr };
+        let backend =
+            EvmLlvmBackend::new(context, true, opt).map_err(|e| format!("backend: {e}"))?;
+        let mut compiler = EvmCompiler::new(backend);
+        compiler.translate(symbol, bytecode, ETH_SPEC).map_err(|e| format!("translate: {e}"))?;
+        compiler.write_object_to_file(obj).map_err(|e| format!("write: {e}"))?;
+        revmc::Linker::new().link(lib, [obj]).map_err(|e| format!("link: {e}"))?;
+        Ok::<(), String>(())
+    })();
+    unsafe {
+        drop(Box::from_raw(ctx_ptr));
+    }
+    result
 }
 
 // ── Skeleton compile ───────────────────────────────────────────────────────
@@ -173,19 +175,23 @@ pub fn compile_skeleton_group(
     if let Some(parent) = obj.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let context = Box::leak(Box::new(revmc::llvm::inkwell::context::Context::create()));
-    let backend = EvmLlvmBackend::new(context, true, opt).map_err(|e| format!("backend: {e}"))?;
-    let mut compiler = EvmCompiler::new(backend);
-    compiler
-        .translate_skeleton(symbol, bytecode, ETH_SPEC, variance)
-        .map_err(|e| format!("translate_skeleton: {e}"))?;
-    compiler
-        .write_object_to_file(obj)
-        .map_err(|e| format!("write: {e}"))?;
-    revmc::Linker::new()
-        .link(lib, [obj])
-        .map_err(|e| format!("link: {e}"))?;
-    Ok(())
+    let ctx_ptr = Box::into_raw(Box::new(revmc::llvm::inkwell::context::Context::create()));
+    let result = (|| {
+        let context = unsafe { &*ctx_ptr };
+        let backend =
+            EvmLlvmBackend::new(context, true, opt).map_err(|e| format!("backend: {e}"))?;
+        let mut compiler = EvmCompiler::new(backend);
+        compiler
+            .translate_skeleton(symbol, bytecode, ETH_SPEC, variance)
+            .map_err(|e| format!("translate_skeleton: {e}"))?;
+        compiler.write_object_to_file(obj).map_err(|e| format!("write: {e}"))?;
+        revmc::Linker::new().link(lib, [obj]).map_err(|e| format!("link: {e}"))?;
+        Ok::<(), String>(())
+    })();
+    unsafe {
+        drop(Box::from_raw(ctx_ptr));
+    }
+    result
 }
 
 // ── Protocol identification (lifted from skeleton_identify.rs) ─────────────
@@ -198,34 +204,67 @@ pub struct KnownSelector {
 pub const KNOWN_SELECTORS: &[KnownSelector] = &[
     // ERC-20
     KnownSelector { bytes: [0xa9, 0x05, 0x9c, 0xbb], name: "transfer(address,uint256)" },
-    KnownSelector { bytes: [0x23, 0xb8, 0x72, 0xdd], name: "transferFrom(address,address,uint256)" },
+    KnownSelector {
+        bytes: [0x23, 0xb8, 0x72, 0xdd],
+        name: "transferFrom(address,address,uint256)",
+    },
     KnownSelector { bytes: [0x09, 0x5e, 0xa7, 0xb3], name: "approve(address,uint256)" },
     KnownSelector { bytes: [0x70, 0xa0, 0x82, 0x31], name: "balanceOf(address)" },
     KnownSelector { bytes: [0x18, 0x16, 0x0d, 0xdd], name: "totalSupply()" },
     KnownSelector { bytes: [0xdd, 0x62, 0xed, 0x3e], name: "allowance(address,address)" },
     // ERC-721
-    KnownSelector { bytes: [0x42, 0x84, 0x2e, 0x0e], name: "safeTransferFrom(address,address,uint256)" },
+    KnownSelector {
+        bytes: [0x42, 0x84, 0x2e, 0x0e],
+        name: "safeTransferFrom(address,address,uint256)",
+    },
     KnownSelector { bytes: [0x63, 0x52, 0x21, 0x1e], name: "ownerOf(uint256)" },
     // Uniswap V2
-    KnownSelector { bytes: [0x02, 0x2c, 0x0d, 0x9f], name: "UniV2:swap(uint256,uint256,address,bytes)" },
+    KnownSelector {
+        bytes: [0x02, 0x2c, 0x0d, 0x9f],
+        name: "UniV2:swap(uint256,uint256,address,bytes)",
+    },
     KnownSelector { bytes: [0x09, 0x02, 0xf1, 0xac], name: "UniV2:getReserves()" },
     KnownSelector { bytes: [0x6a, 0x62, 0x78, 0x42], name: "UniV2:mint(address)" },
     KnownSelector { bytes: [0xd2, 0x12, 0x20, 0xa7], name: "UniV2:factory()" },
     // Uniswap V3
-    KnownSelector { bytes: [0x12, 0x8a, 0xcb, 0x08], name: "UniV3:swap(address,bool,int256,uint160,bytes)" },
+    KnownSelector {
+        bytes: [0x12, 0x8a, 0xcb, 0x08],
+        name: "UniV3:swap(address,bool,int256,uint160,bytes)",
+    },
     KnownSelector { bytes: [0x3c, 0x8a, 0x7d, 0x8d], name: "UniV3:collect(CollectParams)" },
     KnownSelector { bytes: [0x25, 0x14, 0x00, 0x00], name: "UniV3:positions(uint256)" },
     KnownSelector { bytes: [0xf3, 0x05, 0x83, 0x99], name: "UniV3:observe(uint32[])" },
     KnownSelector { bytes: [0x1a, 0x68, 0x65, 0x02], name: "UniV3:slot0()" },
-    KnownSelector { bytes: [0x49, 0x04, 0x88, 0x76], name: "UniV3:flash(address,uint256,uint256,bytes)" },
+    KnownSelector {
+        bytes: [0x49, 0x04, 0x88, 0x76],
+        name: "UniV3:flash(address,uint256,uint256,bytes)",
+    },
     // Uniswap V3 Router
-    KnownSelector { bytes: [0xac, 0x96, 0x50, 0xd8], name: "UniV3Router:multicall(uint256,bytes[])" },
-    KnownSelector { bytes: [0x04, 0xe4, 0x5a, 0xaf], name: "UniV3Router:exactInputSingle(ExactInputSingleParams)" },
+    KnownSelector {
+        bytes: [0xac, 0x96, 0x50, 0xd8],
+        name: "UniV3Router:multicall(uint256,bytes[])",
+    },
+    KnownSelector {
+        bytes: [0x04, 0xe4, 0x5a, 0xaf],
+        name: "UniV3Router:exactInputSingle(ExactInputSingleParams)",
+    },
     // Aave V3
-    KnownSelector { bytes: [0xe8, 0xed, 0xa9, 0xdf], name: "Aave:supply(address,uint256,address,uint16)" },
-    KnownSelector { bytes: [0x69, 0x32, 0x8d, 0xec], name: "Aave:withdraw(address,uint256,address)" },
-    KnownSelector { bytes: [0xa4, 0x15, 0xbc, 0xad], name: "Aave:borrow(address,uint256,uint256,uint16,address)" },
-    KnownSelector { bytes: [0x57, 0x3e, 0xad, 0x4c], name: "Aave:repay(address,uint256,uint256,address)" },
+    KnownSelector {
+        bytes: [0xe8, 0xed, 0xa9, 0xdf],
+        name: "Aave:supply(address,uint256,address,uint16)",
+    },
+    KnownSelector {
+        bytes: [0x69, 0x32, 0x8d, 0xec],
+        name: "Aave:withdraw(address,uint256,address)",
+    },
+    KnownSelector {
+        bytes: [0xa4, 0x15, 0xbc, 0xad],
+        name: "Aave:borrow(address,uint256,uint256,uint16,address)",
+    },
+    KnownSelector {
+        bytes: [0x57, 0x3e, 0xad, 0x4c],
+        name: "Aave:repay(address,uint256,uint256,address)",
+    },
     // Compound
     KnownSelector { bytes: [0xa0, 0x71, 0x2d, 0x68], name: "Compound:mint(uint256)" },
     KnownSelector { bytes: [0xdb, 0x00, 0x6a, 0x75], name: "Compound:redeem(uint256)" },
@@ -233,7 +272,10 @@ pub const KNOWN_SELECTORS: &[KnownSelector] = &[
     KnownSelector { bytes: [0x5c, 0x60, 0xda, 0x1b], name: "Proxy:implementation()" },
     KnownSelector { bytes: [0xf8, 0x51, 0xa4, 0x40], name: "Proxy:admin()" },
     KnownSelector { bytes: [0x36, 0x59, 0xcf, 0xe6], name: "Proxy:upgradeTo(address)" },
-    KnownSelector { bytes: [0x4f, 0x1e, 0xf2, 0x86], name: "Proxy:upgradeToAndCall(address,bytes)" },
+    KnownSelector {
+        bytes: [0x4f, 0x1e, 0xf2, 0x86],
+        name: "Proxy:upgradeToAndCall(address,bytes)",
+    },
     // OpenZeppelin AccessControl / Ownable
     KnownSelector { bytes: [0x8d, 0xa5, 0xcb, 0x5b], name: "OZ:renounceOwnership()" },
     KnownSelector { bytes: [0xf2, 0xfd, 0xe3, 0x8b], name: "OZ:transferOwnership(address)" },
@@ -245,15 +287,30 @@ pub const KNOWN_SELECTORS: &[KnownSelector] = &[
     KnownSelector { bytes: [0xac, 0x96, 0x50, 0xd8], name: "Multicall:multicall(uint256,bytes[])" },
     KnownSelector { bytes: [0x25, 0x2d, 0xba, 0x42], name: "Multicall:multicall(bytes[])" },
     // Curve
-    KnownSelector { bytes: [0x3d, 0xf0, 0x21, 0x24], name: "Curve:exchange(int128,int128,uint256,uint256)" },
+    KnownSelector {
+        bytes: [0x3d, 0xf0, 0x21, 0x24],
+        name: "Curve:exchange(int128,int128,uint256,uint256)",
+    },
     // 1inch
-    KnownSelector { bytes: [0x12, 0xaa, 0x3c, 0xaf], name: "1inch:swap(IAggregationExecutor,SwapDescription,bytes,bytes)" },
+    KnownSelector {
+        bytes: [0x12, 0xaa, 0x3c, 0xaf],
+        name: "1inch:swap(IAggregationExecutor,SwapDescription,bytes,bytes)",
+    },
     // EIP-4337 Account Abstraction
-    KnownSelector { bytes: [0x1f, 0xad, 0x94, 0x8c], name: "AA:validateUserOp(UserOperation,bytes32,uint256)" },
+    KnownSelector {
+        bytes: [0x1f, 0xad, 0x94, 0x8c],
+        name: "AA:validateUserOp(UserOperation,bytes32,uint256)",
+    },
     KnownSelector { bytes: [0xb6, 0x1d, 0x27, 0xf6], name: "AA:execute(address,uint256,bytes)" },
-    KnownSelector { bytes: [0x18, 0xdf, 0xb3, 0xc7], name: "AA:handleOps(UserOperation[],address)" },
+    KnownSelector {
+        bytes: [0x18, 0xdf, 0xb3, 0xc7],
+        name: "AA:handleOps(UserOperation[],address)",
+    },
     // Create2 / Deployer
-    KnownSelector { bytes: [0xcd, 0xcb, 0x76, 0x0a], name: "Create2:deploy(uint256,bytes32,bytes)" },
+    KnownSelector {
+        bytes: [0xcd, 0xcb, 0x76, 0x0a],
+        name: "Create2:deploy(uint256,bytes32,bytes)",
+    },
 ];
 
 /// Scan bytecode for known 4-byte selectors (checking PUSH4 opcodes).

@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use clap::Parser;
 use revm::bytecode::Bytecode;
-use revm::primitives::{Address, B256, HashMap as RevmHashMap, U256};
+use revm::primitives::{Address, HashMap as RevmHashMap, B256, U256};
 use revm::state::AccountInfo;
 use revmc::skeleton::{analyze_skeleton_group, SkeletonVariance};
 use revmc::OptimizationLevel;
@@ -104,10 +104,12 @@ fn collect_bytecodes(args: &Args) -> HashMap<B256, Vec<u8>> {
     for bn in args.start_block..args.start_block + args.block_count {
         let path = bench_dir.join(format!("states/{bn}.bin"));
         let Ok(data) = fs::read(&path) else { continue };
-        let Ok(snap): Result<CacheSnapshot, _> = bincode::deserialize(&data) else {
+        let Ok(mut snapshot): Result<CacheSnapshot, _> = bincode::deserialize(&data) else {
             continue;
         };
-        for (hash, bytecode) in snap.codes {
+        let codes = std::mem::take(&mut snapshot.codes);
+        drop(snapshot);
+        for (hash, bytecode) in codes {
             let raw = bytecode.original_byte_slice().to_vec();
             if should_skip_bytes(&raw) {
                 continue;
@@ -125,8 +127,7 @@ fn run_per_hash(
     resume: bool,
 ) -> (Vec<(B256, f64, u64)>, f64) {
     let opt = OptimizationLevel::Aggressive;
-    let mut jobs: Vec<(B256, Vec<u8>)> =
-        contracts.iter().map(|(h, b)| (*h, b.clone())).collect();
+    let mut jobs: Vec<(B256, Vec<u8>)> = contracts.iter().map(|(h, b)| (*h, b.clone())).collect();
     jobs.sort_by_key(|(_, b)| std::cmp::Reverse(b.len()));
 
     if !resume {
@@ -139,8 +140,7 @@ fn run_per_hash(
 
     let compiled = std::sync::Mutex::new(Vec::<(B256, f64, u64)>::new());
     let total_t0 = Instant::now();
-    let mut assignments: Vec<Vec<(B256, Vec<u8>)>> =
-        (0..threads).map(|_| Vec::new()).collect();
+    let mut assignments: Vec<Vec<(B256, Vec<u8>)>> = (0..threads).map(|_| Vec::new()).collect();
     for (i, item) in jobs.into_iter().enumerate() {
         assignments[i % threads].push(item);
     }
@@ -154,9 +154,7 @@ fn run_per_hash(
                 for (hash, bytes) in chunk {
                     let artifacts = per_hash_paths(cache_dir, &hash, opt);
                     if resume && artifacts.library.exists() {
-                        let size = fs::metadata(&artifacts.object)
-                            .map(|m| m.len())
-                            .unwrap_or(0);
+                        let size = fs::metadata(&artifacts.object).map(|m| m.len()).unwrap_or(0);
                         compiled_ref.lock().unwrap().push((hash, 0.0, size));
                         counter_ref.fetch_add(1, Ordering::Relaxed);
                         continue;
@@ -171,9 +169,8 @@ fn run_per_hash(
                     ) {
                         Ok(()) => {
                             let dur = t0.elapsed().as_secs_f64();
-                            let size = fs::metadata(&artifacts.object)
-                                .map(|m| m.len())
-                                .unwrap_or(0);
+                            let size =
+                                fs::metadata(&artifacts.object).map(|m| m.len()).unwrap_or(0);
                             compiled_ref.lock().unwrap().push((hash, dur, size));
                             let done = counter_ref.fetch_add(1, Ordering::Relaxed) + 1;
                             if done % 50 == 0 {
@@ -202,19 +199,17 @@ fn run_skeleton(
 ) -> (Vec<(B256, f64, u64)>, Vec<FamilyRecord>, f64, usize) {
     let opt = OptimizationLevel::Aggressive;
 
-    let mut groups_raw: HashMap<u64, Vec<(B256, Vec<u8>)>> = HashMap::new();
-    for (hash, bytes) in contracts {
+    // Pass 1: group by skeleton hash using only code hashes (no bytecode clones)
+    let mut skeleton_groups: HashMap<u64, Vec<B256>> = HashMap::new();
+    for (hash, bytes) in contracts.iter() {
         let skel = extract_opcode_skeleton(bytes);
         let skel_hash = hash_bytes(&skel);
-        groups_raw
-            .entry(skel_hash)
-            .or_default()
-            .push((*hash, bytes.clone()));
+        skeleton_groups.entry(skel_hash).or_default().push(*hash);
     }
 
-    let mut singletons: Vec<(B256, Vec<u8>)> = Vec::new();
-    let mut multi: Vec<(u64, Vec<(B256, Vec<u8>)>)> = Vec::new();
-    for (skel_hash, members) in groups_raw {
+    let mut singletons: Vec<B256> = Vec::new();
+    let mut multi: Vec<(u64, Vec<B256>)> = Vec::new();
+    for (skel_hash, members) in skeleton_groups {
         if members.len() >= 2 {
             multi.push((skel_hash, members));
         } else {
@@ -222,18 +217,15 @@ fn run_skeleton(
         }
     }
 
-    eprintln!(
-        "  skeleton groups: {} families, {} singletons",
-        multi.len(),
-        singletons.len()
-    );
+    eprintln!("  skeleton groups: {} families, {} singletons", multi.len(), singletons.len());
 
-    let variances: Vec<(u64, Vec<(B256, Vec<u8>)>, SkeletonVariance)> = multi
+    // Pass 2: analyze variance by borrowing bytecodes from `contracts`
+    let variances: Vec<(u64, Vec<B256>, SkeletonVariance)> = multi
         .into_iter()
-        .map(|(sh, members)| {
-            let refs: Vec<&[u8]> = members.iter().map(|(_, b)| b.as_slice()).collect();
+        .map(|(skel_hash, member_hashes)| {
+            let refs: Vec<&[u8]> = member_hashes.iter().map(|h| contracts[h].as_slice()).collect();
             let variance = analyze_skeleton_group(&refs);
-            (sh, members, variance)
+            (skel_hash, member_hashes, variance)
         })
         .collect();
 
@@ -243,7 +235,7 @@ fn run_skeleton(
             let _ = fs::remove_file(&a.object);
             let _ = fs::remove_file(&a.library);
         }
-        for (hash, _) in &singletons {
+        for hash in &singletons {
             let a = per_hash_paths(cache_dir, hash, opt);
             let _ = fs::remove_file(&a.object);
             let _ = fs::remove_file(&a.library);
@@ -255,7 +247,7 @@ fn run_skeleton(
     let fallback_count = AtomicUsize::new(0);
     let total_t0 = Instant::now();
 
-    let mut assignments: Vec<Vec<(u64, Vec<(B256, Vec<u8>)>, SkeletonVariance)>> =
+    let mut assignments: Vec<Vec<(u64, Vec<B256>, SkeletonVariance)>> =
         (0..threads).map(|_| Vec::new()).collect();
     for (i, item) in variances.into_iter().enumerate() {
         assignments[i % threads].push(item);
@@ -267,29 +259,23 @@ fn run_skeleton(
             let families_ref = &families_out;
             let fb_ref = &fallback_count;
             s.spawn(move || {
-                for (skel_hash, members, variance) in chunk {
+                for (skel_hash, member_hashes, variance) in chunk {
                     let a = skeleton_paths(cache_dir, skel_hash, opt);
-                    let rep = members[0].1.clone();
+                    let rep_bytes = &contracts[&member_hashes[0]];
                     let t0 = Instant::now();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         compile_skeleton_group(
-                            &rep,
-                            &variance,
-                            &a.symbol,
-                            &a.object,
-                            &a.library,
-                            opt,
+                            rep_bytes, &variance, &a.symbol, &a.object, &a.library, opt,
                         )
                     }));
                     match result {
                         Ok(Ok(())) => {
                             let dur = t0.elapsed().as_secs_f64();
-                            let o_size =
-                                fs::metadata(&a.object).map(|m| m.len()).unwrap_or(0);
-                            compiled_ref.lock().unwrap().push((members[0].0, dur, o_size));
+                            let o_size = fs::metadata(&a.object).map(|m| m.len()).unwrap_or(0);
+                            compiled_ref.lock().unwrap().push((member_hashes[0], dur, o_size));
                             families_ref.lock().unwrap().push(FamilyRecord {
                                 skeleton_hash: format!("{:016x}", skel_hash),
-                                members: members.len(),
+                                members: member_hashes.len(),
                                 compile_seconds: dur,
                                 o_bytes: o_size,
                                 fallback: false,
@@ -299,19 +285,16 @@ fn run_skeleton(
                             eprintln!(
                                 "  skel {:016x} failed, falling back to per-hash for {} members",
                                 skel_hash,
-                                members.len()
+                                member_hashes.len()
                             );
-                            fb_ref.fetch_add(members.len(), Ordering::Relaxed);
-                            for (hash, bytes) in &members {
+                            fb_ref.fetch_add(member_hashes.len(), Ordering::Relaxed);
+                            for hash in &member_hashes {
+                                let bytes = &contracts[hash];
                                 let a = per_hash_paths(cache_dir, hash, opt);
                                 let t1 = Instant::now();
-                                if let Err(e) = compile_per_hash(
-                                    bytes,
-                                    &a.symbol,
-                                    &a.object,
-                                    &a.library,
-                                    opt,
-                                ) {
+                                if let Err(e) =
+                                    compile_per_hash(bytes, &a.symbol, &a.object, &a.library, opt)
+                                {
                                     eprintln!(
                                         "  fallback FAIL 0x{}...: {e}",
                                         &hex::encode(hash)[..12]
@@ -319,13 +302,12 @@ fn run_skeleton(
                                     continue;
                                 }
                                 let dur = t1.elapsed().as_secs_f64();
-                                let o_size =
-                                    fs::metadata(&a.object).map(|m| m.len()).unwrap_or(0);
+                                let o_size = fs::metadata(&a.object).map(|m| m.len()).unwrap_or(0);
                                 compiled_ref.lock().unwrap().push((*hash, dur, o_size));
                             }
                             families_ref.lock().unwrap().push(FamilyRecord {
                                 skeleton_hash: format!("{:016x}", skel_hash),
-                                members: members.len(),
+                                members: member_hashes.len(),
                                 compile_seconds: 0.0,
                                 o_bytes: 0,
                                 fallback: true,
@@ -337,29 +319,20 @@ fn run_skeleton(
         }
     });
 
-    let mut assignments: Vec<Vec<(B256, Vec<u8>)>> =
-        (0..threads).map(|_| Vec::new()).collect();
-    for (i, item) in singletons.into_iter().enumerate() {
-        assignments[i % threads].push(item);
+    let mut singleton_assignments: Vec<Vec<B256>> = (0..threads).map(|_| Vec::new()).collect();
+    for (i, hash) in singletons.into_iter().enumerate() {
+        singleton_assignments[i % threads].push(hash);
     }
     std::thread::scope(|s| {
-        for chunk in assignments {
+        for chunk in singleton_assignments {
             let compiled_ref = &compiled;
             s.spawn(move || {
-                for (hash, bytes) in chunk {
-                    let a = per_hash_paths(cache_dir, &hash, OptimizationLevel::Aggressive);
+                for hash in chunk {
+                    let bytes = &contracts[&hash];
+                    let a = per_hash_paths(cache_dir, &hash, opt);
                     let t0 = Instant::now();
-                    if let Err(e) = compile_per_hash(
-                        &bytes,
-                        &a.symbol,
-                        &a.object,
-                        &a.library,
-                        OptimizationLevel::Aggressive,
-                    ) {
-                        eprintln!(
-                            "  singleton FAIL 0x{}...: {e}",
-                            &hex::encode(hash)[..12]
-                        );
+                    if let Err(e) = compile_per_hash(bytes, &a.symbol, &a.object, &a.library, opt) {
+                        eprintln!("  singleton FAIL 0x{}...: {e}", &hex::encode(hash)[..12]);
                         continue;
                     }
                     let dur = t0.elapsed().as_secs_f64();
@@ -372,12 +345,7 @@ fn run_skeleton(
 
     let total_dur = total_t0.elapsed().as_secs_f64();
     let fallback_total = fallback_count.load(Ordering::Relaxed);
-    (
-        compiled.into_inner().unwrap(),
-        families_out.into_inner().unwrap(),
-        total_dur,
-        fallback_total,
-    )
+    (compiled.into_inner().unwrap(), families_out.into_inner().unwrap(), total_dur, fallback_total)
 }
 
 fn main() {
@@ -447,10 +415,7 @@ fn main() {
     } else {
         out
     };
-    fs::write(
-        &out_path,
-        serde_json::to_vec_pretty(&merged).expect("serialize"),
-    )
-    .expect("write compile_bench.json");
+    fs::write(&out_path, serde_json::to_vec_pretty(&merged).expect("serialize"))
+        .expect("write compile_bench.json");
     eprintln!("wrote {}", out_path.display());
 }
