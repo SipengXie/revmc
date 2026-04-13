@@ -54,6 +54,10 @@ struct Cli {
     alpha: f64,
     #[arg(long)]
     out: Option<String>,
+    /// Load pre-built skeleton registry instead of scanning all blocks.
+    /// Saves ~5 min on repeat runs. Generated automatically on first run.
+    #[arg(long)]
+    registry: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -380,39 +384,17 @@ fn main() {
         t0.elapsed().as_secs_f64()
     );
 
-    // Phase 2: Reconstruct skeleton families from block bytecodes
-    println!("\n--- Phase 2: Reconstructing skeleton families ---");
-    let t1 = Instant::now();
+    // Phase 2: Load or reconstruct skeleton families.
+    // Variance must match what was used at compile time — using a different member
+    // set produces wrong data-table slot assignments and silent correctness bugs.
 
-    let mut all_codes: HashMap<B256, Vec<u8>> = HashMap::new();
-    let mut blocks_loaded = 0usize;
-    for &block in &block_numbers {
-        match BinLoader::new(bench_dir, block) {
-            Ok(loader) => {
-                for (h, bc) in loader.code_values() {
-                    if !bc.is_empty() {
-                        all_codes.entry(*h).or_insert_with(|| bc.original_byte_slice().to_vec());
-                    }
-                }
-                blocks_loaded += 1;
-            }
-            Err(e) => eprintln!("  WARN: skip block {block}: {e}"),
-        }
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct RegistryEntry {
+        skel_hash: u64,
+        member_hashes: Vec<[u8; 32]>,
+        variance_pushes: Vec<i32>, // -1 = Invariant, >= 0 = Variant(table_index)
+        num_variant: u32,
     }
-    println!("  Scanned {blocks_loaded} blocks, {} unique bytecodes", all_codes.len());
-
-    let mut skeleton_groups: HashMap<u64, Vec<(B256, Vec<u8>)>> = HashMap::new();
-    for (hash, bytes) in &all_codes {
-        if skelot_common::should_skip_bytes(bytes) {
-            continue;
-        }
-        let skel = skelot_common::extract_opcode_skeleton(bytes);
-        let skel_hash = skelot_common::hash_bytes(&skel);
-        skeleton_groups.entry(skel_hash).or_default().push((*hash, bytes.clone()));
-    }
-
-    let dup_groups: Vec<_> =
-        skeleton_groups.into_iter().filter(|(_, members)| members.len() >= 2).collect();
 
     struct AnalyzedGroup {
         skel_hash: u64,
@@ -420,16 +402,164 @@ fn main() {
         variance: revmc::skeleton::SkeletonVariance,
     }
 
-    let analyzed: Vec<AnalyzedGroup> = dup_groups
-        .into_iter()
-        .map(|(skel_hash, members)| {
-            let refs: Vec<&[u8]> = members.iter().map(|(_, b)| b.as_slice()).collect();
-            let variance = analyze_skeleton_group(&refs);
-            AnalyzedGroup { skel_hash, members, variance }
-        })
-        .collect();
+    fn variance_from_registry(entry: &RegistryEntry) -> revmc::skeleton::SkeletonVariance {
+        use revmc::skeleton::PushClassification;
+        let pushes = entry
+            .variance_pushes
+            .iter()
+            .map(|&v| {
+                if v < 0 {
+                    PushClassification::Invariant
+                } else {
+                    PushClassification::Variant { table_index: v as u32 }
+                }
+            })
+            .collect();
+        revmc::skeleton::SkeletonVariance { pushes, num_variant: entry.num_variant }
+    }
 
-    println!("  {} skeleton families found in {:.2}s", analyzed.len(), t1.elapsed().as_secs_f64());
+    let analyzed: Vec<AnalyzedGroup>;
+    let t1 = Instant::now();
+
+    if let Some(ref registry_path) = cli.registry {
+        // Fast path: load pre-built registry
+        println!("\n--- Phase 2: Loading skeleton registry from {} ---", registry_path);
+        let data = std::fs::read(registry_path).expect("read registry");
+        let entries: Vec<RegistryEntry> =
+            bincode::deserialize(&data).expect("deserialize registry");
+
+        // We still need bytecodes to build data tables, so scan all blocks
+        let mut all_codes: HashMap<B256, Vec<u8>> = HashMap::new();
+        let mut blocks_loaded = 0usize;
+        for bn in cli.start_block..cli.start_block + cli.block_count {
+            if let Ok(loader) = BinLoader::new(bench_dir, bn) {
+                for (h, bc) in loader.code_values() {
+                    if !bc.is_empty() {
+                        all_codes.entry(*h).or_insert_with(|| bc.original_byte_slice().to_vec());
+                    }
+                }
+                blocks_loaded += 1;
+                if blocks_loaded % 1000 == 0 {
+                    eprint!("  [{blocks_loaded}] {} unique bytecodes\r", all_codes.len());
+                }
+            }
+        }
+        println!("  Scanned {blocks_loaded} blocks, {} unique bytecodes", all_codes.len());
+
+        analyzed = entries
+            .into_iter()
+            .filter_map(|entry| {
+                let variance = variance_from_registry(&entry);
+                let members: Vec<(B256, Vec<u8>)> = entry
+                    .member_hashes
+                    .iter()
+                    .filter_map(|raw| {
+                        let hash = B256::from(*raw);
+                        all_codes.get(&hash).map(|bytes| (hash, bytes.clone()))
+                    })
+                    .collect();
+                if members.len() >= 2 {
+                    Some(AnalyzedGroup { skel_hash: entry.skel_hash, members, variance })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        println!(
+            "  {} skeleton families loaded from registry in {:.2}s",
+            analyzed.len(),
+            t1.elapsed().as_secs_f64()
+        );
+    } else {
+        // Slow path: full scan + analyze
+        println!(
+            "\n--- Phase 2: Reconstructing skeleton families (full {}-block scan) ---",
+            cli.block_count
+        );
+
+        let mut all_codes: HashMap<B256, Vec<u8>> = HashMap::new();
+        let mut blocks_loaded = 0usize;
+        for bn in cli.start_block..cli.start_block + cli.block_count {
+            if let Ok(loader) = BinLoader::new(bench_dir, bn) {
+                for (h, bc) in loader.code_values() {
+                    if !bc.is_empty() {
+                        all_codes.entry(*h).or_insert_with(|| bc.original_byte_slice().to_vec());
+                    }
+                }
+                blocks_loaded += 1;
+                if blocks_loaded % 1000 == 0 {
+                    eprint!("  [{blocks_loaded}] {} unique bytecodes\r", all_codes.len());
+                }
+            }
+        }
+        println!("  Scanned {blocks_loaded} blocks, {} unique bytecodes", all_codes.len());
+
+        // Group by skeleton hash — store only hashes, not bytecodes (saves ~200MB cloning)
+        let mut skeleton_groups: HashMap<u64, Vec<B256>> = HashMap::new();
+        for (hash, bytes) in &all_codes {
+            if skelot_common::should_skip_bytes(bytes) {
+                continue;
+            }
+            let skel = skelot_common::extract_opcode_skeleton(bytes);
+            let skel_hash = skelot_common::hash_bytes(&skel);
+            skeleton_groups.entry(skel_hash).or_default().push(*hash);
+        }
+        let dup_groups: Vec<_> =
+            skeleton_groups.into_iter().filter(|(_, members)| members.len() >= 2).collect();
+
+        analyzed = dup_groups
+            .into_iter()
+            .map(|(skel_hash, member_hashes)| {
+                let refs: Vec<&[u8]> =
+                    member_hashes.iter().map(|h| all_codes[h].as_slice()).collect();
+                let variance = analyze_skeleton_group(&refs);
+                let members: Vec<(B256, Vec<u8>)> =
+                    member_hashes.into_iter().map(|h| (h, all_codes[&h].clone())).collect();
+                AnalyzedGroup { skel_hash, members, variance }
+            })
+            .collect();
+
+        println!(
+            "  {} skeleton families found in {:.2}s",
+            analyzed.len(),
+            t1.elapsed().as_secs_f64()
+        );
+
+        // Save registry for fast reuse
+        let registry_save_path = cli
+            .out
+            .as_ref()
+            .map(|p| std::path::Path::new(p).with_file_name("skeleton_registry_full.bin"))
+            .unwrap_or_else(|| std::path::PathBuf::from("skeleton_registry_full.bin"));
+        let entries: Vec<RegistryEntry> = analyzed
+            .iter()
+            .map(|g| {
+                use revmc::skeleton::PushClassification;
+                RegistryEntry {
+                    skel_hash: g.skel_hash,
+                    member_hashes: g.members.iter().map(|(h, _)| h.0).collect(),
+                    variance_pushes: g
+                        .variance
+                        .pushes
+                        .iter()
+                        .map(|p| match p {
+                            PushClassification::Invariant => -1i32,
+                            PushClassification::Variant { table_index } => *table_index as i32,
+                        })
+                        .collect(),
+                    num_variant: g.variance.num_variant,
+                }
+            })
+            .collect();
+        let data = bincode::serialize(&entries).expect("serialize registry");
+        std::fs::write(&registry_save_path, &data).expect("write registry");
+        println!(
+            "  Registry saved to {} ({:.1} KB)",
+            registry_save_path.display(),
+            data.len() as f64 / 1024.0
+        );
+    }
 
     // Phase 3: Load skeleton .so files and build dispatch tables
     println!("\n--- Phase 3: Loading skeleton .so files ---");
@@ -494,6 +624,42 @@ fn main() {
             Err(_) => continue,
         };
         let chain_id = loader.raw_txs().first().and_then(|tx| tx.chain_id);
+
+        // Correctness check: run once with each mode, compare (success, gas) per tx.
+        // Handler created ONCE per mode (not per-tx) to avoid cloning dispatch maps.
+        let mut ph_check = TimingPerHashHandler {
+            functions: per_hash_fns.clone(),
+            target_hashes: target_hashes.clone(),
+            timings: HashMap::new(),
+        };
+        let ph_results = execute_block_timed(&loader, chain_id, |evm| match ph_check.run(evm) {
+            Ok(rr) => extract_gas(&rr),
+            Err(_) => (false, 0),
+        });
+        let mut sk_check = TimingSkeletonHandler {
+            per_hash_fns: per_hash_fns.clone(),
+            skeleton_dispatch: skeleton_dispatch.clone(),
+            target_hashes: target_hashes.clone(),
+            timings: HashMap::new(),
+        };
+        let sk_results = execute_block_timed(&loader, chain_id, |evm| match sk_check.run(evm) {
+            Ok(rr) => extract_gas(&rr),
+            Err(_) => (false, 0),
+        });
+        let mut mismatches = 0u32;
+        for (i, (ph, sk)) in ph_results.iter().zip(sk_results.iter()).enumerate() {
+            if ph != sk {
+                mismatches += 1;
+                eprintln!(
+                    "  MISMATCH block {} tx[{}]: per-hash=({},{}) skeleton=({},{})",
+                    block, i, ph.0, ph.1, sk.0, sk.1
+                );
+            }
+        }
+        if mismatches > 0 {
+            eprintln!("  ABORT block {}: {} mismatches — skipping", block, mismatches);
+            continue;
+        }
 
         // Per-hash warmup
         for _ in 0..cli.warmup {
