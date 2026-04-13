@@ -441,12 +441,15 @@ fn main() {
         member_hashes: Vec<[u8; 32]>,
         variance_pushes: Vec<i32>, // -1 = Invariant, >= 0 = Variant(table_index)
         num_variant: u32,
+        #[serde(default)]
+        member_data_tables: Vec<Vec<u8>>, // pre-computed data tables, one per member
     }
 
     struct AnalyzedGroup {
         skel_hash: u64,
         members: Vec<(B256, Vec<u8>)>,
         variance: revmc::skeleton::SkeletonVariance,
+        cached_data_tables: Option<Vec<(B256, Vec<u8>)>>,
     }
 
     fn variance_from_registry(entry: &RegistryEntry) -> revmc::skeleton::SkeletonVariance {
@@ -469,49 +472,94 @@ fn main() {
     let t1 = Instant::now();
 
     if let Some(ref registry_path) = cli.registry {
-        // Fast path: load pre-built registry
+        // Fast path: load pre-built registry with cached data tables
         println!("\n--- Phase 2: Loading skeleton registry from {} ---", registry_path);
         let data = std::fs::read(registry_path).expect("read registry");
         let entries: Vec<RegistryEntry> =
             bincode::deserialize(&data).expect("deserialize registry");
 
-        // We still need bytecodes to build data tables, so scan all blocks
-        let mut all_codes: HashMap<B256, Vec<u8>> = HashMap::new();
-        let mut blocks_loaded = 0usize;
-        for bn in cli.start_block..cli.start_block + cli.block_count {
-            if let Ok(loader) = BinLoader::new(bench_dir, bn) {
-                for (h, bc) in loader.code_values() {
-                    if !bc.is_empty() {
-                        all_codes.entry(*h).or_insert_with(|| bc.original_byte_slice().to_vec());
+        let has_cached_tables = entries.first().map_or(false, |e| !e.member_data_tables.is_empty());
+
+        if has_cached_tables {
+            // Ultra-fast path: data tables pre-computed, no bytecode scan needed
+            println!("  Using cached data tables (no bytecode scan)");
+            // We don't need AnalyzedGroup.members bytecodes — only for build_data_table
+            // which is already cached. Store empty bytecodes as placeholder.
+            analyzed = entries
+                .into_iter()
+                .filter(|entry| {
+                    entry.member_hashes.len() >= 2
+                        && entry.member_data_tables.len() == entry.member_hashes.len()
+                })
+                .map(|entry| {
+                    let variance = variance_from_registry(&entry);
+                    let members: Vec<(B256, Vec<u8>)> = entry
+                        .member_hashes
+                        .iter()
+                        .map(|raw| (B256::from(*raw), Vec::new()))
+                        .collect();
+                    AnalyzedGroup {
+                        skel_hash: entry.skel_hash,
+                        members,
+                        variance,
+                        cached_data_tables: Some(
+                            entry
+                                .member_hashes
+                                .iter()
+                                .zip(entry.member_data_tables.into_iter())
+                                .map(|(raw, dt)| (B256::from(*raw), dt))
+                                .collect(),
+                        ),
+                    }
+                })
+                .collect();
+        } else {
+            // Registry without cached tables — fall back to bytecode scan
+            println!("  Registry lacks cached data tables, scanning bytecodes...");
+            let mut all_codes: HashMap<B256, Vec<u8>> = HashMap::new();
+            let mut blocks_loaded = 0usize;
+            for bn in cli.start_block..cli.start_block + cli.block_count {
+                if let Ok(loader) = BinLoader::new(bench_dir, bn) {
+                    for (h, bc) in loader.code_values() {
+                        if !bc.is_empty() {
+                            all_codes
+                                .entry(*h)
+                                .or_insert_with(|| bc.original_byte_slice().to_vec());
+                        }
+                    }
+                    blocks_loaded += 1;
+                    if blocks_loaded % 1000 == 0 {
+                        eprint!("  [{blocks_loaded}] {} unique bytecodes\r", all_codes.len());
                     }
                 }
-                blocks_loaded += 1;
-                if blocks_loaded % 1000 == 0 {
-                    eprint!("  [{blocks_loaded}] {} unique bytecodes\r", all_codes.len());
-                }
             }
-        }
-        println!("  Scanned {blocks_loaded} blocks, {} unique bytecodes", all_codes.len());
+            println!("  Scanned {blocks_loaded} blocks, {} unique bytecodes", all_codes.len());
 
-        analyzed = entries
-            .into_iter()
-            .filter_map(|entry| {
-                let variance = variance_from_registry(&entry);
-                let members: Vec<(B256, Vec<u8>)> = entry
-                    .member_hashes
-                    .iter()
-                    .filter_map(|raw| {
-                        let hash = B256::from(*raw);
-                        all_codes.get(&hash).map(|bytes| (hash, bytes.clone()))
-                    })
-                    .collect();
-                if members.len() >= 2 {
-                    Some(AnalyzedGroup { skel_hash: entry.skel_hash, members, variance })
-                } else {
-                    None
-                }
-            })
-            .collect();
+            analyzed = entries
+                .into_iter()
+                .filter_map(|entry| {
+                    let variance = variance_from_registry(&entry);
+                    let members: Vec<(B256, Vec<u8>)> = entry
+                        .member_hashes
+                        .iter()
+                        .filter_map(|raw| {
+                            let hash = B256::from(*raw);
+                            all_codes.get(&hash).map(|bytes| (hash, bytes.clone()))
+                        })
+                        .collect();
+                    if members.len() >= 2 {
+                        Some(AnalyzedGroup {
+                            skel_hash: entry.skel_hash,
+                            members,
+                            variance,
+                            cached_data_tables: None,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+        }
 
         println!(
             "  {} skeleton families loaded from registry in {:.2}s",
@@ -563,7 +611,7 @@ fn main() {
                 let variance = analyze_skeleton_group(&refs);
                 let members: Vec<(B256, Vec<u8>)> =
                     member_hashes.into_iter().map(|h| (h, all_codes[&h].clone())).collect();
-                AnalyzedGroup { skel_hash, members, variance }
+                AnalyzedGroup { skel_hash, members, variance, cached_data_tables: None }
             })
             .collect();
 
@@ -573,7 +621,7 @@ fn main() {
             t1.elapsed().as_secs_f64()
         );
 
-        // Save registry for fast reuse
+        // Save registry for fast reuse (with pre-computed data tables)
         let registry_save_path = cli
             .out
             .as_ref()
@@ -596,15 +644,20 @@ fn main() {
                         })
                         .collect(),
                     num_variant: g.variance.num_variant,
+                    member_data_tables: g
+                        .members
+                        .iter()
+                        .map(|(_, bytes)| build_data_table(bytes, &g.variance).data)
+                        .collect(),
                 }
             })
             .collect();
         let data = bincode::serialize(&entries).expect("serialize registry");
         std::fs::write(&registry_save_path, &data).expect("write registry");
         println!(
-            "  Registry saved to {} ({:.1} KB)",
+            "  Registry saved to {} ({:.1} MB) with cached data tables",
             registry_save_path.display(),
-            data.len() as f64 / 1024.0
+            data.len() as f64 / 1048576.0
         );
     }
 
@@ -622,10 +675,19 @@ fn main() {
             Ok((raw_fn, lib)) => {
                 skeleton_libs.push(lib);
                 let skel_fn = EvmCompilerFn::new(raw_fn);
-                for (hash, bytes) in &g.members {
-                    let table = build_data_table(bytes, &g.variance);
-                    skeleton_dispatch.insert(*hash, (skel_fn, table.data));
-                    skeleton_hash_map.insert(*hash, (g.skel_hash, g.members.len()));
+                if let Some(ref cached_tables) = g.cached_data_tables {
+                    // Use pre-computed data tables from registry
+                    for (hash, dt) in cached_tables {
+                        skeleton_dispatch.insert(*hash, (skel_fn, dt.clone()));
+                        skeleton_hash_map.insert(*hash, (g.skel_hash, g.members.len()));
+                    }
+                } else {
+                    // Build data tables from bytecodes
+                    for (hash, bytes) in &g.members {
+                        let table = build_data_table(bytes, &g.variance);
+                        skeleton_dispatch.insert(*hash, (skel_fn, table.data));
+                        skeleton_hash_map.insert(*hash, (g.skel_hash, g.members.len()));
+                    }
                 }
             }
             Err(e) => {
