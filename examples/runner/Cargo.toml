@@ -159,3 +159,7 @@ harness = false
 [[bin]]
 name = "skelot_dataset_scan"
 path = "src/bin/skelot_dataset_scan.rs"
+
+[[bin]]
+name = "skeleton_vs_perhash_bench"
+path = "src/bin/skeleton_vs_perhash_bench.rs"
