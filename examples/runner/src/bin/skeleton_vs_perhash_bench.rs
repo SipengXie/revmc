@@ -80,6 +80,34 @@ struct Summary {
 }
 
 #[derive(Serialize)]
+struct RawSample {
+    block: u64,
+    round: usize,
+    per_hash_us: f64,
+    skeleton_us: f64,
+}
+
+#[derive(Serialize)]
+struct FamilyAggregate {
+    skeleton_hash: String,
+    family_size: usize,
+    members_measured: usize,
+    median_speedup: f64,
+    mean_delta_us: f64,
+    pct_faster: f64,
+    pct_equivalent: f64,
+    pct_slower: f64,
+}
+
+#[derive(Serialize)]
+struct BlockSummary {
+    block: u64,
+    contracts_measured: usize,
+    median_speedup: f64,
+    mean_delta_us: f64,
+}
+
+#[derive(Serialize)]
 struct ContractRecord {
     code_hash: String,
     skeleton_hash: String,
@@ -90,14 +118,33 @@ struct ContractRecord {
     delta_us: f64,
     speedup_ratio: f64,
     welch_p: f64,
+    cohens_d: f64,
     verdict: String,
+    raw_samples: Vec<RawSample>,
 }
 
 #[derive(Serialize)]
 struct Output {
     config: Config,
     summary: Summary,
+    per_family: Vec<FamilyAggregate>,
+    per_block: Vec<BlockSummary>,
     per_contract: Vec<ContractRecord>,
+}
+
+fn cohens_d(a: &[f64], b: &[f64]) -> f64 {
+    let mean_a = a.iter().sum::<f64>() / a.len() as f64;
+    let mean_b = b.iter().sum::<f64>() / b.len() as f64;
+    let var_a =
+        a.iter().map(|x| (x - mean_a).powi(2)).sum::<f64>() / (a.len() as f64 - 1.0).max(1.0);
+    let var_b =
+        b.iter().map(|x| (x - mean_b).powi(2)).sum::<f64>() / (b.len() as f64 - 1.0).max(1.0);
+    let pooled_std = ((var_a + var_b) / 2.0).sqrt();
+    if pooled_std == 0.0 {
+        0.0
+    } else {
+        (mean_a - mean_b) / pooled_std
+    }
 }
 
 fn welch_t(a: &[f64], b: &[f64]) -> (f64, f64) {
@@ -614,8 +661,8 @@ fn main() {
     // Phase 5: Run blocks with timing
     println!("\n--- Phase 5: Measuring {} blocks ---", block_numbers.len());
 
-    let mut per_hash_samples: HashMap<B256, Vec<f64>> = HashMap::new();
-    let mut skeleton_samples: HashMap<B256, Vec<f64>> = HashMap::new();
+    let mut per_hash_samples: HashMap<B256, Vec<(u64, usize, f64)>> = HashMap::new();
+    let mut skeleton_samples: HashMap<B256, Vec<(u64, usize, f64)>> = HashMap::new();
     let mut blocks_measured = 0usize;
 
     for (bi, &block) in block_numbers.iter().enumerate() {
@@ -677,7 +724,7 @@ fn main() {
         }
 
         // Per-hash measured rounds
-        for _ in 0..cli.rounds {
+        for round_idx in 0..cli.rounds {
             let mut handler = TimingPerHashHandler {
                 functions: per_hash_fns.clone(),
                 target_hashes: target_hashes.clone(),
@@ -688,7 +735,11 @@ fn main() {
                 Err(_) => (false, 0),
             });
             for (hash, dur) in &handler.timings {
-                per_hash_samples.entry(*hash).or_default().push(dur.as_nanos() as f64 / 1000.0);
+                per_hash_samples.entry(*hash).or_default().push((
+                    block,
+                    round_idx,
+                    dur.as_nanos() as f64 / 1000.0,
+                ));
             }
         }
 
@@ -709,7 +760,7 @@ fn main() {
         }
 
         // Skeleton measured rounds
-        for _ in 0..cli.rounds {
+        for round_idx in 0..cli.rounds {
             let mut handler = TimingSkeletonHandler {
                 per_hash_fns: per_hash_fns.clone(),
                 skeleton_dispatch: skeleton_dispatch.clone(),
@@ -721,7 +772,11 @@ fn main() {
                 Err(_) => (false, 0),
             });
             for (hash, dur) in &handler.timings {
-                skeleton_samples.entry(*hash).or_default().push(dur.as_nanos() as f64 / 1000.0);
+                skeleton_samples.entry(*hash).or_default().push((
+                    block,
+                    round_idx,
+                    dur.as_nanos() as f64 / 1000.0,
+                ));
             }
         }
 
@@ -753,12 +808,16 @@ fn main() {
             continue;
         }
 
-        let mean_ph = ph.iter().sum::<f64>() / ph.len() as f64;
-        let mean_sk = sk.iter().sum::<f64>() / sk.len() as f64;
+        let ph_vals: Vec<f64> = ph.iter().map(|(_, _, us)| *us).collect();
+        let sk_vals: Vec<f64> = sk.iter().map(|(_, _, us)| *us).collect();
+
+        let mean_ph = ph_vals.iter().sum::<f64>() / ph_vals.len() as f64;
+        let mean_sk = sk_vals.iter().sum::<f64>() / sk_vals.len() as f64;
         let delta = mean_sk - mean_ph;
         let ratio = if mean_sk > 0.0 { mean_ph / mean_sk } else { 1.0 };
 
-        let (_, p) = welch_t(ph, sk);
+        let (_, p) = welch_t(&ph_vals, &sk_vals);
+        let d = cohens_d(&ph_vals, &sk_vals);
 
         let verdict = if p >= cli.alpha {
             n_equiv += 1;
@@ -773,6 +832,18 @@ fn main() {
 
         let (skel_hash, family_size) = skeleton_hash_map.get(hash).copied().unwrap_or((0, 0));
 
+        let mut raw: Vec<RawSample> = Vec::new();
+        for &(blk, rnd, ph_us) in ph {
+            if let Some(&(_, _, sk_us)) = sk.iter().find(|(b, r, _)| *b == blk && *r == rnd) {
+                raw.push(RawSample {
+                    block: blk,
+                    round: rnd,
+                    per_hash_us: ph_us,
+                    skeleton_us: sk_us,
+                });
+            }
+        }
+
         all_ratios.push(ratio);
         all_deltas.push(delta);
 
@@ -786,7 +857,9 @@ fn main() {
             delta_us: delta,
             speedup_ratio: ratio,
             welch_p: p,
+            cohens_d: d,
             verdict: verdict.to_string(),
+            raw_samples: raw,
         });
     }
 
@@ -798,8 +871,64 @@ fn main() {
             .reverse()
     });
 
-    all_ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    all_deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // Per-family aggregates
+    let mut family_map: HashMap<String, Vec<&ContractRecord>> = HashMap::new();
+    for rec in &records {
+        family_map.entry(rec.skeleton_hash.clone()).or_default().push(rec);
+    }
+    let fcmp = |a: &f64, b: &f64| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
+    let mut per_family: Vec<FamilyAggregate> = family_map
+        .into_iter()
+        .map(|(skel_hash, members)| {
+            let mut speedups: Vec<f64> = members.iter().map(|r| r.speedup_ratio).collect();
+            speedups.sort_by(fcmp);
+            let median_speedup = speedups[speedups.len() / 2];
+            let mean_delta = members.iter().map(|r| r.delta_us).sum::<f64>() / members.len() as f64;
+            let n = members.len() as f64;
+            let n_f = members.iter().filter(|r| r.verdict == "SKELETON_FASTER").count() as f64;
+            let n_e = members.iter().filter(|r| r.verdict == "EQUIVALENT").count() as f64;
+            let n_s = members.iter().filter(|r| r.verdict == "SKELETON_SLOWER").count() as f64;
+            FamilyAggregate {
+                skeleton_hash: skel_hash,
+                family_size: members[0].family_size,
+                members_measured: members.len(),
+                median_speedup,
+                mean_delta_us: mean_delta,
+                pct_faster: n_f / n * 100.0,
+                pct_equivalent: n_e / n * 100.0,
+                pct_slower: n_s / n * 100.0,
+            }
+        })
+        .collect();
+    per_family.sort_by(|a, b| b.members_measured.cmp(&a.members_measured));
+
+    // Per-block breakdown
+    let mut block_data: HashMap<u64, Vec<f64>> = HashMap::new();
+    for rec in &records {
+        for s in &rec.raw_samples {
+            if s.skeleton_us > 0.0 {
+                block_data.entry(s.block).or_default().push(s.per_hash_us / s.skeleton_us);
+            }
+        }
+    }
+    let mut per_block: Vec<BlockSummary> = block_data
+        .into_iter()
+        .map(|(block, mut ratios)| {
+            ratios.sort_by(fcmp);
+            let median = ratios[ratios.len() / 2];
+            let mean_d = ratios.iter().map(|r| r - 1.0).sum::<f64>() / ratios.len() as f64;
+            BlockSummary {
+                block,
+                contracts_measured: ratios.len(),
+                median_speedup: median,
+                mean_delta_us: mean_d,
+            }
+        })
+        .collect();
+    per_block.sort_by_key(|b| b.block);
+
+    all_ratios.sort_by(fcmp);
+    all_deltas.sort_by(fcmp);
 
     let median_ratio = if all_ratios.is_empty() { 1.0 } else { all_ratios[all_ratios.len() / 2] };
     let mean_delta = if all_deltas.is_empty() {
@@ -822,6 +951,7 @@ fn main() {
     println!("  Median speedup ratio: {median_ratio:.4}");
     println!("  Mean delta (us):      {mean_delta:.2}");
     println!("  P95 delta (us):       {p95_delta:.2}");
+    println!("  Families: {}  Blocks: {}", per_family.len(), per_block.len());
 
     if let Some(ref out_path) = cli.out {
         let output = Output {
@@ -840,6 +970,8 @@ fn main() {
                 mean_delta_us: mean_delta,
                 p95_delta_us: p95_delta,
             },
+            per_family,
+            per_block,
             per_contract: records,
         };
         std::fs::write(out_path, serde_json::to_vec_pretty(&output).expect("serialize"))
