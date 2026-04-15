@@ -100,8 +100,10 @@ pub fn analyze_skeleton_group_with_mode(
                     "bytecodes have different number of PUSH instructions"
                 );
             }
-            for v in is_variant.iter_mut() {
-                *v = true;
+            let skip_logic = skip_logic_push_mask(reference);
+            debug_assert_eq!(skip_logic.len(), ref_pushes.len());
+            for (i, v) in is_variant.iter_mut().enumerate() {
+                *v = !skip_logic[i];
             }
         }
     }
@@ -147,6 +149,63 @@ pub fn build_data_table(bytecode: &[u8], variance: &SkeletonVariance) -> ImmData
 
 pub(crate) fn normalize_push_immediate(imm: &[u8]) -> [u8; 32] {
     U256::from_be_slice(imm).to_le_bytes::<32>()
+}
+
+/// Mask of PUSH1..PUSH32 instructions whose immediate is baked into a static
+/// JUMP/JUMPI (what the bytecode analysis would mark as `SKIP_LOGIC`). The mask
+/// is indexed by PUSH ordinal, matching [`extract_push_immediates`] (PUSH0 is
+/// skipped). A `true` entry means the PUSH's value is consumed by an adjacent
+/// `JUMP` or `JUMPI` to a valid JUMPDEST, so classifying it as Variant would
+/// invalidate the static-jump folding done by the backend.
+pub(crate) fn skip_logic_push_mask(bytecode: &[u8]) -> Vec<bool> {
+    // Pass 1: collect valid JUMPDEST PCs (JUMPDEST opcodes not inside a PUSH imm).
+    let mut jumpdests = std::collections::HashSet::new();
+    let mut i = 0usize;
+    while i < bytecode.len() {
+        let op_byte = bytecode[i];
+        if op_byte == op::JUMPDEST {
+            jumpdests.insert(i);
+        }
+        if op_byte >= op::PUSH1 && op_byte <= op::PUSH32 {
+            let n = (op_byte - op::PUSH0) as usize;
+            i += 1 + n;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Pass 2: walk again, mark PUSH<N> at ordinal k as skip-logic iff it is
+    // immediately followed by JUMP/JUMPI to a valid JUMPDEST and the immediate
+    // fits in a usize.
+    let mut mask = Vec::new();
+    let mut i = 0usize;
+    while i < bytecode.len() {
+        let op_byte = bytecode[i];
+        if op_byte >= op::PUSH1 && op_byte <= op::PUSH32 {
+            let n = (op_byte - op::PUSH0) as usize;
+            let imm_start = i + 1;
+            let imm_end = (imm_start + n).min(bytecode.len());
+            let jump_pc = imm_end;
+            let mut is_skip = false;
+            if jump_pc < bytecode.len() && n <= std::mem::size_of::<usize>() {
+                let jump_op = bytecode[jump_pc];
+                if jump_op == op::JUMP || jump_op == op::JUMPI {
+                    let imm = &bytecode[imm_start..imm_end];
+                    let mut padded = [0u8; std::mem::size_of::<usize>()];
+                    padded[std::mem::size_of::<usize>() - imm.len()..].copy_from_slice(imm);
+                    let target = usize::from_be_bytes(padded);
+                    if jumpdests.contains(&target) {
+                        is_skip = true;
+                    }
+                }
+            }
+            mask.push(is_skip);
+            i = imm_end;
+        } else {
+            i += 1;
+        }
+    }
+    mask
 }
 
 /// Extract PUSH1..PUSH32 immediate byte slices from bytecode, in opcode order.
@@ -271,6 +330,28 @@ mod tests {
         assert_eq!(table.data.len(), 64);
         assert_eq!(table.data[0], 0x42);
         assert_eq!(table.data[32], 0x01);
+    }
+
+    #[test]
+    fn test_force_all_variant_preserves_skip_logic() {
+        // PUSH1 0x03, JUMP, JUMPDEST, STOP — JUMPDEST sits at PC 3, PUSH1 pushes
+        // 3, so the PUSH immediate is a valid static-jump target. Bytecode
+        // analysis would flag it SKIP_LOGIC, and ForceAllVariant must leave it
+        // Invariant to preserve static-jump folding.
+        let bc = &[0x60, 0x03, 0x56, 0x5b, 0x00];
+        let variance = analyze_skeleton_group_with_mode(&[bc, bc], ClassifyMode::ForceAllVariant);
+        assert_eq!(variance.pushes.len(), 1);
+        assert_eq!(variance.pushes[0], PushClassification::Invariant);
+        assert_eq!(variance.num_variant, 0);
+
+        // Add a second, non-SKIP_LOGIC PUSH1 — it must still be forced Variant.
+        // Layout: PUSH1 0x03, JUMP, JUMPDEST, PUSH1 0x42, STOP
+        let bc2 = &[0x60, 0x03, 0x56, 0x5b, 0x60, 0x42, 0x00];
+        let v2 = analyze_skeleton_group_with_mode(&[bc2, bc2], ClassifyMode::ForceAllVariant);
+        assert_eq!(v2.pushes.len(), 2);
+        assert_eq!(v2.pushes[0], PushClassification::Invariant);
+        assert_eq!(v2.pushes[1], PushClassification::Variant { table_index: 0 });
+        assert_eq!(v2.num_variant, 1);
     }
 
     #[test]

@@ -38,6 +38,7 @@ libm = "0.2"
 ureq = { version = "2", features = ["json"] }
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tempfile = "3"
 
 [dev-dependencies]
 criterion = "0.5"

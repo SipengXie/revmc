@@ -15,16 +15,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use clap::Parser;
-use revm::bytecode::Bytecode;
-use revm::primitives::{Address, HashMap as RevmHashMap, B256, U256};
-use revm::state::AccountInfo;
+use revm::primitives::B256;
 use revmc::skeleton::{analyze_skeleton_group, SkeletonVariance};
 use revmc::OptimizationLevel;
 use serde::{Deserialize, Serialize};
 
 use crate::skelot_common::{
-    compile_per_hash, compile_skeleton_group, extract_opcode_skeleton, hash_bytes, per_hash_paths,
-    should_skip_bytes, skeleton_paths,
+    collect_bytecodes, compile_per_hash, compile_skeleton_group, extract_opcode_skeleton,
+    hash_bytes, per_hash_paths, skeleton_paths,
 };
 
 #[derive(Parser)]
@@ -48,25 +46,6 @@ struct Args {
     resume: bool,
     #[arg(long)]
     out: String,
-}
-
-#[derive(Deserialize)]
-struct AccountSnapshot {
-    #[allow(dead_code)]
-    info: Option<AccountInfo>,
-    #[allow(dead_code)]
-    storage: RevmHashMap<U256, U256>,
-}
-
-#[derive(Deserialize)]
-struct CacheSnapshot {
-    #[allow(dead_code)]
-    block_number: u64,
-    #[allow(dead_code)]
-    has_state_clear: bool,
-    #[allow(dead_code)]
-    accounts: RevmHashMap<Address, AccountSnapshot>,
-    codes: RevmHashMap<B256, Bytecode>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -96,28 +75,6 @@ struct CompileRecord {
 #[derive(Serialize, Deserialize)]
 struct CompileBenchOut {
     records: Vec<CompileRecord>,
-}
-
-fn collect_bytecodes(args: &Args) -> HashMap<B256, Vec<u8>> {
-    let bench_dir = PathBuf::from(&args.bench_dir);
-    let mut all: HashMap<B256, Vec<u8>> = HashMap::new();
-    for bn in args.start_block..args.start_block + args.block_count {
-        let path = bench_dir.join(format!("states/{bn}.bin"));
-        let Ok(data) = fs::read(&path) else { continue };
-        let Ok(mut snapshot): Result<CacheSnapshot, _> = bincode::deserialize(&data) else {
-            continue;
-        };
-        let codes = std::mem::take(&mut snapshot.codes);
-        drop(snapshot);
-        for (hash, bytecode) in codes {
-            let raw = bytecode.original_byte_slice().to_vec();
-            if should_skip_bytes(&raw) {
-                continue;
-            }
-            all.entry(hash).or_insert(raw);
-        }
-    }
-    all
 }
 
 fn run_per_hash(
@@ -350,7 +307,8 @@ fn run_skeleton(
 
 fn main() {
     let args = Args::parse();
-    let contracts = collect_bytecodes(&args);
+    let contracts =
+        collect_bytecodes(Path::new(&args.bench_dir), args.start_block, args.block_count);
     eprintln!("Collected {} compilable bytecodes", contracts.len());
     let cache_dir = PathBuf::from(&args.cache_dir);
     fs::create_dir_all(&cache_dir).expect("mk cache");

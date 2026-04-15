@@ -537,6 +537,51 @@ pub fn contains_bytes(bytecode: &[u8], needle: &[u8; 4]) -> bool {
     false
 }
 
+// ── Bench-data bytecode loader (shared by Stage B / Stage E) ──────────────
+
+use revm::primitives::{HashMap as RevmHashMap, U256};
+use revm::state::AccountInfo;
+
+#[derive(Deserialize)]
+pub struct AccountSnapshot {
+    pub info: Option<AccountInfo>,
+    pub storage: RevmHashMap<U256, U256>,
+}
+
+#[derive(Deserialize)]
+pub struct CacheSnapshot {
+    pub block_number: u64,
+    pub has_state_clear: bool,
+    pub accounts: RevmHashMap<Address, AccountSnapshot>,
+    pub codes: RevmHashMap<B256, Bytecode>,
+}
+
+/// Gather non-skippable bytecodes from `states/{bn}.bin` snapshots over a block range.
+pub fn collect_bytecodes(
+    bench_dir: &Path,
+    start_block: u64,
+    block_count: u64,
+) -> std::collections::HashMap<B256, Vec<u8>> {
+    let mut all: std::collections::HashMap<B256, Vec<u8>> = std::collections::HashMap::new();
+    for bn in start_block..start_block + block_count {
+        let path = bench_dir.join(format!("states/{bn}.bin"));
+        let Ok(data) = std::fs::read(&path) else { continue };
+        let Ok(mut snapshot): Result<CacheSnapshot, _> = bincode::deserialize(&data) else {
+            continue;
+        };
+        let codes = std::mem::take(&mut snapshot.codes);
+        drop(snapshot);
+        for (hash, bytecode) in codes {
+            let raw = bytecode.original_byte_slice().to_vec();
+            if should_skip_bytes(&raw) {
+                continue;
+            }
+            all.entry(hash).or_insert(raw);
+        }
+    }
+    all
+}
+
 // ── Family summary + stratified sampling (Stage E) ────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
