@@ -40,6 +40,16 @@ pub struct ImmDataTable {
     pub data: Vec<u8>,
 }
 
+/// Classification mode for [`analyze_skeleton_group_with_mode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassifyMode {
+    /// Default: compare across instances; only differing PUSHes become Variant.
+    Auto,
+    /// Ablation: mark every non-PUSH0 as Variant regardless of cross-instance equality.
+    /// Disables LLVM constant folding over PUSH immediates while keeping skeleton sharing.
+    ForceAllVariant,
+}
+
 /// Analyze a group of bytecodes sharing the same opcode skeleton.
 /// Compares PUSH1..PUSH32 immediates across all instances to classify each as
 /// Invariant (same value everywhere) or Variant (differs in at least one instance).
@@ -48,22 +58,50 @@ pub struct ImmDataTable {
 /// - If `bytecodes` is empty.
 /// - If bytecodes don't share the same opcode skeleton (different PUSH counts).
 pub fn analyze_skeleton_group(bytecodes: &[&[u8]]) -> SkeletonVariance {
+    analyze_skeleton_group_with_mode(bytecodes, ClassifyMode::Auto)
+}
+
+/// Variant of [`analyze_skeleton_group`] parameterized by [`ClassifyMode`].
+///
+/// # Panics
+/// Same panic conditions as [`analyze_skeleton_group`].
+pub fn analyze_skeleton_group_with_mode(
+    bytecodes: &[&[u8]],
+    mode: ClassifyMode,
+) -> SkeletonVariance {
     assert!(!bytecodes.is_empty(), "need at least one bytecode");
 
     let reference = bytecodes[0];
     let ref_pushes = extract_push_immediates(reference);
 
     let mut is_variant = vec![false; ref_pushes.len()];
-    for &bytecode in &bytecodes[1..] {
-        let pushes = extract_push_immediates(bytecode);
-        assert_eq!(
-            pushes.len(),
-            ref_pushes.len(),
-            "bytecodes have different number of PUSH instructions"
-        );
-        for (i, (ref_imm, imm)) in ref_pushes.iter().zip(pushes.iter()).enumerate() {
-            if ref_imm != imm {
-                is_variant[i] = true;
+    match mode {
+        ClassifyMode::Auto => {
+            for &bytecode in &bytecodes[1..] {
+                let pushes = extract_push_immediates(bytecode);
+                assert_eq!(
+                    pushes.len(),
+                    ref_pushes.len(),
+                    "bytecodes have different number of PUSH instructions"
+                );
+                for (i, (ref_imm, imm)) in ref_pushes.iter().zip(pushes.iter()).enumerate() {
+                    if ref_imm != imm {
+                        is_variant[i] = true;
+                    }
+                }
+            }
+        }
+        ClassifyMode::ForceAllVariant => {
+            for &bytecode in &bytecodes[1..] {
+                let pushes = extract_push_immediates(bytecode);
+                assert_eq!(
+                    pushes.len(),
+                    ref_pushes.len(),
+                    "bytecodes have different number of PUSH instructions"
+                );
+            }
+            for v in is_variant.iter_mut() {
+                *v = true;
             }
         }
     }
@@ -206,5 +244,42 @@ mod tests {
         let variance = analyze_skeleton_group(&[bc]);
         assert_eq!(variance.num_variant, 0);
         assert!(variance.pushes.iter().all(|p| *p == PushClassification::Invariant));
+    }
+
+    #[test]
+    fn test_force_all_variant_marks_every_non_push0_as_variant() {
+        let bc = &[0x5f, 0x60, 0x42, 0x61, 0x00, 0x01, 0x00];
+
+        let auto = analyze_skeleton_group_with_mode(&[bc, bc], ClassifyMode::Auto);
+        assert_eq!(auto.num_variant, 0);
+
+        let forced = analyze_skeleton_group_with_mode(&[bc, bc], ClassifyMode::ForceAllVariant);
+        assert_eq!(forced.pushes.len(), 2);
+        assert_eq!(forced.pushes[0], PushClassification::Variant { table_index: 0 });
+        assert_eq!(forced.pushes[1], PushClassification::Variant { table_index: 1 });
+        assert_eq!(forced.num_variant, 2);
+    }
+
+    #[test]
+    fn test_force_all_variant_data_table_roundtrips_values() {
+        let bc1 = &[0x60, 0x42, 0x60, 0x01, 0x00];
+        let bc2 = &[0x60, 0x42, 0x60, 0x02, 0x00];
+        let variance = analyze_skeleton_group_with_mode(&[bc1, bc2], ClassifyMode::ForceAllVariant);
+        assert_eq!(variance.num_variant, 2);
+
+        let table = build_data_table(bc1, &variance);
+        assert_eq!(table.data.len(), 64);
+        assert_eq!(table.data[0], 0x42);
+        assert_eq!(table.data[32], 0x01);
+    }
+
+    #[test]
+    fn test_auto_wrapper_matches_prior_behavior() {
+        let bc1 = &[0x60, 0x42, 0x60, 0x01, 0x00];
+        let bc2 = &[0x60, 0x42, 0x60, 0x02, 0x00];
+        let via_wrapper = analyze_skeleton_group(&[bc1, bc2]);
+        let via_mode = analyze_skeleton_group_with_mode(&[bc1, bc2], ClassifyMode::Auto);
+        assert_eq!(via_wrapper.num_variant, via_mode.num_variant);
+        assert_eq!(via_wrapper.pushes, via_mode.pushes);
     }
 }
