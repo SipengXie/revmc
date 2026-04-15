@@ -14,6 +14,7 @@ use revm::primitives::hardfork::SpecId;
 use revm::primitives::{Address, B256};
 use revmc::skeleton::SkeletonVariance;
 use revmc::{EvmCompiler, EvmLlvmBackend, OptimizationLevel};
+use serde::{Deserialize, Serialize};
 
 use op_revm::OpSpecId;
 
@@ -536,11 +537,97 @@ pub fn contains_bytes(bytecode: &[u8], needle: &[u8; 4]) -> bool {
     false
 }
 
+// ── Family summary + stratified sampling (Stage E) ────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FamilySummary {
+    pub skeleton_id: String,
+    pub skeleton_raw_len: usize,
+    pub member_count: usize,
+    pub member_hashes: Vec<String>,
+}
+
+/// Exact bucket boundaries used by Stage A.
+/// Returns 0..=4 for tiny/small/medium/large/huge.
+pub fn bucket_for_raw_len(raw_len: usize) -> usize {
+    match raw_len {
+        0..=99 => 0,
+        100..=999 => 1,
+        1_000..=4_999 => 2,
+        5_000..=14_999 => 3,
+        _ => 4,
+    }
+}
+
+/// Return a stratified sample of `families`: from each of the 5 buckets, take
+/// the top `per_bucket` families by `member_count` (ties broken by
+/// lexicographic `skeleton_id`). Singleton families (`member_count < 2`) are
+/// excluded — they collapse per_hash and SkelOT to identical points and
+/// contribute no ablation signal. `seed` is reserved for future randomized
+/// variants.
+pub fn stratified_family_sample(
+    families: &[FamilySummary],
+    per_bucket: usize,
+    _seed: u64,
+) -> Vec<FamilySummary> {
+    let mut buckets: [Vec<&FamilySummary>; 5] = Default::default();
+    for fam in families {
+        if fam.member_count < 2 {
+            continue;
+        }
+        buckets[bucket_for_raw_len(fam.skeleton_raw_len)].push(fam);
+    }
+    let mut out = Vec::with_capacity(per_bucket * 5);
+    for mut bucket in buckets {
+        bucket.sort_by(|a, b| {
+            b.member_count.cmp(&a.member_count).then_with(|| a.skeleton_id.cmp(&b.skeleton_id))
+        });
+        for fam in bucket.into_iter().take(per_bucket) {
+            out.push(fam.clone());
+        }
+    }
+    out
+}
+
 /// For EIP-1167: extract embedded implementation address (bytes 10..30).
 pub fn eip1167_impl_addr(bytes: &[u8]) -> Option<Address> {
     if bytes.len() == 45 && bytes.starts_with(&[0x36, 0x3d, 0x3d, 0x37]) && bytes[9] == 0x73 {
         Some(Address::from_slice(&bytes[10..30]))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod stratified_tests {
+    use super::*;
+
+    fn mk_family(skeleton_raw_len: usize, members: usize) -> FamilySummary {
+        FamilySummary {
+            skeleton_id: format!("fam-{}-{}", skeleton_raw_len, members),
+            skeleton_raw_len,
+            member_count: members,
+            member_hashes: (0..members).map(|i| format!("{:064x}", i)).collect(),
+        }
+    }
+
+    #[test]
+    fn stratified_sample_is_deterministic_and_stratified() {
+        let mut families = Vec::new();
+        for (bucket_idx, &raw_len) in [20usize, 200, 1_000, 5_000, 20_000].iter().enumerate() {
+            for i in 0..40 {
+                families.push(mk_family(raw_len, 100 - i + bucket_idx));
+            }
+        }
+        let s1 = stratified_family_sample(&families, 20, 42);
+        let s2 = stratified_family_sample(&families, 20, 42);
+        assert_eq!(s1, s2, "same seed must produce identical selection");
+        assert_eq!(s1.len(), 100);
+
+        let mut per_bucket = [0usize; 5];
+        for fam in &s1 {
+            per_bucket[bucket_for_raw_len(fam.skeleton_raw_len)] += 1;
+        }
+        assert_eq!(per_bucket, [20, 20, 20, 20, 20]);
     }
 }
