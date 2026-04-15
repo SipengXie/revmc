@@ -9,7 +9,7 @@ mod skelot_common;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use clap::Parser;
 use op_revm::transaction::OpTransaction;
@@ -540,16 +540,13 @@ fn summarize(samples: &[f64]) -> (f64, f64, f64, f64) {
 
 fn flat_mode(cm: &CompileMetrics, samples: &[f64], baseline: Option<&[f64]>) -> serde_json::Value {
     let (median, p5, p95, sd) = summarize(samples);
-    let welch =
-        baseline.map(
-            |b| {
-                if samples.is_empty() || b.is_empty() {
-                    0.0
-                } else {
-                    welch_p(samples, b)
-                }
-            },
-        );
+    let welch = baseline.and_then(|b| {
+        if samples.is_empty() || b.is_empty() {
+            None
+        } else {
+            Some(welch_p(samples, b))
+        }
+    });
     serde_json::json!({
         "compile_time_ms": cm.compile_time_ms,
         "so_bytes": cm.so_bytes,
@@ -830,7 +827,5 @@ fn main() -> anyhow::Result<()> {
     });
     std::fs::write(&args.out, serde_json::to_string_pretty(&out)?)?;
     eprintln!("Wrote output to {}", args.out.display());
-    // _ vars (Duration, libloading libs) cleaned up by scope.
-    let _ = Duration::from_secs(0);
     Ok(())
 }
