@@ -35,6 +35,9 @@ bincode = "1.3"
 clap = { version = "4", features = ["derive"] }
 k256 = "0.13"
 libm = "0.2"
+ureq = { version = "2", features = ["json"] }
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [dev-dependencies]
 criterion = "0.5"
@@ -131,6 +134,10 @@ path = "src/bin/compile_hex.rs"
 name = "skelot_compile_bench"
 path = "src/bin/skelot_compile_bench.rs"
 
+[[bin]]
+name = "skelot_ablation_bench"
+path = "src/bin/skelot_ablation_bench.rs"
+
 [[bench]]
 name = "bench_airdrop"
 path = "src/bench_airdrop.rs"
@@ -163,3 +170,7 @@ path = "src/bin/skelot_dataset_scan.rs"
 [[bin]]
 name = "skeleton_vs_perhash_bench"
 path = "src/bin/skeleton_vs_perhash_bench.rs"
+
+[[bin]]
+name = "skeleton_deployment_span"
+path = "src/bin/skeleton_deployment_span.rs"
