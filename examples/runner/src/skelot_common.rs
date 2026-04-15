@@ -582,6 +582,34 @@ pub fn collect_bytecodes(
     all
 }
 
+// ── Statistics (Welch's t) ─────────────────────────────────────────────────
+
+/// Welch's two-sample t-test. Returns `(t, p)` with a two-sided p-value
+/// computed from the normal approximation (adequate for rounds >= ~30).
+pub fn welch_t(a: &[f64], b: &[f64]) -> (f64, f64) {
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let var = |v: &[f64], m: f64| {
+        v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (v.len() as f64 - 1.0).max(1.0)
+    };
+    let ma = mean(a);
+    let mb = mean(b);
+    let va = var(a, ma);
+    let vb = var(b, mb);
+    let se = ((va / a.len() as f64) + (vb / b.len() as f64)).sqrt();
+    if se == 0.0 {
+        return (0.0, 1.0);
+    }
+    let t = (ma - mb) / se;
+    let z = t.abs();
+    let p = 2.0 * (1.0 - 0.5 * (1.0 + libm::erf(z / std::f64::consts::SQRT_2)));
+    (t, p)
+}
+
+/// Thin wrapper returning only the two-sided p-value from [`welch_t`].
+pub fn welch_p(a: &[f64], b: &[f64]) -> f64 {
+    welch_t(a, b).1
+}
+
 // ── Family summary + stratified sampling (Stage E) ────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -2,20 +2,33 @@
 #[allow(dead_code)]
 mod bin_common;
 
-use clap::Parser;
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::time::Instant;
-
 #[path = "../skelot_common.rs"]
 #[allow(dead_code)]
 mod skelot_common;
 
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use clap::Parser;
+use op_revm::transaction::OpTransaction;
+use op_revm::DefaultOp;
+use revm::database::EmptyDB;
+use revm::handler::{EvmTr, FrameResult, Handler, ItemOrResult};
 use revm::primitives::B256;
-use revmc::skeleton::{analyze_skeleton_group_with_mode, ClassifyMode};
+use revmc::skeleton::{
+    analyze_skeleton_group_with_mode, build_data_table, ClassifyMode, SkeletonVariance,
+};
 use revmc::OptimizationLevel;
+use revmc_context::{EvmCompilerFn, RawEvmCompilerFn};
+use serde::{Deserialize, Serialize};
+
+use bin_common::{
+    build_op_cfg, build_op_tx, build_tx_index, extract_gas, BenchError, BenchEvm, BinLoader, OpCtx,
+};
 use skelot_common::{
-    collect_bytecodes, compile_per_hash, compile_skeleton_group, stratified_family_sample,
+    collect_bytecodes, compile_per_hash, compile_skeleton_group, stratified_family_sample, welch_p,
     FamilySummary,
 };
 
@@ -39,7 +52,7 @@ struct Args {
     /// Exec warmup rounds.
     #[arg(long, default_value_t = 50)]
     warmup: usize,
-    /// Welch alpha.
+    /// Welch alpha (reserved, recorded in meta).
     #[arg(long, default_value_t = 0.05)]
     alpha: f64,
     /// Deterministic seed (reserved).
@@ -51,9 +64,10 @@ struct Args {
     /// Number of blocks to scan from `start_block`.
     #[arg(long, default_value_t = 10000)]
     block_count: u64,
-    /// Max resolved bytecodes per family for the compile phase. per_hash cost
-    /// scales linearly with this; SkelOT / all_variant compile once per family
-    /// regardless. Truncation is deterministic (sorted by hash).
+    /// Max resolved bytecodes per family for the compile phase and dispatch
+    /// target set. per_hash compile cost scales linearly with this; SkelOT /
+    /// all_variant compile once per family regardless. Truncation is
+    /// deterministic (sorted by hash lex).
     #[arg(long, default_value_t = 128)]
     compile_members_cap: usize,
     /// Output JSON path.
@@ -78,7 +92,7 @@ fn load_stage_a_families(families_path: &std::path::Path) -> anyhow::Result<Vec<
     let tsv_path = families_path.with_file_name("skeleton_mapping.tsv");
     let tsv = std::fs::read_to_string(&tsv_path)
         .map_err(|e| anyhow::anyhow!("read {}: {e}", tsv_path.display()))?;
-    let mut by_skel: std::collections::HashMap<String, Vec<String>> = Default::default();
+    let mut by_skel: HashMap<String, Vec<String>> = HashMap::new();
     for line in tsv.lines() {
         let mut it = line.split('\t');
         if let (Some(s), Some(h)) = (it.next(), it.next()) {
@@ -130,83 +144,432 @@ fn count_push_immediates(bytecode: &[u8]) -> usize {
     n
 }
 
-fn load_family_bytecodes(
-    all_codes: &std::collections::HashMap<B256, Vec<u8>>,
+fn resolve_family_members(
+    all_codes: &HashMap<B256, Vec<u8>>,
     fam: &FamilySummary,
-    cap: usize,
-) -> Vec<Vec<u8>> {
+) -> Vec<(String, B256, Vec<u8>)> {
     use std::str::FromStr;
-    let mut resolved: Vec<(String, Vec<u8>)> = fam
-        .member_hashes
+    fam.member_hashes
         .iter()
         .filter_map(|h| {
             let key = B256::from_str(h.trim_start_matches("0x")).ok()?;
             let code = all_codes.get(&key)?;
-            Some((h.clone(), code.clone()))
+            Some((h.clone(), key, code.clone()))
         })
-        .collect();
-    resolved.sort_by(|a, b| a.0.cmp(&b.0));
-    resolved.truncate(cap);
-    resolved.into_iter().map(|(_, v)| v).collect()
+        .collect()
+}
+
+/// Cap deterministically: members with txs in corpus first (sorted by
+/// (earliest block, tx_index)), then fill remainder by hash-sort. Guarantees
+/// at least one capped member has a tx if the family has any observations.
+fn cap_members(
+    resolved: Vec<(String, B256, Vec<u8>)>,
+    tx_index: &HashMap<B256, (u64, usize)>,
+    cap: usize,
+) -> Vec<(B256, Vec<u8>)> {
+    let mut with_tx: Vec<(u64, usize, String, B256, Vec<u8>)> = Vec::new();
+    let mut without_tx: Vec<(String, B256, Vec<u8>)> = Vec::new();
+    for (hstr, key, code) in resolved {
+        match tx_index.get(&key) {
+            Some(&(bn, ti)) => with_tx.push((bn, ti, hstr, key, code)),
+            None => without_tx.push((hstr, key, code)),
+        }
+    }
+    with_tx.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    without_tx.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out: Vec<(B256, Vec<u8>)> = with_tx.into_iter().map(|(_, _, _, h, v)| (h, v)).collect();
+    if out.len() < cap {
+        let need = cap - out.len();
+        out.extend(without_tx.into_iter().take(need).map(|(_, h, v)| (h, v)));
+    } else {
+        out.truncate(cap);
+    }
+    out
+}
+
+/// Per-hash artifact map keyed by code hash.
+struct PerHashArtifact {
+    hash: B256,
+    lib: PathBuf,
+    symbol: String,
 }
 
 fn compile_per_hash_mode(
-    bytecodes: &[Vec<u8>],
-    tmp_dir: &std::path::Path,
-) -> anyhow::Result<CompileMetrics> {
+    members: &[(B256, Vec<u8>)],
+    tmp_dir: &Path,
+) -> anyhow::Result<(CompileMetrics, Vec<PerHashArtifact>)> {
     let t = Instant::now();
     let mut so_bytes = 0u64;
-    for (i, bc) in bytecodes.iter().enumerate() {
+    let mut arts = Vec::with_capacity(members.len());
+    for (i, (hash, bc)) in members.iter().enumerate() {
+        let symbol = format!("ph_{i}");
         let obj = tmp_dir.join(format!("per_hash_{i}.o"));
         let lib = tmp_dir.join(format!("per_hash_{i}.so"));
-        compile_per_hash(bc, &format!("ph_{i}"), &obj, &lib, OPT)
+        compile_per_hash(bc, &symbol, &obj, &lib, OPT)
             .map_err(|e| anyhow::anyhow!("compile_per_hash: {e}"))?;
         so_bytes += std::fs::metadata(&lib)?.len();
+        arts.push(PerHashArtifact { hash: *hash, lib, symbol });
     }
-    let total_push = bytecodes.first().map(|bc| count_push_immediates(bc) as u32).unwrap_or(0);
-    Ok(CompileMetrics {
-        compile_time_ms: t.elapsed().as_secs_f64() * 1000.0,
-        so_bytes,
-        num_variant: 0,
-        num_invariant: total_push,
-        num_skip_logic_preserved: 0,
-    })
+    let total_push = members.first().map(|(_, bc)| count_push_immediates(bc) as u32).unwrap_or(0);
+    Ok((
+        CompileMetrics {
+            compile_time_ms: t.elapsed().as_secs_f64() * 1000.0,
+            so_bytes,
+            num_variant: 0,
+            num_invariant: total_push,
+            num_skip_logic_preserved: 0,
+        },
+        arts,
+    ))
+}
+
+struct SkeletonArtifact {
+    lib: PathBuf,
+    symbol: String,
+    variance: SkeletonVariance,
 }
 
 fn compile_skeleton_mode(
-    bytecodes: &[Vec<u8>],
+    members: &[(B256, Vec<u8>)],
     mode: ClassifyMode,
-    tmp_dir: &std::path::Path,
+    tmp_dir: &Path,
     tag: &str,
-) -> anyhow::Result<(CompileMetrics, revmc::skeleton::SkeletonVariance)> {
-    let refs: Vec<&[u8]> = bytecodes.iter().map(|v| v.as_slice()).collect();
+) -> anyhow::Result<(CompileMetrics, SkeletonArtifact)> {
+    let refs: Vec<&[u8]> = members.iter().map(|(_, v)| v.as_slice()).collect();
     let variance = analyze_skeleton_group_with_mode(&refs, mode);
     let obj = tmp_dir.join(format!("{tag}.o"));
     let lib = tmp_dir.join(format!("{tag}.so"));
     let t = Instant::now();
-    compile_skeleton_group(&bytecodes[0], &variance, tag, &obj, &lib, OPT)
+    compile_skeleton_group(&members[0].1, &variance, tag, &obj, &lib, OPT)
         .map_err(|e| anyhow::anyhow!("compile_skeleton_group: {e}"))?;
-    let ct = t.elapsed().as_secs_f64() * 1000.0;
+    let compile_time_ms = t.elapsed().as_secs_f64() * 1000.0;
     let so_bytes = std::fs::metadata(&lib)?.len();
     let num_total = variance.pushes.len() as u32;
     let num_invariant = num_total - variance.num_variant;
-    // Only ForceAllVariant keeps PUSHes Invariant *because* of SKIP_LOGIC.
-    // In Auto mode an Invariant may also come from cross-family equality, so
-    // we cannot attribute them to SKIP_LOGIC here — report 0.
     let num_skip_logic_preserved = match mode {
         ClassifyMode::ForceAllVariant => num_invariant,
         ClassifyMode::Auto => 0,
     };
     Ok((
         CompileMetrics {
-            compile_time_ms: ct,
+            compile_time_ms,
             so_bytes,
             num_variant: variance.num_variant,
             num_invariant,
             num_skip_logic_preserved,
         },
-        variance,
+        SkeletonArtifact { lib, symbol: tag.to_string(), variance },
     ))
+}
+
+// ── Dispatch / TimingHandlers (adapted from skeleton_vs_perhash_bench.rs) ─
+
+fn load_raw_fn(
+    path: &Path,
+    symbol: &str,
+) -> Result<(RawEvmCompilerFn, libloading::Library), String> {
+    let library = unsafe { libloading::Library::new(path) }.map_err(|e| format!("dlopen: {e}"))?;
+    let sym = unsafe { library.get::<RawEvmCompilerFn>(symbol.as_bytes()) }
+        .map_err(|e| format!("dlsym: {e}"))?;
+    let function = *sym;
+    drop(sym);
+    Ok((function, library))
+}
+
+/// Per-hash dispatch: one RawEvmCompilerFn per code hash, each backed by its
+/// own .so. Handler calls `f.call_with_interpreter(...)` (no data pointer).
+struct TimingPerHashHandler {
+    functions: Arc<HashMap<B256, RawEvmCompilerFn>>,
+    target_hashes: Arc<HashSet<B256>>,
+    total_ns: u128,
+}
+
+impl Handler for TimingPerHashHandler {
+    type Evm = BenchEvm;
+    type Error = BenchError;
+    type HaltReason = op_revm::OpHaltReason;
+
+    fn run_exec_loop(
+        &mut self,
+        evm: &mut Self::Evm,
+        first_frame_input: revm::interpreter::interpreter_action::FrameInit,
+    ) -> Result<FrameResult, Self::Error> {
+        let res = evm.frame_init(first_frame_input)?;
+        if let ItemOrResult::Result(frame_result) = res {
+            return Ok(frame_result);
+        }
+        loop {
+            let call_or_result = self.run_frame(evm)?;
+            let result = match call_or_result {
+                ItemOrResult::Item(init) => match evm.frame_init(init)? {
+                    ItemOrResult::Item(_) => continue,
+                    ItemOrResult::Result(result) => result,
+                },
+                ItemOrResult::Result(result) => result,
+            };
+            if let Some(result) = evm.frame_return_result(result)? {
+                return Ok(result);
+            }
+        }
+    }
+}
+
+impl TimingPerHashHandler {
+    fn run_frame(
+        &mut self,
+        evm: &mut BenchEvm,
+    ) -> Result<
+        ItemOrResult<revm::interpreter::interpreter_action::FrameInit, FrameResult>,
+        BenchError,
+    > {
+        let (ctx, frame_stack) = (&mut evm.0.ctx, &mut evm.0.frame_stack);
+        let frame = frame_stack.get();
+        if !bin_common::should_lookup_jit(
+            frame.data.is_create(),
+            frame.interpreter.input.bytecode_address,
+            frame.interpreter.bytecode.is_empty(),
+        ) {
+            drop((ctx, frame_stack));
+            return Ok(evm.frame_run()?);
+        }
+        let hash = frame.interpreter.bytecode.get_or_calculate_hash();
+        let is_target = self.target_hashes.contains(&hash);
+        if let Some(&raw_fn) = self.functions.get(&hash) {
+            let f = EvmCompilerFn::new(raw_fn);
+            let t0 = if is_target { Some(Instant::now()) } else { None };
+            let action = unsafe { f.call_with_interpreter(&mut frame.interpreter, ctx) };
+            if let Some(t0) = t0 {
+                self.total_ns += t0.elapsed().as_nanos();
+            }
+            let result = frame.process_next_action::<_, BenchError>(ctx, action).inspect(|i| {
+                if i.is_result() {
+                    frame.set_finished(true);
+                }
+            })?;
+            Ok(result)
+        } else {
+            drop((ctx, frame_stack));
+            Ok(evm.frame_run()?)
+        }
+    }
+}
+
+/// Skeleton dispatch: single shared EvmCompilerFn, per-hash data table.
+struct TimingSkeletonHandler {
+    dispatch: Arc<HashMap<B256, (EvmCompilerFn, Vec<u8>)>>,
+    target_hashes: Arc<HashSet<B256>>,
+    total_ns: u128,
+}
+
+impl Handler for TimingSkeletonHandler {
+    type Evm = BenchEvm;
+    type Error = BenchError;
+    type HaltReason = op_revm::OpHaltReason;
+
+    fn run_exec_loop(
+        &mut self,
+        evm: &mut Self::Evm,
+        first_frame_input: revm::interpreter::interpreter_action::FrameInit,
+    ) -> Result<FrameResult, Self::Error> {
+        let res = evm.frame_init(first_frame_input)?;
+        if let ItemOrResult::Result(frame_result) = res {
+            return Ok(frame_result);
+        }
+        loop {
+            let call_or_result = self.run_frame(evm)?;
+            let result = match call_or_result {
+                ItemOrResult::Item(init) => match evm.frame_init(init)? {
+                    ItemOrResult::Item(_) => continue,
+                    ItemOrResult::Result(result) => result,
+                },
+                ItemOrResult::Result(result) => result,
+            };
+            if let Some(result) = evm.frame_return_result(result)? {
+                return Ok(result);
+            }
+        }
+    }
+}
+
+impl TimingSkeletonHandler {
+    fn run_frame(
+        &mut self,
+        evm: &mut BenchEvm,
+    ) -> Result<
+        ItemOrResult<revm::interpreter::interpreter_action::FrameInit, FrameResult>,
+        BenchError,
+    > {
+        let (ctx, frame_stack) = (&mut evm.0.ctx, &mut evm.0.frame_stack);
+        let frame = frame_stack.get();
+        if !bin_common::should_lookup_jit(
+            frame.data.is_create(),
+            frame.interpreter.input.bytecode_address,
+            frame.interpreter.bytecode.is_empty(),
+        ) {
+            drop((ctx, frame_stack));
+            return Ok(evm.frame_run()?);
+        }
+        let hash = frame.interpreter.bytecode.get_or_calculate_hash();
+        let is_target = self.target_hashes.contains(&hash);
+        if let Some((skel_fn, table)) = self.dispatch.get(&hash) {
+            let t0 = if is_target { Some(Instant::now()) } else { None };
+            let action = unsafe {
+                skel_fn.call_with_interpreter_data(&mut frame.interpreter, ctx, table.as_ptr())
+            };
+            if let Some(t0) = t0 {
+                self.total_ns += t0.elapsed().as_nanos();
+            }
+            let result = frame.process_next_action::<_, BenchError>(ctx, action).inspect(|i| {
+                if i.is_result() {
+                    frame.set_finished(true);
+                }
+            })?;
+            Ok(result)
+        } else {
+            drop((ctx, frame_stack));
+            Ok(evm.frame_run()?)
+        }
+    }
+}
+
+fn replay_block<F: FnMut(&mut BenchEvm) -> (bool, u64)>(
+    loader: &BinLoader,
+    chain_id: Option<u64>,
+    mut run_tx: F,
+) {
+    let cfg = build_op_cfg(chain_id);
+    let dummy_tx = OpTransaction::builder().build_fill();
+    let mut evm: BenchEvm = {
+        let ctx =
+            OpCtx::<EmptyDB>::op().with_cfg(cfg).with_db(loader.build_cache_db()).with_tx(dummy_tx);
+        op_revm::OpEvm::new(ctx, ())
+    };
+    for tx_bin in loader.raw_txs() {
+        if tx_bin.tx_type == 0x7e {
+            continue;
+        }
+        evm.0.ctx.tx = build_op_tx(tx_bin);
+        let _ = run_tx(&mut evm);
+    }
+}
+
+fn exec_per_hash(
+    loader: &BinLoader,
+    chain_id: Option<u64>,
+    functions: &Arc<HashMap<B256, RawEvmCompilerFn>>,
+    target: &Arc<HashSet<B256>>,
+    rounds: usize,
+    warmup: usize,
+) -> Vec<f64> {
+    for _ in 0..warmup {
+        let mut h = TimingPerHashHandler {
+            functions: functions.clone(),
+            target_hashes: target.clone(),
+            total_ns: 0,
+        };
+        replay_block(loader, chain_id, |evm| match h.run(evm) {
+            Ok(rr) => extract_gas(&rr),
+            Err(_) => (false, 0),
+        });
+    }
+    let mut samples = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        let mut h = TimingPerHashHandler {
+            functions: functions.clone(),
+            target_hashes: target.clone(),
+            total_ns: 0,
+        };
+        replay_block(loader, chain_id, |evm| match h.run(evm) {
+            Ok(rr) => extract_gas(&rr),
+            Err(_) => (false, 0),
+        });
+        samples.push(h.total_ns as f64);
+    }
+    samples
+}
+
+fn exec_skeleton(
+    loader: &BinLoader,
+    chain_id: Option<u64>,
+    dispatch: &Arc<HashMap<B256, (EvmCompilerFn, Vec<u8>)>>,
+    target: &Arc<HashSet<B256>>,
+    rounds: usize,
+    warmup: usize,
+) -> Vec<f64> {
+    for _ in 0..warmup {
+        let mut h = TimingSkeletonHandler {
+            dispatch: dispatch.clone(),
+            target_hashes: target.clone(),
+            total_ns: 0,
+        };
+        replay_block(loader, chain_id, |evm| match h.run(evm) {
+            Ok(rr) => extract_gas(&rr),
+            Err(_) => (false, 0),
+        });
+    }
+    let mut samples = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        let mut h = TimingSkeletonHandler {
+            dispatch: dispatch.clone(),
+            target_hashes: target.clone(),
+            total_ns: 0,
+        };
+        replay_block(loader, chain_id, |evm| match h.run(evm) {
+            Ok(rr) => extract_gas(&rr),
+            Err(_) => (false, 0),
+        });
+        samples.push(h.total_ns as f64);
+    }
+    samples
+}
+
+fn summarize(samples: &[f64]) -> (f64, f64, f64, f64) {
+    if samples.is_empty() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    let mut s = samples.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = s.len();
+    let median = s[n / 2];
+    let p5 = s[((n as f64 * 0.05) as usize).min(n - 1)];
+    let p95 = s[((n as f64 * 0.95) as usize).min(n - 1)];
+    let mean = s.iter().sum::<f64>() / n as f64;
+    let var = s.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n as f64 - 1.0).max(1.0);
+    (median, p5, p95, var.sqrt())
+}
+
+fn flat_mode(cm: &CompileMetrics, samples: &[f64], baseline: Option<&[f64]>) -> serde_json::Value {
+    let (median, p5, p95, sd) = summarize(samples);
+    let welch =
+        baseline.map(
+            |b| {
+                if samples.is_empty() || b.is_empty() {
+                    0.0
+                } else {
+                    welch_p(samples, b)
+                }
+            },
+        );
+    serde_json::json!({
+        "compile_time_ms": cm.compile_time_ms,
+        "so_bytes": cm.so_bytes,
+        "num_variant": cm.num_variant,
+        "num_invariant": cm.num_invariant,
+        "num_skip_logic_preserved": cm.num_skip_logic_preserved,
+        "exec_median_ns": median,
+        "exec_p5_ns": p5,
+        "exec_p95_ns": p95,
+        "exec_stdev_ns": sd,
+        "welch_p_vs_skelot": welch,
+    })
+}
+
+fn geomean(xs: &[f64]) -> f64 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    let log_sum: f64 = xs.iter().map(|v| v.max(1e-12).ln()).sum();
+    (log_sum / xs.len() as f64).exp()
 }
 
 fn main() -> anyhow::Result<()> {
@@ -223,23 +586,43 @@ fn main() -> anyhow::Result<()> {
         args.start_block + args.block_count
     );
 
+    // Two-phase cap: resolve ALL family members, build tx-index over them, then
+    // cap preferring members with txs in corpus. Guarantees the capped set has
+    // a rep whenever the family has any observed txs.
+    let resolved_per_family: Vec<Vec<(String, B256, Vec<u8>)>> =
+        sampled.iter().map(|fam| resolve_family_members(&all_codes, fam)).collect();
+    let mut wanted: HashSet<B256> = HashSet::new();
+    for r in &resolved_per_family {
+        for (_, h, _) in r {
+            wanted.insert(*h);
+        }
+    }
+    eprintln!("Building tx-index over {} resolved member hashes...", wanted.len());
+    let tx_index = build_tx_index(&args.bench_dir, args.start_block, args.block_count, &wanted);
+    eprintln!("tx-index resolved {}/{} hashes", tx_index.len(), wanted.len());
+
+    let family_members: Vec<Vec<(B256, Vec<u8>)>> = resolved_per_family
+        .into_iter()
+        .map(|r| cap_members(r, &tx_index, args.compile_members_cap))
+        .collect();
+
     let tmp_root = tempfile::tempdir()?;
     let mut fam_rows = Vec::<serde_json::Value>::new();
-    for (idx, fam) in sampled.iter().enumerate() {
-        let bytecodes = load_family_bytecodes(&all_codes, fam, args.compile_members_cap);
-        if bytecodes.is_empty() {
+
+    for (idx, (fam, members)) in sampled.iter().zip(family_members.iter()).enumerate() {
+        if members.is_empty() {
             eprintln!("[skip] family {}: no bytecodes resolved from corpus", fam.skeleton_id);
             continue;
         }
-
         let fam_tmp = tmp_root.path().join(&fam.skeleton_id);
         std::fs::create_dir_all(&fam_tmp)?;
 
-        let per_hash = compile_per_hash_mode(&bytecodes, &fam_tmp)?;
-        let (skelot, _var_auto) =
-            compile_skeleton_mode(&bytecodes, ClassifyMode::Auto, &fam_tmp, "skelot_auto")?;
-        let (all_variant, _var_forced) = compile_skeleton_mode(
-            &bytecodes,
+        // ── Compile (3 modes) ─────────────────────────────────────────────
+        let (per_hash, ph_arts) = compile_per_hash_mode(members, &fam_tmp)?;
+        let (skelot, sk_art) =
+            compile_skeleton_mode(members, ClassifyMode::Auto, &fam_tmp, "skelot_auto")?;
+        let (all_variant, av_art) = compile_skeleton_mode(
+            members,
             ClassifyMode::ForceAllVariant,
             &fam_tmp,
             "skelot_forced",
@@ -253,16 +636,181 @@ fn main() -> anyhow::Result<()> {
             _ => "huge",
         };
 
+        // ── Pick representative block: earliest tx-index entry in family ──
+        let rep_block: Option<u64> =
+            members.iter().filter_map(|(h, _)| tx_index.get(h).map(|(bn, _)| *bn)).min();
+
+        let (ph_samples, sk_samples, av_samples): (Vec<f64>, Vec<f64>, Vec<f64>) = if let Some(bn) =
+            rep_block
+        {
+            match BinLoader::new(&args.bench_dir, bn) {
+                Ok(loader) => {
+                    let chain_id = loader.raw_txs().first().and_then(|tx| tx.chain_id);
+
+                    // Load .so files
+                    let mut per_hash_fns: HashMap<B256, RawEvmCompilerFn> = HashMap::new();
+                    let mut _ph_libs: Vec<libloading::Library> = Vec::new();
+                    for art in &ph_arts {
+                        match load_raw_fn(&art.lib, &art.symbol) {
+                            Ok((f, lib)) => {
+                                per_hash_fns.insert(art.hash, f);
+                                _ph_libs.push(lib);
+                            }
+                            Err(e) => {
+                                eprintln!("  dlopen per_hash {}: {e}", hex::encode(&art.hash[..4]))
+                            }
+                        }
+                    }
+
+                    let (sk_fn, _sk_lib) = load_raw_fn(&sk_art.lib, &sk_art.symbol)
+                        .map_err(|e| anyhow::anyhow!("dlopen skelot_auto: {e}"))?;
+                    let sk_ecf = EvmCompilerFn::new(sk_fn);
+                    let mut sk_dispatch: HashMap<B256, (EvmCompilerFn, Vec<u8>)> = HashMap::new();
+                    for (h, bc) in members {
+                        let table = build_data_table(bc, &sk_art.variance);
+                        sk_dispatch.insert(*h, (sk_ecf, table.data));
+                    }
+
+                    let (av_fn, _av_lib) = load_raw_fn(&av_art.lib, &av_art.symbol)
+                        .map_err(|e| anyhow::anyhow!("dlopen skelot_forced: {e}"))?;
+                    let av_ecf = EvmCompilerFn::new(av_fn);
+                    let mut av_dispatch: HashMap<B256, (EvmCompilerFn, Vec<u8>)> = HashMap::new();
+                    for (h, bc) in members {
+                        let table = build_data_table(bc, &av_art.variance);
+                        av_dispatch.insert(*h, (av_ecf, table.data));
+                    }
+
+                    let target: HashSet<B256> = members.iter().map(|(h, _)| *h).collect();
+                    let target = Arc::new(target);
+                    let per_hash_fns = Arc::new(per_hash_fns);
+                    let sk_dispatch = Arc::new(sk_dispatch);
+                    let av_dispatch = Arc::new(av_dispatch);
+
+                    let ph = exec_per_hash(
+                        &loader,
+                        chain_id,
+                        &per_hash_fns,
+                        &target,
+                        args.rounds,
+                        args.warmup,
+                    );
+                    let sk = exec_skeleton(
+                        &loader,
+                        chain_id,
+                        &sk_dispatch,
+                        &target,
+                        args.rounds,
+                        args.warmup,
+                    );
+                    let av = exec_skeleton(
+                        &loader,
+                        chain_id,
+                        &av_dispatch,
+                        &target,
+                        args.rounds,
+                        args.warmup,
+                    );
+
+                    // Drop dispatch/Arc BEFORE _libs go out of scope to keep
+                    // function pointers valid during the replay (guaranteed
+                    // by Arc ordering — libs live to end of scope).
+                    drop(per_hash_fns);
+                    drop(sk_dispatch);
+                    drop(av_dispatch);
+                    drop(target);
+                    (ph, sk, av)
+                }
+                Err(e) => {
+                    eprintln!("[exec-skip] family {} block {bn} loader: {e}", fam.skeleton_id);
+                    (Vec::new(), Vec::new(), Vec::new())
+                }
+            }
+        } else {
+            eprintln!(
+                "[exec-skip] family {} has no capped member with a tx in corpus",
+                fam.skeleton_id
+            );
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+
+        // ── Flatten ───────────────────────────────────────────────────────
+        let ph_row = flat_mode(&per_hash, &ph_samples, Some(&sk_samples));
+        let sk_row = flat_mode(&skelot, &sk_samples, None);
+        let av_row = flat_mode(&all_variant, &av_samples, Some(&sk_samples));
+
         fam_rows.push(serde_json::json!({
             "skeleton_id": fam.skeleton_id,
             "bucket": bucket_name,
             "member_count": fam.member_count,
-            "members_compiled": bytecodes.len(),
-            "per_hash": { "compile": per_hash },
-            "skelot": { "compile": skelot },
-            "all_variant": { "compile": all_variant },
+            "members_compiled": members.len(),
+            "per_hash": ph_row,
+            "skelot": sk_row,
+            "all_variant": av_row,
         }));
-        eprintln!("[{}/{}] {} compiled", idx + 1, sampled.len(), fam.skeleton_id);
+        eprintln!(
+            "[{}/{}] {} done (rep_block={:?}, samples=[ph={}, sk={}, av={}])",
+            idx + 1,
+            sampled.len(),
+            fam.skeleton_id,
+            rep_block,
+            ph_samples.len(),
+            sk_samples.len(),
+            av_samples.len()
+        );
+    }
+
+    // ── Bucket aggregates ─────────────────────────────────────────────────
+    let mut by_bucket: std::collections::BTreeMap<String, Vec<&serde_json::Value>> =
+        Default::default();
+    for row in &fam_rows {
+        let b = row["bucket"].as_str().unwrap_or("?").to_string();
+        by_bucket.entry(b).or_default().push(row);
+    }
+    let mut aggregates = Vec::new();
+    for (bucket, rows) in by_bucket {
+        let ct: Vec<f64> = rows
+            .iter()
+            .map(|r| {
+                r["all_variant"]["compile_time_ms"].as_f64().unwrap_or(0.0)
+                    / r["skelot"]["compile_time_ms"].as_f64().unwrap_or(1e-9).max(1e-9)
+            })
+            .collect();
+        let so: Vec<f64> = rows
+            .iter()
+            .map(|r| {
+                r["all_variant"]["so_bytes"].as_f64().unwrap_or(0.0)
+                    / r["skelot"]["so_bytes"].as_f64().unwrap_or(1.0).max(1.0)
+            })
+            .collect();
+        let ex: Vec<f64> = rows
+            .iter()
+            .filter_map(|r| {
+                let av = r["all_variant"]["exec_median_ns"].as_f64()?;
+                let sk = r["skelot"]["exec_median_ns"].as_f64()?;
+                if sk > 0.0 {
+                    Some(av / sk)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut ps: Vec<f64> = rows
+            .iter()
+            .filter_map(|r| r["all_variant"]["welch_p_vs_skelot"].as_f64())
+            .filter(|v| !v.is_nan())
+            .collect();
+        ps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p_med = if ps.is_empty() { 1.0 } else { ps[ps.len() / 2] };
+
+        aggregates.push(serde_json::json!({
+            "bucket": bucket,
+            "n": rows.len(),
+            "compile_time_geomean_ratio_allvariant_over_skelot": geomean(&ct),
+            "so_bytes_geomean_ratio_allvariant_over_skelot": geomean(&so),
+            "exec_median_geomean_ratio_allvariant_over_skelot":
+                if ex.is_empty() { 0.0 } else { geomean(&ex) },
+            "welch_p_median": p_med,
+        }));
     }
 
     let out = serde_json::json!({
@@ -278,9 +826,11 @@ fn main() -> anyhow::Result<()> {
             "compile_members_cap": args.compile_members_cap,
         },
         "families": fam_rows,
-        "bucket_aggregates": [],
+        "bucket_aggregates": aggregates,
     });
     std::fs::write(&args.out, serde_json::to_string_pretty(&out)?)?;
     eprintln!("Wrote output to {}", args.out.display());
+    // _ vars (Duration, libloading libs) cleaned up by scope.
+    let _ = Duration::from_secs(0);
     Ok(())
 }

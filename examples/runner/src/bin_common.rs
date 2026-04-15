@@ -10,18 +10,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use op_revm::{DefaultOp, OpEvm, OpHaltReason, OpSpecId, OpTransactionError};
 use op_revm::transaction::OpTransaction;
+use op_revm::{DefaultOp, OpEvm, OpHaltReason, OpSpecId, OpTransactionError};
 use revm::{
     bytecode::Bytecode,
     context::{CfgEnv, TxEnv},
     context_interface::result::{EVMError, ExecutionResult},
     database::{CacheDB, EmptyDB},
     handler::{EvmTr, FrameResult, Handler, ItemOrResult},
-    primitives::{
-        hardfork::SpecId, Address, Bytes, HashMap as RevmHashMap,
-        TxKind, B256, U256,
-    },
+    primitives::{hardfork::SpecId, Address, Bytes, HashMap as RevmHashMap, TxKind, B256, U256},
     state::AccountInfo,
 };
 use revmc::{EvmCompiler, EvmLlvmBackend, OptimizationLevel};
@@ -209,8 +206,7 @@ impl BinLoader {
         let snapshot: CacheSnapshot = bincode::deserialize(&snapshot_data)
             .map_err(|e| format!("deserialize states/{block_number}.bin: {e}"))?;
 
-        let txs_data =
-            std::fs::read(&txs_path).map_err(|e| format!("read {:?}: {e}", txs_path))?;
+        let txs_data = std::fs::read(&txs_path).map_err(|e| format!("read {:?}: {e}", txs_path))?;
         let block_bin: BlockBin = bincode::deserialize(&txs_data)
             .map_err(|e| format!("deserialize txs/{block_number}.bin: {e}"))?;
 
@@ -413,13 +409,11 @@ pub fn run_jit_or_native(
         }
         let f = EvmCompilerFn::new(raw_fn);
         let action = unsafe { f.call_with_interpreter(&mut frame.interpreter, ctx) };
-        let result = frame
-            .process_next_action::<_, BenchError>(ctx, action)
-            .inspect(|i| {
-                if i.is_result() {
-                    frame.set_finished(true);
-                }
-            })?;
+        let result = frame.process_next_action::<_, BenchError>(ctx, action).inspect(|i| {
+            if i.is_result() {
+                frame.set_finished(true);
+            }
+        })?;
         Ok(result)
     } else {
         if collect_stats {
@@ -465,9 +459,7 @@ pub fn compile_all_contracts(code_values: &HashMap<B256, Bytecode>) -> CompiledC
     contracts.sort_by_key(|(_, bc)| std::cmp::Reverse(bc.original_byte_slice().len()));
 
     let empty_count = code_values.len() - contracts.len();
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get().min(16))
-        .unwrap_or(4);
+    let n_threads = std::thread::available_parallelism().map(|n| n.get().min(16)).unwrap_or(4);
     eprintln!(
         "  Using {n_threads} threads for {}/{} contracts ({empty_count} empty)",
         contracts.len(),
@@ -479,63 +471,53 @@ pub fn compile_all_contracts(code_values: &HashMap<B256, Bytecode>) -> CompiledC
         assignments[i % n_threads].push(contract);
     }
 
-    let thread_results: Vec<(HashMap<B256, RawEvmCompilerFn>, usize)> =
-        std::thread::scope(|s| {
-            let handles: Vec<_> = assignments
-                .into_iter()
-                .enumerate()
-                .map(|(tid, chunk)| {
-                    s.spawn(move || {
-                        let context = Box::leak(Box::new(
-                            revmc::llvm::inkwell::context::Context::create(),
-                        ));
-                        let backend =
-                            EvmLlvmBackend::new(context, false, OptimizationLevel::Aggressive)
-                                .expect("LLVM backend");
-                        let compiler: &'static mut EvmCompiler<EvmLlvmBackend<'static>> =
-                            Box::leak(Box::new(EvmCompiler::new(backend)));
+    let thread_results: Vec<(HashMap<B256, RawEvmCompilerFn>, usize)> = std::thread::scope(|s| {
+        let handles: Vec<_> = assignments
+            .into_iter()
+            .enumerate()
+            .map(|(tid, chunk)| {
+                s.spawn(move || {
+                    let context =
+                        Box::leak(Box::new(revmc::llvm::inkwell::context::Context::create()));
+                    let backend =
+                        EvmLlvmBackend::new(context, false, OptimizationLevel::Aggressive)
+                            .expect("LLVM backend");
+                    let compiler: &'static mut EvmCompiler<EvmLlvmBackend<'static>> =
+                        Box::leak(Box::new(EvmCompiler::new(backend)));
 
-                        let mut pending = Vec::new();
-                        let mut skipped = 0usize;
-                        for (hash, bytecode) in &chunk {
-                            let name = format!("c_{}", hex::encode(&hash.as_slice()[..8]));
-                            match compiler.translate(
-                                &name,
-                                bytecode.original_byte_slice(),
-                                ETH_SPEC,
-                            ) {
-                                Ok(func_id) => pending.push((*hash, func_id)),
-                                Err(e) => {
-                                    eprintln!("  [T{tid}] WARN translate: {name}: {e}");
-                                    skipped += 1;
-                                }
+                    let mut pending = Vec::new();
+                    let mut skipped = 0usize;
+                    for (hash, bytecode) in &chunk {
+                        let name = format!("c_{}", hex::encode(&hash.as_slice()[..8]));
+                        match compiler.translate(&name, bytecode.original_byte_slice(), ETH_SPEC) {
+                            Ok(func_id) => pending.push((*hash, func_id)),
+                            Err(e) => {
+                                eprintln!("  [T{tid}] WARN translate: {name}: {e}");
+                                skipped += 1;
                             }
                         }
+                    }
 
-                        let mut functions = HashMap::with_capacity(pending.len());
-                        for (hash, func_id) in pending {
-                            match unsafe { compiler.jit_function(func_id) } {
-                                Ok(fn_ptr) => {
-                                    functions.insert(hash, fn_ptr.into_inner());
-                                }
-                                Err(e) => {
-                                    let short = hex::encode(&hash.as_slice()[..4]);
-                                    eprintln!("  [T{tid}] WARN JIT: {short}: {e}");
-                                    skipped += 1;
-                                }
+                    let mut functions = HashMap::with_capacity(pending.len());
+                    for (hash, func_id) in pending {
+                        match unsafe { compiler.jit_function(func_id) } {
+                            Ok(fn_ptr) => {
+                                functions.insert(hash, fn_ptr.into_inner());
+                            }
+                            Err(e) => {
+                                let short = hex::encode(&hash.as_slice()[..4]);
+                                eprintln!("  [T{tid}] WARN JIT: {short}: {e}");
+                                skipped += 1;
                             }
                         }
-                        eprintln!(
-                            "  [T{tid}] done: {}/{} compiled",
-                            functions.len(),
-                            chunk.len()
-                        );
-                        (functions, skipped)
-                    })
+                    }
+                    eprintln!("  [T{tid}] done: {}/{} compiled", functions.len(), chunk.len());
+                    (functions, skipped)
                 })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
 
     let mut all_functions = HashMap::new();
     let mut total_skipped = empty_count;
@@ -550,10 +532,7 @@ pub fn compile_all_contracts(code_values: &HashMap<B256, Bytecode>) -> CompiledC
         code_values.len()
     );
 
-    CompiledContracts {
-        functions: Arc::new(all_functions),
-        _libraries: Vec::new(),
-    }
+    CompiledContracts { functions: Arc::new(all_functions), _libraries: Vec::new() }
 }
 
 // ── AOT Cache ───────────────────────────────────────────────────────────────
@@ -605,8 +584,8 @@ fn compile_contract_to_cache(
         std::fs::create_dir_all(parent).ok();
     }
     let context = Box::leak(Box::new(revmc::llvm::inkwell::context::Context::create()));
-    let backend = EvmLlvmBackend::new(context, true, opt)
-        .map_err(|e| format!("AOT backend: {e}"))?;
+    let backend =
+        EvmLlvmBackend::new(context, true, opt).map_err(|e| format!("AOT backend: {e}"))?;
     let mut compiler = EvmCompiler::new(backend);
     compiler
         .translate(&artifacts.symbol, bytecode.original_byte_slice(), ETH_SPEC)
@@ -630,9 +609,7 @@ fn compile_jit_fallback(
     let backend = EvmLlvmBackend::new(context, false, opt).ok()?;
     let compiler: &'static mut EvmCompiler<EvmLlvmBackend<'static>> =
         Box::leak(Box::new(EvmCompiler::new(backend)));
-    let func_id = compiler
-        .translate(&symbol, bytecode.original_byte_slice(), ETH_SPEC)
-        .ok()?;
+    let func_id = compiler.translate(&symbol, bytecode.original_byte_slice(), ETH_SPEC).ok()?;
     unsafe { compiler.jit_function(func_id).ok().map(|f| f.into_inner()) }
 }
 
@@ -679,19 +656,11 @@ pub fn compile_all_contracts_with_cache(
         }
     }
 
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get().min(16))
-        .unwrap_or(4);
-    eprintln!(
-        "  Cache: hits={hits} to_compile={} threads={n_threads}",
-        to_compile.len()
-    );
+    let n_threads = std::thread::available_parallelism().map(|n| n.get().min(16)).unwrap_or(4);
+    eprintln!("  Cache: hits={hits} to_compile={} threads={n_threads}", to_compile.len());
 
     if to_compile.is_empty() {
-        return CompiledContracts {
-            functions: Arc::new(functions),
-            _libraries: libraries,
-        };
+        return CompiledContracts { functions: Arc::new(functions), _libraries: libraries };
     }
 
     let mut assignments: Vec<Vec<(B256, &Bytecode, CacheArtifacts)>> =
@@ -750,10 +719,51 @@ pub fn compile_all_contracts_with_cache(
 
     eprintln!("  Total: {} compiled (hits={hits})", functions.len());
 
-    CompiledContracts {
-        functions: Arc::new(functions),
-        _libraries: libraries,
+    CompiledContracts { functions: Arc::new(functions), _libraries: libraries }
+}
+
+// ── Tx-index (Stage E) ──────────────────────────────────────────────────────
+
+/// Build `code_hash → (earliest block, tx_index)` over a block range, resolving
+/// `tx.to` addresses to code hashes via each block's `CacheSnapshot.accounts`.
+/// Streams blocks in order, writing only the FIRST occurrence for each wanted
+/// hash, and short-circuits when every wanted hash has been resolved.
+pub fn build_tx_index(
+    bench_dir: &Path,
+    start_block: u64,
+    block_count: u64,
+    wanted: &std::collections::HashSet<B256>,
+) -> HashMap<B256, (u64, usize)> {
+    let mut index: HashMap<B256, (u64, usize)> = HashMap::new();
+    for bn in start_block..start_block + block_count {
+        if index.len() == wanted.len() {
+            break;
+        }
+        let states_path = bench_dir.join(format!("states/{bn}.bin"));
+        let txs_path = bench_dir.join(format!("txs/{bn}.bin"));
+        let Ok(sdata) = std::fs::read(&states_path) else { continue };
+        let Ok(snapshot): Result<CacheSnapshot, _> = bincode::deserialize(&sdata) else {
+            continue;
+        };
+        let Ok(tdata) = std::fs::read(&txs_path) else { continue };
+        let Ok(block_bin): Result<BlockBin, _> = bincode::deserialize(&tdata) else { continue };
+        let mut addr_to_hash: HashMap<Address, B256> = HashMap::new();
+        for (addr, acc) in &snapshot.accounts {
+            if let Some(info) = &acc.info {
+                if wanted.contains(&info.code_hash) {
+                    addr_to_hash.insert(*addr, info.code_hash);
+                }
+            }
+        }
+        for (tx_idx, tx) in block_bin.txs.iter().enumerate() {
+            let Some(to) = tx.to else { continue };
+            let to_addr = Address::from_slice(&to);
+            if let Some(hash) = addr_to_hash.get(&to_addr) {
+                index.entry(*hash).or_insert((bn, tx_idx));
+            }
+        }
     }
+    index
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -763,10 +773,7 @@ pub fn make_evm(loader: &BinLoader, chain_id: Option<u64>) -> BenchEvm {
     let cfg = build_op_cfg(chain_id);
     let db = loader.build_cache_db();
     let dummy_tx = OpTransaction::builder().build_fill();
-    let ctx = OpCtx::<EmptyDB>::op()
-        .with_cfg(cfg)
-        .with_db(db)
-        .with_tx(dummy_tx);
+    let ctx = OpCtx::<EmptyDB>::op().with_cfg(cfg).with_db(db).with_tx(dummy_tx);
     OpEvm::new(ctx, ())
 }
 
