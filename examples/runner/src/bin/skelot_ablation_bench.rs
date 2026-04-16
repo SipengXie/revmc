@@ -25,11 +25,12 @@ use revmc_context::{EvmCompilerFn, RawEvmCompilerFn};
 use serde::{Deserialize, Serialize};
 
 use bin_common::{
-    build_op_cfg, build_op_tx, build_tx_index, extract_gas, BenchError, BenchEvm, BinLoader, OpCtx,
+    build_op_cfg, build_op_tx, build_tx_index_cached, extract_gas, BenchError, BenchEvm, BinLoader,
+    OpCtx,
 };
 use skelot_common::{
-    collect_bytecodes, compile_per_hash, compile_skeleton_group, stratified_family_sample, welch_p,
-    FamilySummary,
+    collect_bytecodes_cached, compile_per_hash, compile_skeleton_group, stratified_family_sample,
+    welch_p, FamilySummary,
 };
 
 const OPT: OptimizationLevel = OptimizationLevel::Aggressive;
@@ -218,7 +219,7 @@ fn cap_members(
     resolved: Vec<(String, B256, Vec<u8>)>,
     tx_index: &HashMap<B256, (u64, usize)>,
     cap: usize,
-) -> Vec<(B256, Vec<u8>)> {
+) -> (Vec<(B256, Vec<u8>)>, Option<u64>) {
     let mut with_tx: Vec<(u64, usize, String, B256, Vec<u8>)> = Vec::new();
     let mut without_tx: Vec<(String, B256, Vec<u8>)> = Vec::new();
     for (hstr, key, code) in resolved {
@@ -229,6 +230,7 @@ fn cap_members(
     }
     with_tx.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
     without_tx.sort_by(|a, b| a.0.cmp(&b.0));
+    let rep_block = with_tx.first().map(|(bn, _, _, _, _)| *bn);
     let mut out: Vec<(B256, Vec<u8>)> = with_tx.into_iter().map(|(_, _, _, h, v)| (h, v)).collect();
     if out.len() < cap {
         let need = cap - out.len();
@@ -236,7 +238,7 @@ fn cap_members(
     } else {
         out.truncate(cap);
     }
-    out
+    (out, rep_block)
 }
 
 /// Per-hash artifact map keyed by code hash.
@@ -644,38 +646,46 @@ fn main() -> anyhow::Result<()> {
             sidecar.display()
         );
     }
+    let all_done = sampled.iter().all(|f| done_ids.contains(&f.skeleton_id));
 
-    let all_codes = collect_bytecodes(&args.bench_dir, args.start_block, args.block_count);
-    eprintln!(
-        "Collected {} compilable bytecodes from states/[{}..{})",
-        all_codes.len(),
-        args.start_block,
-        args.start_block + args.block_count
-    );
+    // Skip the corpus scan + tx-index build entirely when the sidecar already
+    // covers every sampled family. Otherwise, load the cached indices so
+    // subsequent runs reuse the scan result instead of paying ~8 min per
+    // restart. Each entry is `(capped_members, earliest_rep_block)`.
+    let family_plans: Vec<(Vec<(B256, Vec<u8>)>, Option<u64>)> = if all_done {
+        eprintln!(
+            "[resume] all {} sampled families already in sidecar; skipping corpus scan",
+            sampled.len()
+        );
+        vec![(Vec::new(), None); sampled.len()]
+    } else {
+        let all_codes =
+            collect_bytecodes_cached(&args.bench_dir, args.start_block, args.block_count);
+        eprintln!(
+            "Collected {} compilable bytecodes from states/[{}..{})",
+            all_codes.len(),
+            args.start_block,
+            args.start_block + args.block_count
+        );
 
-    // Two-phase cap: resolve ALL family members, build tx-index over them, then
-    // cap preferring members with txs in corpus. Guarantees the capped set has
-    // a rep whenever the family has any observed txs.
-    let resolved_per_family: Vec<Vec<(String, B256, Vec<u8>)>> =
-        sampled.iter().map(|fam| resolve_family_members(&all_codes, fam)).collect();
-    let mut wanted: HashSet<B256> = HashSet::new();
-    for r in &resolved_per_family {
-        for (_, h, _) in r {
-            wanted.insert(*h);
-        }
-    }
-    eprintln!("Building tx-index over {} resolved member hashes...", wanted.len());
-    let tx_index = build_tx_index(&args.bench_dir, args.start_block, args.block_count, &wanted);
-    eprintln!("tx-index resolved {}/{} hashes", tx_index.len(), wanted.len());
+        // Two-phase cap: resolve ALL family members, build tx-index over them,
+        // then cap preferring members with txs in corpus. Guarantees the
+        // capped set has a rep whenever the family has any observed txs.
+        let resolved_per_family: Vec<Vec<(String, B256, Vec<u8>)>> =
+            sampled.iter().map(|fam| resolve_family_members(&all_codes, fam)).collect();
+        let tx_index = build_tx_index_cached(&args.bench_dir, args.start_block, args.block_count);
 
-    let family_members: Vec<Vec<(B256, Vec<u8>)>> = resolved_per_family
-        .into_iter()
-        .map(|r| cap_members(r, &tx_index, args.compile_members_cap))
-        .collect();
+        resolved_per_family
+            .into_iter()
+            .map(|r| cap_members(r, &tx_index, args.compile_members_cap))
+            .collect()
+    };
 
     let tmp_root = tempfile::tempdir()?;
 
-    for (idx, (fam, members)) in sampled.iter().zip(family_members.iter()).enumerate() {
+    for (idx, (fam, (members, rep_block_from_cap))) in
+        sampled.iter().zip(family_plans.iter()).enumerate()
+    {
         if done_ids.contains(&fam.skeleton_id) {
             eprintln!(
                 "[{}/{}] [resume] skipping already-done family {}",
@@ -711,9 +721,9 @@ fn main() -> anyhow::Result<()> {
             _ => "huge",
         };
 
-        // ── Pick representative block: earliest tx-index entry in family ──
-        let rep_block: Option<u64> =
-            members.iter().filter_map(|(h, _)| tx_index.get(h).map(|(bn, _)| *bn)).min();
+        // Rep block is computed during cap_members so we don't need tx_index
+        // in this scope (the all-done fast path doesn't build it).
+        let rep_block: Option<u64> = *rep_block_from_cap;
 
         let (ph_samples, sk_samples, av_samples): (Vec<f64>, Vec<f64>, Vec<f64>) = if let Some(bn) =
             rep_block

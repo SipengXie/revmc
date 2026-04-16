@@ -556,6 +556,14 @@ pub struct CacheSnapshot {
     pub codes: RevmHashMap<B256, Bytecode>,
 }
 
+/// Shared cache directory for derived indices over the bench corpus.
+/// Falls back to `/tmp/skelot_index` when `$HOME` is unset.
+pub fn index_cache_dir() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".cache").join("skelot_index"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/skelot_index"))
+}
+
 /// Gather non-skippable bytecodes from `states/{bn}.bin` snapshots over a block range.
 pub fn collect_bytecodes(
     bench_dir: &Path,
@@ -580,6 +588,49 @@ pub fn collect_bytecodes(
         }
     }
     all
+}
+
+/// Cached wrapper around `collect_bytecodes`. Reads from
+/// `~/.cache/skelot_index/bytecodes_{start_block}_{block_count}.bin` when
+/// present, otherwise rebuilds and atomically writes the cache. The bench
+/// corpus is assumed static; remove the cache file if it changes.
+pub fn collect_bytecodes_cached(
+    bench_dir: &Path,
+    start_block: u64,
+    block_count: u64,
+) -> std::collections::HashMap<B256, Vec<u8>> {
+    let cache_dir = index_cache_dir();
+    let cache_path = cache_dir.join(format!("bytecodes_{start_block}_{block_count}.bin"));
+    if let Ok(data) = std::fs::read(&cache_path) {
+        match bincode::deserialize::<std::collections::HashMap<B256, Vec<u8>>>(&data) {
+            Ok(map) => {
+                eprintln!(
+                    "[cache] loaded bytecodes ({} entries) from {}",
+                    map.len(),
+                    cache_path.display()
+                );
+                return map;
+            }
+            Err(e) => eprintln!("[cache] {} unreadable ({e}); rebuilding", cache_path.display()),
+        }
+    }
+    let map = collect_bytecodes(bench_dir, start_block, block_count);
+    let _ = std::fs::create_dir_all(&cache_dir);
+    match bincode::serialize(&map) {
+        Ok(bytes) => {
+            let tmp = cache_path.with_extension("bin.tmp");
+            if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &cache_path).is_ok() {
+                eprintln!(
+                    "[cache] wrote bytecodes ({} entries, {} bytes) to {}",
+                    map.len(),
+                    bytes.len(),
+                    cache_path.display()
+                );
+            }
+        }
+        Err(e) => eprintln!("[cache] serialize bytecodes: {e}"),
+    }
+    map
 }
 
 // ── Statistics (Welch's t) ─────────────────────────────────────────────────
