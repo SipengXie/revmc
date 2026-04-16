@@ -12,9 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use clap::Parser;
-use op_revm::transaction::OpTransaction;
-use op_revm::DefaultOp;
-use revm::database::EmptyDB;
+use revm::database::{CacheDB, EmptyDB};
 use revm::handler::{EvmTr, FrameResult, Handler, ItemOrResult};
 use revm::primitives::B256;
 use revmc::skeleton::{
@@ -25,8 +23,7 @@ use revmc_context::{EvmCompilerFn, RawEvmCompilerFn};
 use serde::{Deserialize, Serialize};
 
 use bin_common::{
-    build_op_cfg, build_op_tx, build_tx_index_cached, extract_gas, BenchError, BenchEvm, BinLoader,
-    OpCtx,
+    build_tx_index_cached, snapshot_before_tx, BenchError, BenchEvm, BinLoader, TxBin,
 };
 use skelot_common::{
     collect_bytecodes_cached, compile_per_hash, compile_skeleton_group, stratified_family_sample,
@@ -486,30 +483,40 @@ impl TimingSkeletonHandler {
     }
 }
 
-fn replay_block<F: FnMut(&mut BenchEvm) -> (bool, u64)>(
-    loader: &BinLoader,
+// ── Single-tx execution ─────────────────────────────────────────────────────
+//
+// Each round:
+//   1. `single_tx_evm` clones the pre-tx snapshot into a fresh CacheDB and
+//      seeds `evm.ctx.tx` with the representative tx.
+//   2. A freshly-constructed timing handler runs that single tx.
+//   3. `h.total_ns` accumulates wall-ns spent in frames whose code_hash is in
+//      the family's capped target set.
+// The pre-tx snapshot itself is built once per family (outside these loops).
+
+fn run_one_tx_per_hash(
+    h: &mut TimingPerHashHandler,
+    snapshot: &CacheDB<EmptyDB>,
     chain_id: Option<u64>,
-    mut run_tx: F,
+    tx_bin: &TxBin,
 ) {
-    let cfg = build_op_cfg(chain_id);
-    let dummy_tx = OpTransaction::builder().build_fill();
-    let mut evm: BenchEvm = {
-        let ctx =
-            OpCtx::<EmptyDB>::op().with_cfg(cfg).with_db(loader.build_cache_db()).with_tx(dummy_tx);
-        op_revm::OpEvm::new(ctx, ())
-    };
-    for tx_bin in loader.raw_txs() {
-        if tx_bin.tx_type == 0x7e {
-            continue;
-        }
-        evm.0.ctx.tx = build_op_tx(tx_bin);
-        let _ = run_tx(&mut evm);
-    }
+    let mut evm = bin_common::single_tx_evm(snapshot, chain_id, tx_bin);
+    let _ = h.run(&mut evm);
 }
 
-fn exec_per_hash(
-    loader: &BinLoader,
+fn run_one_tx_skeleton(
+    h: &mut TimingSkeletonHandler,
+    snapshot: &CacheDB<EmptyDB>,
     chain_id: Option<u64>,
+    tx_bin: &TxBin,
+) {
+    let mut evm = bin_common::single_tx_evm(snapshot, chain_id, tx_bin);
+    let _ = h.run(&mut evm);
+}
+
+fn exec_per_hash_single(
+    snapshot: &CacheDB<EmptyDB>,
+    chain_id: Option<u64>,
+    tx_bin: &TxBin,
     functions: &Arc<HashMap<B256, RawEvmCompilerFn>>,
     target: &Arc<HashSet<B256>>,
     rounds: usize,
@@ -521,10 +528,7 @@ fn exec_per_hash(
             target_hashes: target.clone(),
             total_ns: 0,
         };
-        replay_block(loader, chain_id, |evm| match h.run(evm) {
-            Ok(rr) => extract_gas(&rr),
-            Err(_) => (false, 0),
-        });
+        run_one_tx_per_hash(&mut h, snapshot, chain_id, tx_bin);
     }
     let mut samples = Vec::with_capacity(rounds);
     for _ in 0..rounds {
@@ -533,18 +537,16 @@ fn exec_per_hash(
             target_hashes: target.clone(),
             total_ns: 0,
         };
-        replay_block(loader, chain_id, |evm| match h.run(evm) {
-            Ok(rr) => extract_gas(&rr),
-            Err(_) => (false, 0),
-        });
+        run_one_tx_per_hash(&mut h, snapshot, chain_id, tx_bin);
         samples.push(h.total_ns as f64);
     }
     samples
 }
 
-fn exec_skeleton(
-    loader: &BinLoader,
+fn exec_skeleton_single(
+    snapshot: &CacheDB<EmptyDB>,
     chain_id: Option<u64>,
+    tx_bin: &TxBin,
     dispatch: &Arc<HashMap<B256, (EvmCompilerFn, Vec<u8>)>>,
     target: &Arc<HashSet<B256>>,
     rounds: usize,
@@ -556,10 +558,7 @@ fn exec_skeleton(
             target_hashes: target.clone(),
             total_ns: 0,
         };
-        replay_block(loader, chain_id, |evm| match h.run(evm) {
-            Ok(rr) => extract_gas(&rr),
-            Err(_) => (false, 0),
-        });
+        run_one_tx_skeleton(&mut h, snapshot, chain_id, tx_bin);
     }
     let mut samples = Vec::with_capacity(rounds);
     for _ in 0..rounds {
@@ -568,10 +567,7 @@ fn exec_skeleton(
             target_hashes: target.clone(),
             total_ns: 0,
         };
-        replay_block(loader, chain_id, |evm| match h.run(evm) {
-            Ok(rr) => extract_gas(&rr),
-            Err(_) => (false, 0),
-        });
+        run_one_tx_skeleton(&mut h, snapshot, chain_id, tx_bin);
         samples.push(h.total_ns as f64);
     }
     samples
@@ -723,89 +719,146 @@ fn main() -> anyhow::Result<()> {
 
         // Rep (block, tx_index) is computed during cap_members so we don't
         // need tx_index in this scope (the all-done fast path doesn't build
-        // it). Commit 2 threads the tx_index through; commit 3 consumes it.
+        // it). Exec replays THIS single tx per round on the pre-tx snapshot.
         let rep_tx: Option<(u64, usize)> = *rep_tx_from_cap;
-        let rep_block: Option<u64> = rep_tx.map(|(bn, _)| bn);
 
-        let (ph_samples, sk_samples, av_samples): (Vec<f64>, Vec<f64>, Vec<f64>) = if let Some(bn) =
-            rep_block
+        let (ph_samples, sk_samples, av_samples): (Vec<f64>, Vec<f64>, Vec<f64>) = if let Some((
+            bn,
+            ti,
+        )) = rep_tx
         {
             match BinLoader::new(&args.bench_dir, bn) {
                 Ok(loader) => {
                     let chain_id = loader.raw_txs().first().and_then(|tx| tx.chain_id);
+                    let tx_bin = match loader.raw_txs().get(ti) {
+                        Some(tx) if tx.tx_type == 0x7e => {
+                            eprintln!(
+                                "[exec-skip] family {} rep tx[{ti}] @ block {bn} is deposit (0x7e)",
+                                fam.skeleton_id
+                            );
+                            None
+                        }
+                        Some(tx) => Some(tx),
+                        None => {
+                            eprintln!(
+                                    "[exec-skip] family {} rep tx_index {ti} out of range for block {bn}",
+                                    fam.skeleton_id
+                                );
+                            None
+                        }
+                    };
+                    if let Some(tx_bin) = tx_bin {
+                        match snapshot_before_tx(&loader, ti, true) {
+                            Ok(snapshot) => {
+                                // Load .so files
+                                let mut per_hash_fns: HashMap<B256, RawEvmCompilerFn> =
+                                    HashMap::new();
+                                let mut _ph_libs: Vec<libloading::Library> = Vec::new();
+                                for art in &ph_arts {
+                                    match load_raw_fn(&art.lib, &art.symbol) {
+                                        Ok((f, lib)) => {
+                                            per_hash_fns.insert(art.hash, f);
+                                            _ph_libs.push(lib);
+                                        }
+                                        Err(e) => eprintln!(
+                                            "  dlopen per_hash {}: {e}",
+                                            hex::encode(&art.hash[..4])
+                                        ),
+                                    }
+                                }
 
-                    // Load .so files
-                    let mut per_hash_fns: HashMap<B256, RawEvmCompilerFn> = HashMap::new();
-                    let mut _ph_libs: Vec<libloading::Library> = Vec::new();
-                    for art in &ph_arts {
-                        match load_raw_fn(&art.lib, &art.symbol) {
-                            Ok((f, lib)) => {
-                                per_hash_fns.insert(art.hash, f);
-                                _ph_libs.push(lib);
+                                let (sk_fn, _sk_lib) = load_raw_fn(&sk_art.lib, &sk_art.symbol)
+                                    .map_err(|e| anyhow::anyhow!("dlopen skelot_auto: {e}"))?;
+                                let sk_ecf = EvmCompilerFn::new(sk_fn);
+                                let mut sk_dispatch: HashMap<B256, (EvmCompilerFn, Vec<u8>)> =
+                                    HashMap::new();
+                                for (h, bc) in members {
+                                    let table = build_data_table(bc, &sk_art.variance);
+                                    sk_dispatch.insert(*h, (sk_ecf, table.data));
+                                }
+
+                                let (av_fn, _av_lib) = load_raw_fn(&av_art.lib, &av_art.symbol)
+                                    .map_err(|e| anyhow::anyhow!("dlopen skelot_forced: {e}"))?;
+                                let av_ecf = EvmCompilerFn::new(av_fn);
+                                let mut av_dispatch: HashMap<B256, (EvmCompilerFn, Vec<u8>)> =
+                                    HashMap::new();
+                                for (h, bc) in members {
+                                    let table = build_data_table(bc, &av_art.variance);
+                                    av_dispatch.insert(*h, (av_ecf, table.data));
+                                }
+
+                                let target: HashSet<B256> =
+                                    members.iter().map(|(h, _)| *h).collect();
+                                let target = Arc::new(target);
+                                let per_hash_fns = Arc::new(per_hash_fns);
+                                let sk_dispatch = Arc::new(sk_dispatch);
+                                let av_dispatch = Arc::new(av_dispatch);
+
+                                let ph = exec_per_hash_single(
+                                    &snapshot,
+                                    chain_id,
+                                    &tx_bin,
+                                    &per_hash_fns,
+                                    &target,
+                                    args.rounds,
+                                    args.warmup,
+                                );
+                                let sk = exec_skeleton_single(
+                                    &snapshot,
+                                    chain_id,
+                                    &tx_bin,
+                                    &sk_dispatch,
+                                    &target,
+                                    args.rounds,
+                                    args.warmup,
+                                );
+                                let av = exec_skeleton_single(
+                                    &snapshot,
+                                    chain_id,
+                                    &tx_bin,
+                                    &av_dispatch,
+                                    &target,
+                                    args.rounds,
+                                    args.warmup,
+                                );
+
+                                // Revert detection: if ALL samples across
+                                // ALL three modes are zero, the rep tx
+                                // almost certainly reverted before any
+                                // dispatched frame could accumulate ns.
+                                let all_zero =
+                                    ph.iter().chain(sk.iter()).chain(av.iter()).all(|s| *s == 0.0);
+                                if all_zero {
+                                    eprintln!(
+                                        "[warn] family {} rep tx[{ti}] @ block {bn} produced \
+                                             zero JIT-frame time; likely reverted (check \
+                                             skip_deposits / tx_index alignment)",
+                                        fam.skeleton_id
+                                    );
+                                }
+
+                                // Drop Arcs BEFORE `_libs` go out of
+                                // scope so fn pointers stay valid across
+                                // the exec calls (libs live to end of
+                                // this match arm).
+                                drop(per_hash_fns);
+                                drop(sk_dispatch);
+                                drop(av_dispatch);
+                                drop(target);
+                                drop(snapshot);
+                                (ph, sk, av)
                             }
                             Err(e) => {
-                                eprintln!("  dlopen per_hash {}: {e}", hex::encode(&art.hash[..4]))
+                                eprintln!(
+                                    "[exec-skip] family {} snapshot_before_tx failed: {e}",
+                                    fam.skeleton_id
+                                );
+                                (Vec::new(), Vec::new(), Vec::new())
                             }
                         }
+                    } else {
+                        (Vec::new(), Vec::new(), Vec::new())
                     }
-
-                    let (sk_fn, _sk_lib) = load_raw_fn(&sk_art.lib, &sk_art.symbol)
-                        .map_err(|e| anyhow::anyhow!("dlopen skelot_auto: {e}"))?;
-                    let sk_ecf = EvmCompilerFn::new(sk_fn);
-                    let mut sk_dispatch: HashMap<B256, (EvmCompilerFn, Vec<u8>)> = HashMap::new();
-                    for (h, bc) in members {
-                        let table = build_data_table(bc, &sk_art.variance);
-                        sk_dispatch.insert(*h, (sk_ecf, table.data));
-                    }
-
-                    let (av_fn, _av_lib) = load_raw_fn(&av_art.lib, &av_art.symbol)
-                        .map_err(|e| anyhow::anyhow!("dlopen skelot_forced: {e}"))?;
-                    let av_ecf = EvmCompilerFn::new(av_fn);
-                    let mut av_dispatch: HashMap<B256, (EvmCompilerFn, Vec<u8>)> = HashMap::new();
-                    for (h, bc) in members {
-                        let table = build_data_table(bc, &av_art.variance);
-                        av_dispatch.insert(*h, (av_ecf, table.data));
-                    }
-
-                    let target: HashSet<B256> = members.iter().map(|(h, _)| *h).collect();
-                    let target = Arc::new(target);
-                    let per_hash_fns = Arc::new(per_hash_fns);
-                    let sk_dispatch = Arc::new(sk_dispatch);
-                    let av_dispatch = Arc::new(av_dispatch);
-
-                    let ph = exec_per_hash(
-                        &loader,
-                        chain_id,
-                        &per_hash_fns,
-                        &target,
-                        args.rounds,
-                        args.warmup,
-                    );
-                    let sk = exec_skeleton(
-                        &loader,
-                        chain_id,
-                        &sk_dispatch,
-                        &target,
-                        args.rounds,
-                        args.warmup,
-                    );
-                    let av = exec_skeleton(
-                        &loader,
-                        chain_id,
-                        &av_dispatch,
-                        &target,
-                        args.rounds,
-                        args.warmup,
-                    );
-
-                    // Drop dispatch/Arc BEFORE _libs go out of scope to keep
-                    // function pointers valid during the replay (guaranteed
-                    // by Arc ordering — libs live to end of scope).
-                    drop(per_hash_fns);
-                    drop(sk_dispatch);
-                    drop(av_dispatch);
-                    drop(target);
-                    (ph, sk, av)
                 }
                 Err(e) => {
                     eprintln!("[exec-skip] family {} block {bn} loader: {e}", fam.skeleton_id);
@@ -830,17 +883,19 @@ fn main() -> anyhow::Result<()> {
             "bucket": bucket_name,
             "member_count": fam.member_count,
             "members_compiled": members.len(),
+            "rep_block": rep_tx.map(|(bn, _)| bn),
+            "rep_tx_index": rep_tx.map(|(_, ti)| ti),
             "per_hash": ph_row,
             "skelot": sk_row,
             "all_variant": av_row,
         });
         append_family_row(&sidecar, &row)?;
         eprintln!(
-            "[{}/{}] {} done (rep_block={:?}, samples=[ph={}, sk={}, av={}])",
+            "[{}/{}] {} done (rep_tx={:?}, samples=[ph={}, sk={}, av={}])",
             idx + 1,
             sampled.len(),
             fam.skeleton_id,
-            rep_block,
+            rep_tx,
             ph_samples.len(),
             sk_samples.len(),
             av_samples.len()
