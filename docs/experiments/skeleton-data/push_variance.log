@@ -1,0 +1,365 @@
+warning: unused import: `I256_MIN`
+ --> crates/revmc/src/compiler/translate.rs:5:87
+  |
+5 |     Backend, Builder, Bytecode, EvmContext, Inst, InstData, InstFlags, IntCC, Result, I256_MIN,
+  |                                                                                       ^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `I256_MIN` is never used
+  --> crates/revmc/src/lib.rs:61:7
+   |
+61 | const I256_MIN: U256 = U256::from_limbs([
+   |       ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `ADMISSION_DESCRIPTOR_VERSION` is never used
+ --> crates/revmc/src/skeleton_admission.rs:5:7
+  |
+5 | const ADMISSION_DESCRIPTOR_VERSION: u32 = 1;
+  |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `AdmissionDescriptor` is never constructed
+ --> crates/revmc/src/skeleton_admission.rs:8:19
+  |
+8 | pub(crate) struct AdmissionDescriptor {
+  |                   ^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `from_bytecode` and `validate` are never used
+  --> crates/revmc/src/skeleton_admission.rs:16:19
+   |
+15 | impl AdmissionDescriptor {
+   | ------------------------ associated items in this implementation
+16 |     pub(crate) fn from_bytecode(
+   |                   ^^^^^^^^^^^^^
+...
+51 |     pub(crate) fn validate(&self) -> Result<(), DescriptorError> {
+   |                   ^^^^^^^^
+
+warning: function `check_admission` is never used
+  --> crates/revmc/src/skeleton_admission.rs:82:15
+   |
+82 | pub(crate) fn check_admission(
+   |               ^^^^^^^^^^^^^^^
+
+warning: enum `AdmissionMismatch` is never used
+   --> crates/revmc/src/skeleton_admission.rs:124:17
+    |
+124 | pub(crate) enum AdmissionMismatch {
+    |                 ^^^^^^^^^^^^^^^^^
+
+warning: enum `DescriptorError` is never used
+   --> crates/revmc/src/skeleton_admission.rs:134:17
+    |
+134 | pub(crate) enum DescriptorError {
+    |                 ^^^^^^^^^^^^^^^
+
+warning: enum `AdmissionError` is never used
+   --> crates/revmc/src/skeleton_admission.rs:142:17
+    |
+142 | pub(crate) enum AdmissionError {
+    |                 ^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+  --> crates/revmc/src/profile.rs:14:5
+   |
+14 |     pub fn new() -> Self {
+   |     ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: `revmc` (lib) generated 10 warnings (run `cargo fix --lib -p revmc` to apply 1 suggestion)
+warning: `revmc` (lib) generated 10 warnings (10 duplicates)
+   Compiling revmc-examples-runner v0.1.0 (/home/ubuntu/sipeng/helios/revmc/examples/runner)
+warning: unused variable: `ref_push`
+   --> examples/runner/src/bin/push_variance.rs:623:29
+    |
+623 |                 if let Some(ref_push) = ref_pushes_for_pos.get(v.push_idx) {
+    |                             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_ref_push`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `invariant_count` and `invariant_bytes` are never read
+   --> examples/runner/src/bin/push_variance.rs:171:9
+    |
+167 |     struct GroupStats {
+    |            ---------- fields in this struct
+...
+171 |         invariant_count: usize,
+    |         ^^^^^^^^^^^^^^^
+172 |         variant_count: usize,
+173 |         invariant_bytes: usize,
+    |         ^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `revmc-examples-runner` (bin "push_variance") generated 2 warnings
+    Finished `release` profile [optimized + debuginfo] target(s) in 6.65s
+     Running `target/release/push_variance`
+Scanning blocks 38004930..38014927 (9997 blocks)
+  2000 blocks, 11204 unique codes
+  4000 blocks, 14314 unique codes
+  6000 blocks, 16261 unique codes
+  8000 blocks, 17873 unique codes
+Scanned 9993 blocks, 19197 unique bytecodes
+=== PUSH Variance Analysis ===
+Skeleton groups with 2+ members: 428
+
+━━━ #1 | skel f812d76162f34d9a | 3323 copies | 22142B bytecode ━━━
+  PUSH count: 3746  |  invariant: 3713 (6472 bytes)  |  variant: 33 (882 bytes, 0.9%)
+  Variant PUSHes: #1583(PUSH32,32B), #2133(PUSH32,32B), #2277(PUSH32,32B), #3139(PUSH32,32B), #3161(PUSH4,4B), #3338(PUSH32,32B), #3360(PUSH4,4B), #4103(PUSH4,4B), #4542(PUSH32,32B), #4554(PUSH32,32B), #4582(PUSH32,32B), #4593(PUSH32,32B), #4606(PUSH4,4B), #5319(PUSH32,32B), #5374(PUSH32,32B), ...+18 more
+  Data table: 882 bytes/instance × 3323 instances = 2930886 bytes total
+  Only 12.0% of immediate bytes vary (882/7354B)
+
+━━━ #2 | skel 4089dc8c705868b7 | 465 copies | 12791B bytecode ━━━
+  PUSH count: 1563  |  invariant: 1556 (6925 bytes)  |  variant: 7 (224 bytes, 0.4%)
+  Variant PUSHes: #831(PUSH32,32B), #1471(PUSH32,32B), #2315(PUSH32,32B), #3106(PUSH32,32B), #4108(PUSH32,32B), #4119(PUSH32,32B), #4132(PUSH32,32B)
+  Data table: 224 bytes/instance × 465 instances = 104160 bytes total
+  Only 3.1% of immediate bytes vary (224/7149B)
+
+━━━ #3 | skel ad86cca8f0abeb22 | 401 copies | 22962B bytecode ━━━
+  PUSH count: 3952  |  invariant: 3913 (6428 bytes)  |  variant: 39 (1136 bytes, 1.0%)
+  Variant PUSHes: #1639(PUSH32,32B), #2264(PUSH32,32B), #2408(PUSH32,32B), #3404(PUSH32,32B), #3426(PUSH4,4B), #3603(PUSH32,32B), #3625(PUSH4,4B), #4408(PUSH4,4B), #4843(PUSH32,32B), #4855(PUSH32,32B), #4883(PUSH32,32B), #4894(PUSH32,32B), #4907(PUSH4,4B), #5604(PUSH32,32B), #5659(PUSH32,32B), ...+24 more
+  Data table: 1136 bytes/instance × 401 instances = 455536 bytes total
+  Only 15.0% of immediate bytes vary (1136/7564B)
+
+━━━ #4 | skel bf4abe9c82c9be73 | 342 copies | 45B bytecode ━━━
+  PUSH count: 2  |  invariant: 1 (1 bytes)  |  variant: 1 (20 bytes, 50.0%)
+  Variant PUSHes: #9(PUSH20,20B)
+  Data table: 20 bytes/instance × 342 instances = 6840 bytes total
+  Only 95.2% of immediate bytes vary (20/21B)
+
+━━━ #5 | skel b724098a6d94952e | 199 copies | 5129B bytecode ━━━
+  PUSH count: 627  |  invariant: 620 (2220 bytes)  |  variant: 7 (224 bytes, 1.1%)
+  Variant PUSHes: #520(PUSH32,32B), #524(PUSH32,32B), #629(PUSH32,32B), #947(PUSH32,32B), #1168(PUSH32,32B), #1314(PUSH32,32B), #1572(PUSH32,32B)
+  Data table: 224 bytes/instance × 199 instances = 44576 bytes total
+  Only 9.2% of immediate bytes vary (224/2444B)
+
+━━━ #6 | skel 5a6eda3ab2a82d4c | 162 copies | 813B bytecode ━━━
+  PUSH count: 136  |  invariant: 135 (334 bytes)  |  variant: 1 (32 bytes, 0.7%)
+  Variant PUSHes: #4(PUSH32,32B)
+  Data table: 32 bytes/instance × 162 instances = 5184 bytes total
+  Only 8.7% of immediate bytes vary (32/366B)
+
+━━━ #7 | skel 0e999679924db48e | 138 copies | 20054B bytecode ━━━
+  PUSH count: 3347  |  invariant: 3270 (6494 bytes)  |  variant: 77 (2332 bytes, 2.3%)
+  Variant PUSHes: #444(PUSH32,32B), #480(PUSH32,32B), #540(PUSH32,32B), #672(PUSH32,32B), #834(PUSH32,32B), #863(PUSH32,32B), #1177(PUSH32,32B), #1274(PUSH32,32B), #1296(PUSH32,32B), #1313(PUSH32,32B), #1412(PUSH32,32B), #1748(PUSH32,32B), #1816(PUSH32,32B), #1832(PUSH32,32B), #1863(PUSH32,32B), ...+62 more
+  Data table: 2332 bytes/instance × 138 instances = 321816 bytes total
+  Only 26.4% of immediate bytes vary (2332/8826B)
+
+━━━ #8 | skel 16c6821f67e58be8 | 135 copies | 12282B bytecode ━━━
+  PUSH count: 1506  |  invariant: 1502 (6715 bytes)  |  variant: 4 (128 bytes, 0.3%)
+  Variant PUSHes: #1420(PUSH32,32B), #3821(PUSH32,32B), #3832(PUSH32,32B), #3845(PUSH32,32B)
+  Data table: 128 bytes/instance × 135 instances = 17280 bytes total
+  Only 1.9% of immediate bytes vary (128/6843B)
+
+━━━ #9 | skel fafd69a61db3a337 | 133 copies | 1387B bytecode ━━━
+  PUSH count: 151  |  invariant: 150 (684 bytes)  |  variant: 1 (32 bytes, 0.7%)
+  Variant PUSHes: #102(PUSH32,32B)
+  Data table: 32 bytes/instance × 133 instances = 4256 bytes total
+  Only 4.5% of immediate bytes vary (32/716B)
+
+━━━ #10 | skel 3c643f47c4c72aa6 | 133 copies | 6236B bytecode ━━━
+  PUSH count: 1064  |  invariant: 1054 (2511 bytes)  |  variant: 10 (320 bytes, 0.9%)
+  Variant PUSHes: #278(PUSH32,32B), #413(PUSH32,32B), #732(PUSH32,32B), #1470(PUSH32,32B), #1586(PUSH32,32B), #1677(PUSH32,32B), #1707(PUSH32,32B), #1779(PUSH32,32B), #1809(PUSH32,32B), #2349(PUSH32,32B)
+  Data table: 320 bytes/instance × 133 instances = 42560 bytes total
+  Only 11.3% of immediate bytes vary (320/2831B)
+
+━━━ #11 | skel 654209aa56c3c9f5 | 112 copies | 1159B bytecode ━━━
+  PUSH count: 193  |  invariant: 192 (410 bytes)  |  variant: 1 (32 bytes, 0.5%)
+  Variant PUSHes: #9(PUSH32,32B)
+  Data table: 32 bytes/instance × 112 instances = 3584 bytes total
+  Only 7.2% of immediate bytes vary (32/442B)
+
+━━━ #12 | skel 7a7e107949b09cdd | 107 copies | 22493B bytecode ━━━
+  PUSH count: 3978  |  invariant: 3952 (6856 bytes)  |  variant: 26 (832 bytes, 0.7%)
+  Variant PUSHes: #315(PUSH32,32B), #1504(PUSH32,32B), #1582(PUSH32,32B), #2092(PUSH32,32B), #2165(PUSH32,32B), #2936(PUSH32,32B), #2957(PUSH32,32B), #3471(PUSH32,32B), #3494(PUSH32,32B), #4042(PUSH32,32B), #4059(PUSH32,32B), #4098(PUSH32,32B), #4115(PUSH32,32B), #4604(PUSH32,32B), #4635(PUSH32,32B), ...+11 more
+  Data table: 832 bytes/instance × 107 instances = 89024 bytes total
+  Only 10.8% of immediate bytes vary (832/7688B)
+
+━━━ #13 | skel 03ae90dc9788a4e0 | 86 copies | 4826B bytecode ━━━
+  PUSH count: 853  |  invariant: 852 (1573 bytes)  |  variant: 1 (32 bytes, 0.1%)
+  Variant PUSHes: #212(PUSH32,32B)
+  Data table: 32 bytes/instance × 86 instances = 2752 bytes total
+  Only 2.0% of immediate bytes vary (32/1605B)
+
+━━━ #14 | skel 25158268626a59cd | 82 copies | 10143B bytecode ━━━
+  PUSH count: 1801  |  invariant: 1791 (3508 bytes)  |  variant: 10 (320 bytes, 0.6%)
+  Variant PUSHes: #690(PUSH32,32B), #960(PUSH32,32B), #1813(PUSH32,32B), #1957(PUSH32,32B), #3184(PUSH32,32B), #3411(PUSH32,32B), #3413(PUSH32,32B), #4196(PUSH32,32B), #4211(PUSH32,32B), #4224(PUSH32,32B)
+  Data table: 320 bytes/instance × 82 instances = 26240 bytes total
+  Only 8.4% of immediate bytes vary (320/3828B)
+
+━━━ #15 | skel 028ca4447a882c19 | 79 copies | 22435B bytecode ━━━
+  PUSH count: 3962  |  invariant: 3936 (6835 bytes)  |  variant: 26 (832 bytes, 0.7%)
+  Variant PUSHes: #315(PUSH32,32B), #1504(PUSH32,32B), #1582(PUSH32,32B), #2092(PUSH32,32B), #2165(PUSH32,32B), #2936(PUSH32,32B), #2957(PUSH32,32B), #3471(PUSH32,32B), #3494(PUSH32,32B), #4077(PUSH32,32B), #4094(PUSH32,32B), #4133(PUSH32,32B), #4150(PUSH32,32B), #4639(PUSH32,32B), #4670(PUSH32,32B), ...+11 more
+  Data table: 832 bytes/instance × 79 instances = 65728 bytes total
+  Only 10.9% of immediate bytes vary (832/7667B)
+
+━━━ #16 | skel 8fce9ea3588e12bf | 73 copies | 3169B bytecode ━━━
+  PUSH count: 408  |  invariant: 404 (1525 bytes)  |  variant: 4 (128 bytes, 1.0%)
+  Variant PUSHes: #89(PUSH32,32B), #174(PUSH32,32B), #295(PUSH32,32B), #330(PUSH32,32B)
+  Data table: 128 bytes/instance × 73 instances = 9344 bytes total
+  Only 7.7% of immediate bytes vary (128/1653B)
+
+━━━ #17 | skel 2e6c5163465a1ed8 | 63 copies | 17215B bytecode ━━━
+  PUSH count: 2951  |  invariant: 2943 (6073 bytes)  |  variant: 8 (256 bytes, 0.3%)
+  Variant PUSHes: #285(PUSH32,32B), #388(PUSH32,32B), #2847(PUSH32,32B), #3054(PUSH32,32B), #3932(PUSH32,32B), #4107(PUSH32,32B), #4220(PUSH32,32B), #6973(PUSH32,32B)
+  Data table: 256 bytes/instance × 63 instances = 16128 bytes total
+  Only 4.0% of immediate bytes vary (256/6329B)
+
+━━━ #18 | skel 6d8338807cb00951 | 63 copies | 4932B bytecode ━━━
+  PUSH count: 535  |  invariant: 532 (2990 bytes)  |  variant: 3 (96 bytes, 0.6%)
+  Variant PUSHes: #224(PUSH32,32B), #289(PUSH32,32B), #403(PUSH32,32B)
+  Data table: 96 bytes/instance × 63 instances = 6048 bytes total
+  Only 3.1% of immediate bytes vary (96/3086B)
+
+━━━ #19 | skel 082b92bb30d80652 | 58 copies | 15342B bytecode ━━━
+  PUSH count: 2440  |  invariant: 2431 (5832 bytes)  |  variant: 9 (288 bytes, 0.4%)
+  Variant PUSHes: #250(PUSH32,32B), #336(PUSH32,32B), #2046(PUSH32,32B), #2376(PUSH32,32B), #2991(PUSH32,32B), #3161(PUSH32,32B), #3274(PUSH32,32B), #3336(PUSH32,32B), #5992(PUSH32,32B)
+  Data table: 288 bytes/instance × 58 instances = 16704 bytes total
+  Only 4.7% of immediate bytes vary (288/6120B)
+
+━━━ #20 | skel b75eb6e7b0303778 | 58 copies | 5835B bytecode ━━━
+  PUSH count: 668  |  invariant: 665 (3488 bytes)  |  variant: 3 (96 bytes, 0.4%)
+  Variant PUSHes: #224(PUSH32,32B), #384(PUSH32,32B), #764(PUSH32,32B)
+  Data table: 96 bytes/instance × 58 instances = 5568 bytes total
+  Only 2.7% of immediate bytes vary (96/3584B)
+
+=== Global Summary (all 428 skeleton groups with 2+ members) ===
+  Total PUSH positions analyzed: 590650
+  Invariant: 586950 (1561415 bytes) — can remain LLVM constants
+  Variant:   3700 (116443 bytes) — need parameterization
+  Variant fraction: 0.63% of positions, 6.94% of bytes
+
+  Compilation: 8366 bytecodes → 428 skeleton compilations (each with full constant folding on invariant PUSHes)
+
+=== Variant PUSH Distribution (ALL 428 groups) ===
+
+  Variant % histogram (by # of PUSH positions):
+                bucket  groups  bytecodes  avg_copies
+          0-1% variant     281      6848        24.4
+          1-2% variant      69       616         8.9
+          2-5% variant      56       344         6.1
+         5-10% variant      14        89         6.4
+        10-25% variant       5        72        14.4
+        25-50% variant       2       395       197.5
+       50-100% variant       1         2         2.0
+
+  Variant % by bytecode size:
+           size bucket  groups   bytecodes  avg_var_push  avg_var_bytes    avg_var%
+          tiny (<100B)       6         410           1.0           18B       43.6%
+      small (100-500B)      22          92           1.4           45B        4.0%
+     medium (500B-5KB)     153        1416           4.2          131B        1.6%
+        large (5-15KB)     141        1720           9.0          284B        0.7%
+          huge (>15KB)     106        4728          16.6          521B        0.5%
+
+=== Variant Depth Analysis ("耗子屎" detection) ===
+For each variant PUSH: how many distinct values exist across all instances?
+
+Total variant PUSH positions: 3700
+  Near-invariant (majority >= 99%): 6 (0.2%) ← "耗子屎" scenario
+  Low diversity (2-5 distinct values): 2848 (77.0%)
+  High diversity (>5 distinct values): 852 (23.0%) ← truly variant
+
+  Distinct value count histogram:
+  distinct_vals  positions       pct
+             2      1757     47.5%
+             3       619     16.7%
+             4       263      7.1%
+             5       209      5.6%
+             6        78      2.1%
+             7       164      4.4%
+             8        79      2.1%
+             9        57      1.5%
+            10        50      1.4%
+         11-50       297      8.0%
+        51-200       106      2.9%
+          >200        21      0.6%
+
+  Top "耗子屎" positions (majority >= 95%, group >= 10 members):
+  group#  copies  push_idx    opcode   distinct    majority    outliers
+       1    3323       873     PUSH4          3       3321 (99.9%)           2
+       1    3323       922     PUSH4          3       3321 (99.9%)           2
+       1    3323      1120     PUSH4          3       3321 (99.9%)           2
+       1    3323      1265     PUSH4          3       3321 (99.9%)           2
+       1    3323      1546     PUSH1          2       3322 (100.0%)           1
+       1    3323      1554     PUSH1          2       3322 (100.0%)           1
+       3     401      2018    PUSH32          2        387 (96.5%)          14
+      18      63       107    PUSH32          3         60 (95.2%)           3
+      27      38      1172    PUSH32          2         37 (97.4%)           1
+      27      38      1251    PUSH32          2         37 (97.4%)           1
+
+  Top "truly variant" positions (>5 distinct values, group >= 10 members):
+  group#  copies  push_idx    opcode   distinct    majority    outliers
+       1    3323      1984    PUSH32       3323          1 ( 0.0%)        3322
+       1    3323       404    PUSH32       1699       1079 (32.5%)        2244
+       1    3323       913    PUSH32       1699       1079 (32.5%)        2244
+       1    3323      1256    PUSH32       1699       1079 (32.5%)        2244
+       1    3323      1453    PUSH32       1699       1079 (32.5%)        2244
+       1    3323      1667    PUSH32       1699       1079 (32.5%)        2244
+       1    3323      2606    PUSH32       1699       1079 (32.5%)        2244
+       1    3323       864    PUSH32       1076        978 (29.4%)        2345
+       1    3323      1260    PUSH32       1076        978 (29.4%)        2345
+       1    3323      1466    PUSH32       1076        978 (29.4%)        2345
+       1    3323      1688    PUSH32       1076        978 (29.4%)        2345
+       1    3323      1880    PUSH32       1076        978 (29.4%)        2345
+       1    3323      2650    PUSH32       1076        978 (29.4%)        2345
+       2     465      1149    PUSH32        465          1 ( 0.2%)         464
+       2     465      1152    PUSH32        465          1 ( 0.2%)         464
+       2     465      1156    PUSH32        449          4 ( 0.9%)         461
+       2     465       457    PUSH32        441          9 ( 1.9%)         456
+       2     465       246    PUSH32        385         10 ( 2.2%)         455
+       2     465       689    PUSH32        385         10 ( 2.2%)         455
+       2     465       926    PUSH32        385         10 ( 2.2%)         455
+       4     342         0    PUSH20        342          1 ( 0.3%)         341
+       5     199       125    PUSH32        199          1 ( 0.5%)         198
+       5     199       126    PUSH32        199          1 ( 0.5%)         198
+       5     199       162    PUSH32        199          1 ( 0.5%)         198
+       5     199       242    PUSH32        199          1 ( 0.5%)         198
+       5     199       286    PUSH32        199          1 ( 0.5%)         198
+       5     199       312    PUSH32        199          1 ( 0.5%)         198
+       5     199       376    PUSH32        199          1 ( 0.5%)         198
+       6     162         2    PUSH32        162          1 ( 0.6%)         161
+       8     135       439    PUSH32        135          1 ( 0.7%)         134
+
+=== Lazy Promotion Impact Estimate ===
+If we use majority value as invariant and lazy-promote outliers:
+
+  group#  copies   var_pos    near_inv   truly_var  max_outliers     outlier_bcs
+       1    3323        33           9          24           206            206 (6.2%)
+       2     465         7           0           7             0              0 (0.0%)
+       3     401        39           1          38            14             14 (3.5%)
+       4     342         1           0           1             0              0 (0.0%)
+       5     199         7           0           7             0              0 (0.0%)
+       6     162         1           0           1             0              0 (0.0%)
+       7     138        77           0          77             0              0 (0.0%)
+       8     135         4           0           4             0              0 (0.0%)
+       9     133         1           0           1             0              0 (0.0%)
+      10     133        10           0          10             0              0 (0.0%)
+      11     112         1           0           1             0              0 (0.0%)
+      12     107        26           0          26             0              0 (0.0%)
+      13      86         1           0           1             0              0 (0.0%)
+      14      82        10           0          10             0              0 (0.0%)
+      15      79        26           0          26             0              0 (0.0%)
+      16      73         4           0           4             0              0 (0.0%)
+      17      63         8           0           8             0              0 (0.0%)
+      18      63         3           1           2             3              3 (4.8%)
+      19      58         9           0           9             0              0 (0.0%)
+      20      58         3           0           3             0              0 (0.0%)
+      21      57         4           0           4             0              0 (0.0%)
+      22      53         1           0           1             0              0 (0.0%)
+      23      53         1           0           1             0              0 (0.0%)
+      24      45         3           0           3             0              0 (0.0%)
+      25      40        13           0          13             0              0 (0.0%)
+      26      38         8           0           8             0              0 (0.0%)
+      27      38        21           2          19             1              1 (2.6%)
+      28      37         2           0           2             0              0 (0.0%)
+      29      37         1           0           1             0              0 (0.0%)
+      30      36        12           0          12             0              0 (0.0%)
+
+  Grand total:
+    Bytecodes in variant groups: 8366
+    Variant positions that are near-invariant (promotable): 45
+    Variant positions that are truly variant: 3655
+    Total outlier bytecodes needing sub-variants: 233 (2.8%)

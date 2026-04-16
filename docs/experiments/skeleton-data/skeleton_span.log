@@ -1,0 +1,158 @@
+warning: unused import: `I256_MIN`
+ --> crates/revmc/src/compiler/translate.rs:5:87
+  |
+5 |     Backend, Builder, Bytecode, EvmContext, Inst, InstData, InstFlags, IntCC, Result, I256_MIN,
+  |                                                                                       ^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `I256_MIN` is never used
+  --> crates/revmc/src/lib.rs:61:7
+   |
+61 | const I256_MIN: U256 = U256::from_limbs([
+   |       ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `ADMISSION_DESCRIPTOR_VERSION` is never used
+ --> crates/revmc/src/skeleton_admission.rs:5:7
+  |
+5 | const ADMISSION_DESCRIPTOR_VERSION: u32 = 1;
+  |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `AdmissionDescriptor` is never constructed
+ --> crates/revmc/src/skeleton_admission.rs:8:19
+  |
+8 | pub(crate) struct AdmissionDescriptor {
+  |                   ^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `from_bytecode` and `validate` are never used
+  --> crates/revmc/src/skeleton_admission.rs:16:19
+   |
+15 | impl AdmissionDescriptor {
+   | ------------------------ associated items in this implementation
+16 |     pub(crate) fn from_bytecode(
+   |                   ^^^^^^^^^^^^^
+...
+51 |     pub(crate) fn validate(&self) -> Result<(), DescriptorError> {
+   |                   ^^^^^^^^
+
+warning: function `check_admission` is never used
+  --> crates/revmc/src/skeleton_admission.rs:82:15
+   |
+82 | pub(crate) fn check_admission(
+   |               ^^^^^^^^^^^^^^^
+
+warning: enum `AdmissionMismatch` is never used
+   --> crates/revmc/src/skeleton_admission.rs:124:17
+    |
+124 | pub(crate) enum AdmissionMismatch {
+    |                 ^^^^^^^^^^^^^^^^^
+
+warning: enum `DescriptorError` is never used
+   --> crates/revmc/src/skeleton_admission.rs:134:17
+    |
+134 | pub(crate) enum DescriptorError {
+    |                 ^^^^^^^^^^^^^^^
+
+warning: enum `AdmissionError` is never used
+   --> crates/revmc/src/skeleton_admission.rs:142:17
+    |
+142 | pub(crate) enum AdmissionError {
+    |                 ^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+  --> crates/revmc/src/profile.rs:14:5
+   |
+14 |     pub fn new() -> Self {
+   |     ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: `revmc` (lib) generated 10 warnings (run `cargo fix --lib -p revmc` to apply 1 suggestion)
+warning: `revmc` (lib) generated 10 warnings (10 duplicates)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.16s
+     Running `target/release/skeleton_deployment_span --top 5 --sample-per-group 30 --concurrency 12`
+Loading codes + account index from blocks 38004930..38014927
+  2000 blocks, 11204 codes, 11206 addr-mappings
+  4000 blocks, 14314 codes, 14316 addr-mappings
+  6000 blocks, 16261 codes, 16263 addr-mappings
+  8000 blocks, 17873 codes, 17875 addr-mappings
+Scanned 9993 blocks: 19197 unique bytecodes, 19199 code_hash→addr mappings
+Querying Base mainnet head block…
+Head block: 44681401
+=== Skeleton Group Deployment Time Span ===
+
+Head block: 44681401
+Measurement window: 38004930..38014927
+
+
+Group #1 (skel 0xf812d76162f34d9a): 3323 members, bytecode 22142 bytes — sampling 30 with addresses
+  10/30
+  20/30
+  30/30
+-- Group #1 (skel 0xf812d76162f34d9a) --
+  members: 3323  |  bytecode len: 22142
+  sampled: 30 resolved / 30 attempted
+  deploy block  min=2832666  median=29665606  max=38012254
+  deploy ts     min=1692454679  median=1746120559  max=1762813855
+  span:         814.3 days
+  min UTC: 2023-08-19 14:17:59
+  max UTC: 2025-11-10 22:30:55
+
+
+Group #2 (skel 0x4089dc8c705868b7): 465 members, bytecode 12791 bytes — sampling 30 with addresses
+  10/30
+  20/30
+  30/30
+-- Group #2 (skel 0x4089dc8c705868b7) --
+  members: 465  |  bytecode len: 12791
+  sampled: 30 resolved / 30 attempted
+  deploy block  min=32732738  median=37926312  max=38014373
+  deploy ts     min=1752254823  median=1762641971  max=1762818093
+  span:         122.3 days
+  min UTC: 2025-07-11 17:27:03
+  max UTC: 2025-11-10 23:41:33
+
+
+Group #3 (skel 0xad86cca8f0abeb22): 401 members, bytecode 22962 bytes — sampling 30 with addresses
+  10/30
+  20/30
+  30/30
+-- Group #3 (skel 0xad86cca8f0abeb22) --
+  members: 401  |  bytecode len: 22962
+  sampled: 30 resolved / 30 attempted
+  deploy block  min=2177457  median=26257488  max=37804357
+  deploy ts     min=1691144261  median=1739304323  max=1762398061
+  span:         824.7 days
+  min UTC: 2023-08-04 10:17:41
+  max UTC: 2025-11-06 03:01:01
+
+
+Group #4 (skel 0xbf4abe9c82c9be73): 342 members, bytecode 45 bytes — sampling 30 with addresses
+  10/30
+  20/30
+  30/30
+-- Group #4 (skel 0xbf4abe9c82c9be73) --
+  members: 342  |  bytecode len: 45
+  sampled: 30 resolved / 30 attempted
+  deploy block  min=2456616  median=32305520  max=38006431
+  deploy ts     min=1691702579  median=1751400387  max=1762802209
+  span:         822.9 days
+  min UTC: 2023-08-10 21:22:59
+  max UTC: 2025-11-10 19:16:49
+
+
+Group #5 (skel 0xb724098a6d94952e): 199 members, bytecode 5129 bytes — sampling 30 with addresses
+  10/30
+  20/30
+  30/30
+-- Group #5 (skel 0xb724098a6d94952e) --
+  members: 199  |  bytecode len: 5129
+  sampled: 30 resolved / 30 attempted
+  deploy block  min=3554199  median=33496205  max=37989755
+  deploy ts     min=1693897745  median=1753781757  max=1762768857
+  span:         797.1 days
+  min UTC: 2023-09-05 07:09:05
+  max UTC: 2025-11-10 10:00:57
+
