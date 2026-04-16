@@ -77,6 +77,13 @@ struct Args {
     /// and recompute everything.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     resume: bool,
+    /// Worker threads for per_hash compile within a family. `compile_time_ms`
+    /// still reports the sum of per-unit compile wall (serial equivalent) so
+    /// cap-invariant comparisons across modes and families are preserved;
+    /// parallelism only reduces overall Task wall-clock. Skeleton and
+    /// all-variant modes are a single compile per family and ignore this.
+    #[arg(long, default_value_t = 8)]
+    compile_threads: usize,
 }
 
 /// Sidecar JSONL path derived from the final output path.
@@ -248,23 +255,69 @@ struct PerHashArtifact {
 fn compile_per_hash_mode(
     members: &[(B256, Vec<u8>)],
     tmp_dir: &Path,
+    threads: usize,
 ) -> anyhow::Result<(CompileMetrics, Vec<PerHashArtifact>)> {
-    let t = Instant::now();
-    let mut so_bytes = 0u64;
-    let mut arts = Vec::with_capacity(members.len());
-    for (i, (hash, bc)) in members.iter().enumerate() {
-        let symbol = format!("ph_{i}");
-        let obj = tmp_dir.join(format!("per_hash_{i}.o"));
-        let lib = tmp_dir.join(format!("per_hash_{i}.so"));
-        compile_per_hash(bc, &symbol, &obj, &lib, OPT)
-            .map_err(|e| anyhow::anyhow!("compile_per_hash: {e}"))?;
-        so_bytes += std::fs::metadata(&lib)?.len();
-        arts.push(PerHashArtifact { hash: *hash, lib, symbol });
+    use std::sync::Mutex;
+    // Round-robin assign compiles to N worker threads. Each thread maintains
+    // its own LLVM Context (via compile_per_hash's per-call scoping), so the
+    // pattern is identical to Stage B's `run_per_hash` in skelot_compile_bench.
+    // `compile_time_ms` aggregates per-unit wall (serial-equivalent) not the
+    // parallel wall, keeping cap-invariant ratios meaningful across families.
+    let n = members.len();
+    let threads = threads.max(1).min(n.max(1));
+    let mut assignments: Vec<Vec<usize>> = (0..threads).map(|_| Vec::new()).collect();
+    for i in 0..n {
+        assignments[i % threads].push(i);
     }
+
+    type Slot = Mutex<Option<(PerHashArtifact, f64, u64)>>;
+    let slots: Vec<Slot> = (0..n).map(|_| Mutex::new(None)).collect();
+    let slots_ref = &slots;
+    let members_ref = members;
+
+    std::thread::scope(|s| -> anyhow::Result<()> {
+        let handles: Vec<_> = assignments
+            .into_iter()
+            .map(|chunk| {
+                s.spawn(move || -> anyhow::Result<()> {
+                    for i in chunk {
+                        let (hash, bc) = &members_ref[i];
+                        let symbol = format!("ph_{i}");
+                        let obj = tmp_dir.join(format!("per_hash_{i}.o"));
+                        let lib = tmp_dir.join(format!("per_hash_{i}.so"));
+                        let t0 = Instant::now();
+                        compile_per_hash(bc, &symbol, &obj, &lib, OPT)
+                            .map_err(|e| anyhow::anyhow!("compile_per_hash[{i}]: {e}"))?;
+                        let unit_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        let size = std::fs::metadata(&lib)?.len();
+                        *slots_ref[i].lock().unwrap() =
+                            Some((PerHashArtifact { hash: *hash, lib, symbol }, unit_ms, size));
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().map_err(|e| anyhow::anyhow!("per_hash worker panic: {e:?}"))??;
+        }
+        Ok(())
+    })?;
+
+    let mut arts = Vec::with_capacity(n);
+    let mut compile_time_ms = 0.0f64;
+    let mut so_bytes = 0u64;
+    for slot in slots {
+        let (art, unit_ms, size) =
+            slot.into_inner().unwrap().expect("every per_hash unit must be filled");
+        arts.push(art);
+        compile_time_ms += unit_ms;
+        so_bytes += size;
+    }
+
     let total_push = members.first().map(|(_, bc)| count_push_immediates(bc) as u32).unwrap_or(0);
     Ok((
         CompileMetrics {
-            compile_time_ms: t.elapsed().as_secs_f64() * 1000.0,
+            compile_time_ms,
             so_bytes,
             num_variant: 0,
             num_invariant: total_push,
@@ -809,7 +862,7 @@ fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(&fam_tmp)?;
 
         // ── Compile (3 modes) ─────────────────────────────────────────────
-        let (per_hash, ph_arts) = compile_per_hash_mode(members, &fam_tmp)?;
+        let (per_hash, ph_arts) = compile_per_hash_mode(members, &fam_tmp, args.compile_threads)?;
         let (skelot, sk_art) =
             compile_skeleton_mode(members, ClassifyMode::Auto, &fam_tmp, "skelot_auto")?;
         let (all_variant, av_art) = compile_skeleton_mode(
