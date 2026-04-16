@@ -252,17 +252,39 @@ struct PerHashArtifact {
     symbol: String,
 }
 
+/// Persistent `.so` cache root for Stage E. Files survive across runs; keyed
+/// by cap so different `--compile-members-cap` settings don't collide.
+const SO_CACHE_ROOT: &str =
+    "/home/ubuntu/hermes-shared-workspace/skelot-paper/data/stage_e_so_cache";
+
+fn family_cache_dir(skeleton_id: &str, cap: usize) -> PathBuf {
+    Path::new(SO_CACHE_ROOT).join(format!("cap{cap}")).join(skeleton_id)
+}
+
+fn cache_hit(obj: &Path, lib: &Path) -> bool {
+    let obj_ok = std::fs::metadata(obj).map(|m| m.len() > 0).unwrap_or(false);
+    let lib_ok = std::fs::metadata(lib).map(|m| m.len() > 0).unwrap_or(false);
+    obj_ok && lib_ok
+}
+
 fn compile_per_hash_mode(
     members: &[(B256, Vec<u8>)],
-    tmp_dir: &Path,
+    cache_dir: &Path,
     threads: usize,
 ) -> anyhow::Result<(CompileMetrics, Vec<PerHashArtifact>)> {
     use std::sync::Mutex;
     // Round-robin assign compiles to N worker threads. Each thread maintains
     // its own LLVM Context (via compile_per_hash's per-call scoping), so the
     // pattern is identical to Stage B's `run_per_hash` in skelot_compile_bench.
-    // `compile_time_ms` aggregates per-unit wall (serial-equivalent) not the
+    //
+    // Cache-hit semantics: if a family member's .o + .so are already on disk
+    // under `{cache_dir}/per_hash_{hash16}.*` with non-zero size, skip compile
+    // entirely, record `compile_time_ms = 0.0` for that member, and report the
+    // existing `.so` size. Cache misses compile + write.
+    //
+    // `compile_time_ms` aggregates per-unit wall (serial-equivalent) NOT the
     // parallel wall, keeping cap-invariant ratios meaningful across families.
+    std::fs::create_dir_all(cache_dir)?;
     let n = members.len();
     let threads = threads.max(1).min(n.max(1));
     let mut assignments: Vec<Vec<usize>> = (0..threads).map(|_| Vec::new()).collect();
@@ -282,14 +304,19 @@ fn compile_per_hash_mode(
                 s.spawn(move || -> anyhow::Result<()> {
                     for i in chunk {
                         let (hash, bc) = &members_ref[i];
-                        let symbol = format!("ph_{i}");
-                        let obj = tmp_dir.join(format!("per_hash_{i}.o"));
-                        let lib = tmp_dir.join(format!("per_hash_{i}.so"));
-                        let t0 = Instant::now();
-                        compile_per_hash(bc, &symbol, &obj, &lib, OPT)
-                            .map_err(|e| anyhow::anyhow!("compile_per_hash[{i}]: {e}"))?;
-                        let unit_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                        let size = std::fs::metadata(&lib)?.len();
+                        let hash_hex = hex::encode(&hash[..8]); // 16 hex = 64-bit
+                        let symbol = format!("ph_{hash_hex}");
+                        let obj = cache_dir.join(format!("per_hash_{hash_hex}.o"));
+                        let lib = cache_dir.join(format!("per_hash_{hash_hex}.so"));
+                        let (unit_ms, size) = if cache_hit(&obj, &lib) {
+                            (0.0_f64, std::fs::metadata(&lib)?.len())
+                        } else {
+                            let t0 = Instant::now();
+                            compile_per_hash(bc, &symbol, &obj, &lib, OPT)
+                                .map_err(|e| anyhow::anyhow!("compile_per_hash[{i}]: {e}"))?;
+                            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                            (ms, std::fs::metadata(&lib)?.len())
+                        };
                         *slots_ref[i].lock().unwrap() =
                             Some((PerHashArtifact { hash: *hash, lib, symbol }, unit_ms, size));
                     }
@@ -336,18 +363,22 @@ struct SkeletonArtifact {
 fn compile_skeleton_mode(
     members: &[(B256, Vec<u8>)],
     mode: ClassifyMode,
-    tmp_dir: &Path,
+    cache_dir: &Path,
     tag: &str,
 ) -> anyhow::Result<(CompileMetrics, SkeletonArtifact)> {
+    std::fs::create_dir_all(cache_dir)?;
     let refs: Vec<&[u8]> = members.iter().map(|(_, v)| v.as_slice()).collect();
     let variance = analyze_skeleton_group_with_mode(&refs, mode);
-    let obj = tmp_dir.join(format!("{tag}.o"));
-    let lib = tmp_dir.join(format!("{tag}.so"));
-    let t = Instant::now();
-    compile_skeleton_group(&members[0].1, &variance, tag, &obj, &lib, OPT)
-        .map_err(|e| anyhow::anyhow!("compile_skeleton_group: {e}"))?;
-    let compile_time_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let so_bytes = std::fs::metadata(&lib)?.len();
+    let obj = cache_dir.join(format!("{tag}.o"));
+    let lib = cache_dir.join(format!("{tag}.so"));
+    let (compile_time_ms, so_bytes) = if cache_hit(&obj, &lib) {
+        (0.0_f64, std::fs::metadata(&lib)?.len())
+    } else {
+        let t = Instant::now();
+        compile_skeleton_group(&members[0].1, &variance, tag, &obj, &lib, OPT)
+            .map_err(|e| anyhow::anyhow!("compile_skeleton_group: {e}"))?;
+        (t.elapsed().as_secs_f64() * 1000.0, std::fs::metadata(&lib)?.len())
+    };
     let num_total = variance.pushes.len() as u32;
     let num_invariant = num_total - variance.num_variant;
     let num_skip_logic_preserved = match mode {
@@ -385,7 +416,10 @@ fn load_raw_fn(
 struct TimingPerHashHandler {
     functions: Arc<HashMap<B256, RawEvmCompilerFn>>,
     target_hashes: Arc<HashSet<B256>>,
-    total_ns: u128,
+    /// One entry per target-hash frame executed during this round.
+    /// u64 fits any realistic single-frame wall-ns (frames are hundreds of ns
+    /// to low ms); saturated via `try_into().unwrap_or(u64::MAX)`.
+    frame_ns: Vec<u64>,
 }
 
 impl Handler for TimingPerHashHandler {
@@ -443,7 +477,8 @@ impl TimingPerHashHandler {
             let t0 = if is_target { Some(Instant::now()) } else { None };
             let action = unsafe { f.call_with_interpreter(&mut frame.interpreter, ctx) };
             if let Some(t0) = t0 {
-                self.total_ns += t0.elapsed().as_nanos();
+                let ns: u64 = t0.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
+                self.frame_ns.push(ns);
             }
             let result = frame.process_next_action::<_, BenchError>(ctx, action).inspect(|i| {
                 if i.is_result() {
@@ -462,7 +497,9 @@ impl TimingPerHashHandler {
 struct TimingSkeletonHandler {
     dispatch: Arc<HashMap<B256, (EvmCompilerFn, Vec<u8>)>>,
     target_hashes: Arc<HashSet<B256>>,
-    total_ns: u128,
+    /// One entry per target-hash frame executed during this round. See
+    /// TimingPerHashHandler::frame_ns for units.
+    frame_ns: Vec<u64>,
 }
 
 impl Handler for TimingSkeletonHandler {
@@ -521,7 +558,8 @@ impl TimingSkeletonHandler {
                 skel_fn.call_with_interpreter_data(&mut frame.interpreter, ctx, table.as_ptr())
             };
             if let Some(t0) = t0 {
-                self.total_ns += t0.elapsed().as_nanos();
+                let ns: u64 = t0.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
+                self.frame_ns.push(ns);
             }
             let result = frame.process_next_action::<_, BenchError>(ctx, action).inspect(|i| {
                 if i.is_result() {
@@ -542,9 +580,16 @@ impl TimingSkeletonHandler {
 //   1. `single_tx_evm` clones the pre-tx snapshot into a fresh CacheDB and
 //      seeds `evm.ctx.tx` with the representative tx.
 //   2. A freshly-constructed timing handler runs that single tx.
-//   3. `h.total_ns` accumulates wall-ns spent in frames whose code_hash is in
-//      the family's capped target set.
+//   3. Each target-hash frame pushes one wall-ns entry into `h.frame_ns`.
+// Per-family `ExecOutput.samples` is the concatenation of every round's
+// `frame_ns`, so `len = rounds * frames_per_round_mean` (not `= rounds`).
 // The pre-tx snapshot itself is built once per family (outside these loops).
+
+struct ExecOutput {
+    samples: Vec<f64>,
+    frames_per_round_mean: f64,
+    frame_samples_n: u64,
+}
 
 fn exec_per_hash_single(
     snapshot: &CacheDB<EmptyDB>,
@@ -554,28 +599,31 @@ fn exec_per_hash_single(
     target: &Arc<HashSet<B256>>,
     rounds: usize,
     warmup: usize,
-) -> Vec<f64> {
+) -> ExecOutput {
     for _ in 0..warmup {
         let mut h = TimingPerHashHandler {
             functions: functions.clone(),
             target_hashes: target.clone(),
-            total_ns: 0,
+            frame_ns: Vec::with_capacity(8),
         };
         let mut evm = bin_common::single_tx_evm(snapshot, chain_id, tx_bin);
         let _ = h.run(&mut evm);
     }
-    let mut samples = Vec::with_capacity(rounds);
+    let mut samples = Vec::with_capacity(rounds * 2);
+    let mut total_frames: u64 = 0;
     for _ in 0..rounds {
         let mut h = TimingPerHashHandler {
             functions: functions.clone(),
             target_hashes: target.clone(),
-            total_ns: 0,
+            frame_ns: Vec::with_capacity(8),
         };
         let mut evm = bin_common::single_tx_evm(snapshot, chain_id, tx_bin);
         let _ = h.run(&mut evm);
-        samples.push(h.total_ns as f64);
+        total_frames += h.frame_ns.len() as u64;
+        samples.extend(h.frame_ns.drain(..).map(|n| n as f64));
     }
-    samples
+    let frames_per_round_mean = total_frames as f64 / rounds as f64;
+    ExecOutput { samples, frames_per_round_mean, frame_samples_n: total_frames }
 }
 
 fn exec_skeleton_single(
@@ -586,28 +634,31 @@ fn exec_skeleton_single(
     target: &Arc<HashSet<B256>>,
     rounds: usize,
     warmup: usize,
-) -> Vec<f64> {
+) -> ExecOutput {
     for _ in 0..warmup {
         let mut h = TimingSkeletonHandler {
             dispatch: dispatch.clone(),
             target_hashes: target.clone(),
-            total_ns: 0,
+            frame_ns: Vec::with_capacity(8),
         };
         let mut evm = bin_common::single_tx_evm(snapshot, chain_id, tx_bin);
         let _ = h.run(&mut evm);
     }
-    let mut samples = Vec::with_capacity(rounds);
+    let mut samples = Vec::with_capacity(rounds * 2);
+    let mut total_frames: u64 = 0;
     for _ in 0..rounds {
         let mut h = TimingSkeletonHandler {
             dispatch: dispatch.clone(),
             target_hashes: target.clone(),
-            total_ns: 0,
+            frame_ns: Vec::with_capacity(8),
         };
         let mut evm = bin_common::single_tx_evm(snapshot, chain_id, tx_bin);
         let _ = h.run(&mut evm);
-        samples.push(h.total_ns as f64);
+        total_frames += h.frame_ns.len() as u64;
+        samples.extend(h.frame_ns.drain(..).map(|n| n as f64));
     }
-    samples
+    let frames_per_round_mean = total_frames as f64 / rounds as f64;
+    ExecOutput { samples, frames_per_round_mean, frame_samples_n: total_frames }
 }
 
 fn summarize(samples: &[f64]) -> (f64, f64, f64, f64) {
@@ -625,13 +676,18 @@ fn summarize(samples: &[f64]) -> (f64, f64, f64, f64) {
     (median, p5, p95, var.sqrt())
 }
 
-fn flat_mode(cm: &CompileMetrics, samples: &[f64], baseline: Option<&[f64]>) -> serde_json::Value {
+fn flat_mode(
+    cm: &CompileMetrics,
+    exec: &ExecOutput,
+    baseline: Option<&ExecOutput>,
+) -> serde_json::Value {
+    let samples = exec.samples.as_slice();
     let (median, p5, p95, sd) = summarize(samples);
     let welch = baseline.and_then(|b| {
-        if samples.is_empty() || b.is_empty() {
+        if samples.is_empty() || b.samples.is_empty() {
             None
         } else {
-            Some(welch_p(samples, b))
+            Some(welch_p(samples, &b.samples))
         }
     });
     serde_json::json!({
@@ -645,6 +701,8 @@ fn flat_mode(cm: &CompileMetrics, samples: &[f64], baseline: Option<&[f64]>) -> 
         "exec_p95_ns": p95,
         "exec_stdev_ns": sd,
         "welch_p_vs_skelot": welch,
+        "frames_per_round_mean": exec.frames_per_round_mean,
+        "frame_samples_n": exec.frame_samples_n,
     })
 }
 
@@ -667,38 +725,40 @@ fn run_family_exec(
     av_art: &SkeletonArtifact,
     rounds: usize,
     warmup: usize,
-) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+) -> (ExecOutput, ExecOutput, ExecOutput) {
+    let empty =
+        || ExecOutput { samples: Vec::new(), frames_per_round_mean: 0.0, frame_samples_n: 0 };
     let (bn, ti) = match rep_tx {
         Some(p) => p,
         None => {
             eprintln!("[exec-skip] family {fam_id} has no capped member with a tx in corpus");
-            return (Vec::new(), Vec::new(), Vec::new());
+            return (empty(), empty(), empty());
         }
     };
     let loader = match BinLoader::new(bench_dir, bn) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[exec-skip] family {fam_id} block {bn} loader: {e}");
-            return (Vec::new(), Vec::new(), Vec::new());
+            return (empty(), empty(), empty());
         }
     };
     let chain_id = loader.raw_txs().first().and_then(|tx| tx.chain_id);
     let tx_bin = match loader.raw_txs().get(ti) {
         Some(tx) if tx.tx_type == 0x7e => {
             eprintln!("[exec-skip] family {fam_id} rep tx[{ti}] @ block {bn} is deposit (0x7e)");
-            return (Vec::new(), Vec::new(), Vec::new());
+            return (empty(), empty(), empty());
         }
         Some(tx) => tx,
         None => {
             eprintln!("[exec-skip] family {fam_id} rep tx_index {ti} out of range for block {bn}");
-            return (Vec::new(), Vec::new(), Vec::new());
+            return (empty(), empty(), empty());
         }
     };
     let snapshot = match snapshot_before_tx(&loader, ti, false) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[exec-skip] family {fam_id} snapshot_before_tx failed: {e}");
-            return (Vec::new(), Vec::new(), Vec::new());
+            return (empty(), empty(), empty());
         }
     };
 
@@ -719,7 +779,7 @@ fn run_family_exec(
         Ok(p) => p,
         Err(e) => {
             eprintln!("[exec-skip] family {fam_id} dlopen skelot_auto: {e}");
-            return (Vec::new(), Vec::new(), Vec::new());
+            return (empty(), empty(), empty());
         }
     };
     let sk_ecf = EvmCompilerFn::new(sk_fn);
@@ -733,7 +793,7 @@ fn run_family_exec(
         Ok(p) => p,
         Err(e) => {
             eprintln!("[exec-skip] family {fam_id} dlopen skelot_forced: {e}");
-            return (Vec::new(), Vec::new(), Vec::new());
+            return (empty(), empty(), empty());
         }
     };
     let av_ecf = EvmCompilerFn::new(av_fn);
@@ -755,21 +815,6 @@ fn run_family_exec(
         exec_skeleton_single(&snapshot, chain_id, tx_bin, &sk_dispatch, &target, rounds, warmup);
     let av =
         exec_skeleton_single(&snapshot, chain_id, tx_bin, &av_dispatch, &target, rounds, warmup);
-
-    // Revert detection: if ALL samples across ALL three modes are zero, the
-    // rep tx almost certainly reverted before any dispatched frame could
-    // accumulate ns. Empty-iterator guard avoids `Iterator::all` returning
-    // `true` on an empty chain (which would falsely trigger the warn).
-    let all_zero = !ph.is_empty()
-        && !sk.is_empty()
-        && !av.is_empty()
-        && ph.iter().chain(sk.iter()).chain(av.iter()).all(|s| *s == 0.0);
-    if all_zero {
-        eprintln!(
-            "[warn] family {fam_id} rep tx[{ti}] @ block {bn} produced zero JIT-frame time; \
-             likely reverted (check skip_deposits / tx_index alignment)"
-        );
-    }
 
     // Drop Arcs BEFORE `_ph_libs`/`_sk_lib`/`_av_lib` go out of scope so fn
     // pointers stay valid across the exec calls (libs live to the end of
@@ -797,7 +842,25 @@ fn main() -> anyhow::Result<()> {
         let _ = std::fs::remove_file(&sidecar);
         eprintln!("[resume] --no-resume: cleared sidecar {}", sidecar.display());
     }
-    let (done_ids, prior_rows) = load_sidecar_done(&sidecar).unwrap_or_default();
+    let (mut done_ids, prior_rows) = load_sidecar_done(&sidecar).unwrap_or_default();
+    // v1 → v2 migration: rows lacking `frames_per_round_mean` were written under
+    // the per-tx-sum exec semantic. They are not combinable with per-frame
+    // samples, so we move the old sidecar aside (preserving provenance) and
+    // recompute every sampled family once under v2 semantics. After the first
+    // post-refactor run, the sidecar is pure v2 and resumes normally.
+    let has_v1 = prior_rows
+        .iter()
+        .any(|r| r["per_hash"].get("frames_per_round_mean").map_or(true, |v| v.is_null()));
+    if has_v1 && !prior_rows.is_empty() {
+        let v1_backup = sidecar.with_extension("v1.jsonl");
+        std::fs::rename(&sidecar, &v1_backup)?;
+        eprintln!(
+            "[migrate] v1 sidecar → {}; recomputing {} families under per-frame semantics",
+            v1_backup.display(),
+            prior_rows.len()
+        );
+        done_ids.clear();
+    }
     if !done_ids.is_empty() {
         eprintln!(
             "[resume] loaded {} prior family rows from {}",
@@ -840,8 +903,6 @@ fn main() -> anyhow::Result<()> {
             .collect()
     };
 
-    let tmp_root = tempfile::tempdir()?;
-
     for (idx, (fam, (members, rep_tx_from_cap))) in
         sampled.iter().zip(family_plans.iter()).enumerate()
     {
@@ -858,17 +919,18 @@ fn main() -> anyhow::Result<()> {
             eprintln!("[skip] family {}: no bytecodes resolved from corpus", fam.skeleton_id);
             continue;
         }
-        let fam_tmp = tmp_root.path().join(&fam.skeleton_id);
-        std::fs::create_dir_all(&fam_tmp)?;
+        // Persistent `.so` cache dir — survives across runs. Cache keyed by
+        // cap to auto-invalidate when `--compile-members-cap` changes.
+        let fam_cache = family_cache_dir(&fam.skeleton_id, args.compile_members_cap);
 
-        // ── Compile (3 modes) ─────────────────────────────────────────────
-        let (per_hash, ph_arts) = compile_per_hash_mode(members, &fam_tmp, args.compile_threads)?;
+        // ── Compile (3 modes, cache-aware) ────────────────────────────────
+        let (per_hash, ph_arts) = compile_per_hash_mode(members, &fam_cache, args.compile_threads)?;
         let (skelot, sk_art) =
-            compile_skeleton_mode(members, ClassifyMode::Auto, &fam_tmp, "skelot_auto")?;
+            compile_skeleton_mode(members, ClassifyMode::Auto, &fam_cache, "skelot_auto")?;
         let (all_variant, av_art) = compile_skeleton_mode(
             members,
             ClassifyMode::ForceAllVariant,
-            &fam_tmp,
+            &fam_cache,
             "skelot_forced",
         )?;
 
@@ -885,7 +947,7 @@ fn main() -> anyhow::Result<()> {
         // it). Exec replays THIS single tx per round on the pre-tx snapshot.
         let rep_tx: Option<(u64, usize)> = *rep_tx_from_cap;
 
-        let (ph_samples, sk_samples, av_samples) = run_family_exec(
+        let (ph_exec, sk_exec, av_exec) = run_family_exec(
             &fam.skeleton_id,
             members,
             rep_tx,
@@ -898,9 +960,9 @@ fn main() -> anyhow::Result<()> {
         );
 
         // ── Flatten ───────────────────────────────────────────────────────
-        let ph_row = flat_mode(&per_hash, &ph_samples, Some(&sk_samples));
-        let sk_row = flat_mode(&skelot, &sk_samples, None);
-        let av_row = flat_mode(&all_variant, &av_samples, Some(&sk_samples));
+        let ph_row = flat_mode(&per_hash, &ph_exec, Some(&sk_exec));
+        let sk_row = flat_mode(&skelot, &sk_exec, None);
+        let av_row = flat_mode(&all_variant, &av_exec, Some(&sk_exec));
 
         let row = serde_json::json!({
             "skeleton_id": fam.skeleton_id,
@@ -915,14 +977,17 @@ fn main() -> anyhow::Result<()> {
         });
         append_family_row(&sidecar, &row)?;
         eprintln!(
-            "[{}/{}] {} done (rep_tx={:?}, samples=[ph={}, sk={}, av={}])",
+            "[{}/{}] {} done (rep_tx={:?}, frames=[ph={} av_mean={:.2}, sk={} av_mean={:.2}, av={} av_mean={:.2}])",
             idx + 1,
             sampled.len(),
             fam.skeleton_id,
             rep_tx,
-            ph_samples.len(),
-            sk_samples.len(),
-            av_samples.len()
+            ph_exec.frame_samples_n,
+            ph_exec.frames_per_round_mean,
+            sk_exec.frame_samples_n,
+            sk_exec.frames_per_round_mean,
+            av_exec.frame_samples_n,
+            av_exec.frames_per_round_mean,
         );
     }
 
