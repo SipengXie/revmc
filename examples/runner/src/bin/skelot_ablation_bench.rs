@@ -73,6 +73,58 @@ struct Args {
     /// Output JSON path.
     #[arg(long)]
     out: PathBuf,
+    /// Resume from the per-family JSONL sidecar next to `--out`. When `true`
+    /// (default), already-completed families skip compile+exec and are
+    /// reloaded from the sidecar. Pass `--no-resume` to discard the sidecar
+    /// and recompute everything.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    resume: bool,
+}
+
+/// Sidecar JSONL path derived from the final output path.
+/// `/…/foo.json` → `/…/foo.families.jsonl`.
+fn sidecar_path(out: &Path) -> PathBuf {
+    let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("ablation");
+    let parent = out.parent().unwrap_or(Path::new("."));
+    parent.join(format!("{stem}.families.jsonl"))
+}
+
+/// Read every JSON line from `path` and collect the `skeleton_id` field.
+fn load_sidecar_done(path: &Path) -> std::io::Result<(HashSet<String>, Vec<serde_json::Value>)> {
+    use std::io::{BufRead, BufReader};
+    let mut done = HashSet::new();
+    let mut rows = Vec::new();
+    let f = std::fs::File::open(path)?;
+    for line in BufReader::new(f).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[resume] skipping malformed sidecar line: {e}");
+                continue;
+            }
+        };
+        if let Some(id) = v.get("skeleton_id").and_then(|s| s.as_str()) {
+            done.insert(id.to_string());
+            rows.push(v);
+        }
+    }
+    Ok((done, rows))
+}
+
+/// Append one family row as a single JSON line + newline. Creates the file
+/// if missing; flushes before returning.
+fn append_family_row(path: &Path, row: &serde_json::Value) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let line = serde_json::to_string(row)?;
+    f.write_all(line.as_bytes())?;
+    f.write_all(b"\n")?;
+    f.flush()?;
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -575,6 +627,24 @@ fn main() -> anyhow::Result<()> {
     let sampled = stratified_family_sample(&families, args.per_bucket, args.seed);
     eprintln!("Sampled {} families from {} total", sampled.len(), families.len());
 
+    // Resumable persistence: each completed family is appended as one JSON
+    // line to `{out-stem}.families.jsonl` next to --out. On restart we read
+    // the sidecar, skip already-done skeleton_ids, and at end reload all
+    // rows from it to build bucket_aggregates and the final JSON.
+    let sidecar = sidecar_path(&args.out);
+    if !args.resume {
+        let _ = std::fs::remove_file(&sidecar);
+        eprintln!("[resume] --no-resume: cleared sidecar {}", sidecar.display());
+    }
+    let (done_ids, prior_rows) = load_sidecar_done(&sidecar).unwrap_or_default();
+    if !done_ids.is_empty() {
+        eprintln!(
+            "[resume] loaded {} prior family rows from {}",
+            prior_rows.len(),
+            sidecar.display()
+        );
+    }
+
     let all_codes = collect_bytecodes(&args.bench_dir, args.start_block, args.block_count);
     eprintln!(
         "Collected {} compilable bytecodes from states/[{}..{})",
@@ -604,9 +674,17 @@ fn main() -> anyhow::Result<()> {
         .collect();
 
     let tmp_root = tempfile::tempdir()?;
-    let mut fam_rows = Vec::<serde_json::Value>::new();
 
     for (idx, (fam, members)) in sampled.iter().zip(family_members.iter()).enumerate() {
+        if done_ids.contains(&fam.skeleton_id) {
+            eprintln!(
+                "[{}/{}] [resume] skipping already-done family {}",
+                idx + 1,
+                sampled.len(),
+                fam.skeleton_id
+            );
+            continue;
+        }
         if members.is_empty() {
             eprintln!("[skip] family {}: no bytecodes resolved from corpus", fam.skeleton_id);
             continue;
@@ -735,7 +813,7 @@ fn main() -> anyhow::Result<()> {
         let sk_row = flat_mode(&skelot, &sk_samples, None);
         let av_row = flat_mode(&all_variant, &av_samples, Some(&sk_samples));
 
-        fam_rows.push(serde_json::json!({
+        let row = serde_json::json!({
             "skeleton_id": fam.skeleton_id,
             "bucket": bucket_name,
             "member_count": fam.member_count,
@@ -743,7 +821,8 @@ fn main() -> anyhow::Result<()> {
             "per_hash": ph_row,
             "skelot": sk_row,
             "all_variant": av_row,
-        }));
+        });
+        append_family_row(&sidecar, &row)?;
         eprintln!(
             "[{}/{}] {} done (rep_block={:?}, samples=[ph={}, sk={}, av={}])",
             idx + 1,
@@ -755,6 +834,13 @@ fn main() -> anyhow::Result<()> {
             av_samples.len()
         );
     }
+
+    // Reload the authoritative family rows from the sidecar. On a plain run
+    // this is a superset of what we just appended; on resume it's the union
+    // of prior + new rows. Source of truth for bucket_aggregates and the
+    // final JSON.
+    let (_final_ids, fam_rows) = load_sidecar_done(&sidecar).unwrap_or_default();
+    eprintln!("Assembling final output from {} sidecar rows", fam_rows.len());
 
     // ── Bucket aggregates ─────────────────────────────────────────────────
     let mut by_bucket: std::collections::BTreeMap<String, Vec<&serde_json::Value>> =
