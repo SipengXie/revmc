@@ -31,8 +31,8 @@ use revmc_builtins as _;
 use revmc_context::RawEvmCompilerFn;
 
 use bin_common::{
-    build_op_cfg, build_op_tx, compile_all_contracts_with_cache, BenchEvm, BinLoader, JitHandler, NativeHandler,
-    OpCtx,
+    build_op_cfg, build_op_tx, compile_all_contracts_with_cache, snapshot_before_tx, BenchEvm,
+    BinLoader, JitHandler, NativeHandler, OpCtx,
 };
 
 #[derive(Parser)]
@@ -73,40 +73,6 @@ fn u256_hex(v: U256) -> String {
     format!("0x{}", hex::encode(v.to_be_bytes::<32>()))
 }
 
-fn snapshot_before_tx(
-    loader: &BinLoader,
-    tx_index: usize,
-    skip_deposits: bool,
-) -> Result<CacheDB<EmptyDB>, String> {
-    let chain_id = loader.raw_txs().first().and_then(|tx| tx.chain_id);
-    let cfg = build_op_cfg(chain_id);
-    let dummy_tx = OpTransaction::builder().build_fill();
-
-    let mut evm: BenchEvm = {
-        let ctx = OpCtx::<EmptyDB>::op()
-            .with_cfg(cfg)
-            .with_db(loader.build_cache_db())
-            .with_tx(dummy_tx);
-        op_revm::OpEvm::new(ctx, ())
-    };
-
-    for (i, tx_bin) in loader.raw_txs().iter().enumerate() {
-        if i == tx_index {
-            break;
-        }
-        if skip_deposits && tx_bin.tx_type == 0x7e {
-            continue;
-        }
-        evm.0.ctx.tx = build_op_tx(tx_bin);
-        let mut handler = NativeHandler;
-        handler
-            .run(&mut evm)
-            .map_err(|e| format!("replay tx[{i}] failed: {e:?}"))?;
-    }
-
-    Ok(evm.0.ctx.journaled_state.database.clone())
-}
-
 fn collect_accesses(
     tx_bin: &bin_common::TxBin,
     snapshot: &CacheDB<EmptyDB>,
@@ -115,10 +81,7 @@ fn collect_accesses(
     let cfg = build_op_cfg(chain_id);
     let dummy_tx = OpTransaction::builder().build_fill();
     let mut evm: BenchEvm = {
-        let ctx = OpCtx::<EmptyDB>::op()
-            .with_cfg(cfg)
-            .with_db(snapshot.clone())
-            .with_tx(dummy_tx);
+        let ctx = OpCtx::<EmptyDB>::op().with_cfg(cfg).with_db(snapshot.clone()).with_tx(dummy_tx);
         op_revm::OpEvm::new(ctx, ())
     };
     evm.0.ctx.tx = build_op_tx(tx_bin);
@@ -160,10 +123,7 @@ fn run_once_native(
     let cfg = build_op_cfg(chain_id);
     let dummy_tx = OpTransaction::builder().build_fill();
     let mut evm: BenchEvm = {
-        let ctx = OpCtx::<EmptyDB>::op()
-            .with_cfg(cfg)
-            .with_db(snapshot.clone())
-            .with_tx(dummy_tx);
+        let ctx = OpCtx::<EmptyDB>::op().with_cfg(cfg).with_db(snapshot.clone()).with_tx(dummy_tx);
         op_revm::OpEvm::new(ctx, ())
     };
     evm.0.ctx.tx = build_op_tx(tx_bin);
@@ -183,10 +143,7 @@ fn run_once_jit(
     let cfg = build_op_cfg(chain_id);
     let dummy_tx = OpTransaction::builder().build_fill();
     let mut evm: BenchEvm = {
-        let ctx = OpCtx::<EmptyDB>::op()
-            .with_cfg(cfg)
-            .with_db(snapshot.clone())
-            .with_tx(dummy_tx);
+        let ctx = OpCtx::<EmptyDB>::op().with_cfg(cfg).with_db(snapshot.clone()).with_tx(dummy_tx);
         op_revm::OpEvm::new(ctx, ())
     };
     evm.0.ctx.tx = build_op_tx(tx_bin);
@@ -206,10 +163,8 @@ fn run_target_with_prefix_native(
     let cfg = build_op_cfg(chain_id);
     let dummy_tx = OpTransaction::builder().build_fill();
     let mut evm: BenchEvm = {
-        let ctx = OpCtx::<EmptyDB>::op()
-            .with_cfg(cfg)
-            .with_db(loader.build_cache_db())
-            .with_tx(dummy_tx);
+        let ctx =
+            OpCtx::<EmptyDB>::op().with_cfg(cfg).with_db(loader.build_cache_db()).with_tx(dummy_tx);
         op_revm::OpEvm::new(ctx, ())
     };
 
@@ -245,10 +200,8 @@ fn run_target_with_prefix_jit(
     let cfg = build_op_cfg(chain_id);
     let dummy_tx = OpTransaction::builder().build_fill();
     let mut evm: BenchEvm = {
-        let ctx = OpCtx::<EmptyDB>::op()
-            .with_cfg(cfg)
-            .with_db(loader.build_cache_db())
-            .with_tx(dummy_tx);
+        let ctx =
+            OpCtx::<EmptyDB>::op().with_cfg(cfg).with_db(loader.build_cache_db()).with_tx(dummy_tx);
         op_revm::OpEvm::new(ctx, ())
     };
 
@@ -261,9 +214,7 @@ fn run_target_with_prefix_jit(
             continue;
         }
         evm.0.ctx.tx = build_op_tx(tx_bin);
-        let mut handler = JitHandler {
-            functions: functions.clone(),
-        };
+        let mut handler = JitHandler { functions: functions.clone() };
         if i == tx_index {
             let t0 = Instant::now();
             let _ = handler.run(&mut evm);
@@ -286,10 +237,8 @@ fn run_full_block_and_pick_tx(
     let cfg = build_op_cfg(chain_id);
     let dummy_tx = OpTransaction::builder().build_fill();
     let mut evm: BenchEvm = {
-        let ctx = OpCtx::<EmptyDB>::op()
-            .with_cfg(cfg)
-            .with_db(loader.build_cache_db())
-            .with_tx(dummy_tx);
+        let ctx =
+            OpCtx::<EmptyDB>::op().with_cfg(cfg).with_db(loader.build_cache_db()).with_tx(dummy_tx);
         op_revm::OpEvm::new(ctx, ())
     };
 
@@ -301,9 +250,7 @@ fn run_full_block_and_pick_tx(
         evm.0.ctx.tx = build_op_tx(tx_bin);
         let t0 = Instant::now();
         if let Some(fns) = functions {
-            let mut h = JitHandler {
-                functions: fns.clone(),
-            };
+            let mut h = JitHandler { functions: fns.clone() };
             let _ = h.run(&mut evm);
         } else {
             let mut h = NativeHandler;
@@ -326,10 +273,8 @@ fn run_full_block_target_only_timer(
     let cfg = build_op_cfg(chain_id);
     let dummy_tx = OpTransaction::builder().build_fill();
     let mut evm: BenchEvm = {
-        let ctx = OpCtx::<EmptyDB>::op()
-            .with_cfg(cfg)
-            .with_db(loader.build_cache_db())
-            .with_tx(dummy_tx);
+        let ctx =
+            OpCtx::<EmptyDB>::op().with_cfg(cfg).with_db(loader.build_cache_db()).with_tx(dummy_tx);
         op_revm::OpEvm::new(ctx, ())
     };
 
@@ -340,9 +285,7 @@ fn run_full_block_target_only_timer(
         }
         evm.0.ctx.tx = build_op_tx(tx_bin);
         if let Some(fns) = functions {
-            let mut h = JitHandler {
-                functions: fns.clone(),
-            };
+            let mut h = JitHandler { functions: fns.clone() };
             if i == tx_index {
                 let t0 = Instant::now();
                 let _ = h.run(&mut evm);
@@ -389,10 +332,7 @@ fn main() {
     println!("caller: 0x{}", hex::encode(tx_bin.caller));
     println!(
         "to: {}",
-        tx_bin
-            .to
-            .map(|a| format!("0x{}", hex::encode(a)))
-            .unwrap_or_else(|| "CREATE".to_string())
+        tx_bin.to.map(|a| format!("0x{}", hex::encode(a))).unwrap_or_else(|| "CREATE".to_string())
     );
     println!("gas_limit: {}", tx_bin.gas_limit);
     println!("skip_deposits: {}", args.skip_deposits);
@@ -422,8 +362,8 @@ fn main() {
     }
 
     println!("\n[1/3] Build pre-tx snapshot...");
-    let pre_snapshot =
-        snapshot_before_tx(&loader, args.tx_index, args.skip_deposits).expect("build pre-tx snapshot");
+    let pre_snapshot = snapshot_before_tx(&loader, args.tx_index, args.skip_deposits)
+        .expect("build pre-tx snapshot");
 
     println!("[2/3] Collect accessed accounts/slots from one native run...");
     let (accounts, slots) = collect_accesses(tx_bin, &pre_snapshot, chain_id);
@@ -448,11 +388,8 @@ fn main() {
     }
 
     println!("\n[3/3] Compile JIT and benchmark target tx...");
-    let all_codes: HashMap<B256, _> = loader
-        .code_values()
-        .iter()
-        .map(|(h, bc)| (*h, bc.clone()))
-        .collect();
+    let all_codes: HashMap<B256, _> =
+        loader.code_values().iter().map(|(h, bc)| (*h, bc.clone())).collect();
     let compiled = compile_all_contracts_with_cache(
         &all_codes,
         OptimizationLevel::Aggressive,
@@ -465,9 +402,8 @@ fn main() {
         let _ = run_once_jit(tx_bin, &pre_snapshot, chain_id, compiled.functions.clone());
     }
 
-    let native_samples: Vec<Duration> = (0..args.rounds)
-        .map(|_| run_once_native(tx_bin, &pre_snapshot, chain_id))
-        .collect();
+    let native_samples: Vec<Duration> =
+        (0..args.rounds).map(|_| run_once_native(tx_bin, &pre_snapshot, chain_id)).collect();
     let jit_samples: Vec<Duration> = (0..args.rounds)
         .map(|_| run_once_jit(tx_bin, &pre_snapshot, chain_id, compiled.functions.clone()))
         .collect();
@@ -519,14 +455,8 @@ fn main() {
         (prefix_jit_med.as_secs_f64() - prefix_native_med.as_secs_f64()) * 1_000_000.0;
 
     println!("\n=== Prefix-Aligned Result (full-block context) ===");
-    println!(
-        "native_median: {:.3}µs",
-        prefix_native_med.as_secs_f64() * 1_000_000.0
-    );
-    println!(
-        "jit_median:    {:.3}µs",
-        prefix_jit_med.as_secs_f64() * 1_000_000.0
-    );
+    println!("native_median: {:.3}µs", prefix_native_med.as_secs_f64() * 1_000_000.0);
+    println!("jit_median:    {:.3}µs", prefix_jit_med.as_secs_f64() * 1_000_000.0);
     println!("speedup:       {:.3}x (native/jit)", prefix_speedup);
     println!("delta:         {:+.3}µs (jit - native)", prefix_delta_us);
 
@@ -543,7 +473,9 @@ fn main() {
     let mut classify_native_samples = Vec::with_capacity(args.rounds);
     let mut classify_jit_samples = Vec::with_capacity(args.rounds);
     for _ in 0..args.rounds {
-        if let Some(n) = run_full_block_and_pick_tx(&loader, args.tx_index, args.skip_deposits, None) {
+        if let Some(n) =
+            run_full_block_and_pick_tx(&loader, args.tx_index, args.skip_deposits, None)
+        {
             classify_native_samples.push(n);
         }
         if let Some(j) = run_full_block_and_pick_tx(
@@ -588,7 +520,9 @@ fn main() {
         ) {
             classify_rev_jit_samples.push(j);
         }
-        if let Some(n) = run_full_block_and_pick_tx(&loader, args.tx_index, args.skip_deposits, None) {
+        if let Some(n) =
+            run_full_block_and_pick_tx(&loader, args.tx_index, args.skip_deposits, None)
+        {
             classify_rev_native_samples.push(n);
         }
     }
@@ -617,7 +551,9 @@ fn main() {
     let mut target_only_native = Vec::with_capacity(args.rounds);
     let mut target_only_jit = Vec::with_capacity(args.rounds);
     for _ in 0..args.rounds {
-        if let Some(n) = run_full_block_target_only_timer(&loader, args.tx_index, args.skip_deposits, None) {
+        if let Some(n) =
+            run_full_block_target_only_timer(&loader, args.tx_index, args.skip_deposits, None)
+        {
             target_only_native.push(n);
         }
         if let Some(j) = run_full_block_target_only_timer(

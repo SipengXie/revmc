@@ -424,6 +424,59 @@ pub fn run_jit_or_native(
     }
 }
 
+// ── Single-tx snapshot helpers ──────────────────────────────────────────────
+
+/// Replay txs `[0..tx_index)` on the block's pre-state using `NativeHandler` to
+/// reconstruct the exact database state right before `tx_index`.
+/// `skip_deposits` matches the benchmark-script convention (skip tx_type 0x7e).
+pub fn snapshot_before_tx(
+    loader: &BinLoader,
+    tx_index: usize,
+    skip_deposits: bool,
+) -> Result<CacheDB<EmptyDB>, String> {
+    let chain_id = loader.raw_txs().first().and_then(|tx| tx.chain_id);
+    let cfg = build_op_cfg(chain_id);
+    let dummy_tx = OpTransaction::builder().build_fill();
+
+    let mut evm: BenchEvm = {
+        let ctx =
+            OpCtx::<EmptyDB>::op().with_cfg(cfg).with_db(loader.build_cache_db()).with_tx(dummy_tx);
+        op_revm::OpEvm::new(ctx, ())
+    };
+
+    for (i, tx_bin) in loader.raw_txs().iter().enumerate() {
+        if i == tx_index {
+            break;
+        }
+        if skip_deposits && tx_bin.tx_type == 0x7e {
+            continue;
+        }
+        evm.0.ctx.tx = build_op_tx(tx_bin);
+        let mut handler = NativeHandler;
+        handler.run(&mut evm).map_err(|e| format!("replay tx[{i}] failed: {e:?}"))?;
+    }
+
+    Ok(evm.0.ctx.journaled_state.database.clone())
+}
+
+/// Build a fresh `BenchEvm` by cloning `snapshot` as the backing DB and seeding
+/// `ctx.tx` with `tx_bin`. Caller typically installs a custom handler before
+/// calling `.run(&mut evm)`.
+pub fn single_tx_evm(
+    snapshot: &CacheDB<EmptyDB>,
+    chain_id: Option<u64>,
+    tx_bin: &TxBin,
+) -> BenchEvm {
+    let cfg = build_op_cfg(chain_id);
+    let dummy_tx = OpTransaction::builder().build_fill();
+    let mut evm: BenchEvm = {
+        let ctx = OpCtx::<EmptyDB>::op().with_cfg(cfg).with_db(snapshot.clone()).with_tx(dummy_tx);
+        op_revm::OpEvm::new(ctx, ())
+    };
+    evm.0.ctx.tx = build_op_tx(tx_bin);
+    evm
+}
+
 // ── Compilation ─────────────────────────────────────────────────────────────
 
 pub struct CompiledContracts {
