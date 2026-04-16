@@ -219,7 +219,7 @@ fn cap_members(
     resolved: Vec<(String, B256, Vec<u8>)>,
     tx_index: &HashMap<B256, (u64, usize)>,
     cap: usize,
-) -> (Vec<(B256, Vec<u8>)>, Option<u64>) {
+) -> (Vec<(B256, Vec<u8>)>, Option<(u64, usize)>) {
     let mut with_tx: Vec<(u64, usize, String, B256, Vec<u8>)> = Vec::new();
     let mut without_tx: Vec<(String, B256, Vec<u8>)> = Vec::new();
     for (hstr, key, code) in resolved {
@@ -230,7 +230,7 @@ fn cap_members(
     }
     with_tx.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
     without_tx.sort_by(|a, b| a.0.cmp(&b.0));
-    let rep_block = with_tx.first().map(|(bn, _, _, _, _)| *bn);
+    let rep_tx = with_tx.first().map(|(bn, ti, _, _, _)| (*bn, *ti));
     let mut out: Vec<(B256, Vec<u8>)> = with_tx.into_iter().map(|(_, _, _, h, v)| (h, v)).collect();
     if out.len() < cap {
         let need = cap - out.len();
@@ -238,7 +238,7 @@ fn cap_members(
     } else {
         out.truncate(cap);
     }
-    (out, rep_block)
+    (out, rep_tx)
 }
 
 /// Per-hash artifact map keyed by code hash.
@@ -652,7 +652,7 @@ fn main() -> anyhow::Result<()> {
     // covers every sampled family. Otherwise, load the cached indices so
     // subsequent runs reuse the scan result instead of paying ~8 min per
     // restart. Each entry is `(capped_members, earliest_rep_block)`.
-    let family_plans: Vec<(Vec<(B256, Vec<u8>)>, Option<u64>)> = if all_done {
+    let family_plans: Vec<(Vec<(B256, Vec<u8>)>, Option<(u64, usize)>)> = if all_done {
         eprintln!(
             "[resume] all {} sampled families already in sidecar; skipping corpus scan",
             sampled.len()
@@ -683,7 +683,7 @@ fn main() -> anyhow::Result<()> {
 
     let tmp_root = tempfile::tempdir()?;
 
-    for (idx, (fam, (members, rep_block_from_cap))) in
+    for (idx, (fam, (members, rep_tx_from_cap))) in
         sampled.iter().zip(family_plans.iter()).enumerate()
     {
         if done_ids.contains(&fam.skeleton_id) {
@@ -721,9 +721,11 @@ fn main() -> anyhow::Result<()> {
             _ => "huge",
         };
 
-        // Rep block is computed during cap_members so we don't need tx_index
-        // in this scope (the all-done fast path doesn't build it).
-        let rep_block: Option<u64> = *rep_block_from_cap;
+        // Rep (block, tx_index) is computed during cap_members so we don't
+        // need tx_index in this scope (the all-done fast path doesn't build
+        // it). Commit 2 threads the tx_index through; commit 3 consumes it.
+        let rep_tx: Option<(u64, usize)> = *rep_tx_from_cap;
+        let rep_block: Option<u64> = rep_tx.map(|(bn, _)| bn);
 
         let (ph_samples, sk_samples, av_samples): (Vec<f64>, Vec<f64>, Vec<f64>) = if let Some(bn) =
             rep_block
