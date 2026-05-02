@@ -21,6 +21,47 @@ use op_revm::OpSpecId;
 pub const OP_SPEC: OpSpecId = OpSpecId::ISTHMUS;
 pub const ETH_SPEC: SpecId = OP_SPEC.into_eth_spec();
 
+// ── Chain identity ─────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainId {
+    Base,
+    Eth,
+    Bsc,
+}
+
+impl ChainId {
+    pub fn from_chain_id(id: u64) -> Self {
+        match id {
+            8453 => ChainId::Base,
+            1 => ChainId::Eth,
+            56 => ChainId::Bsc,
+            other => panic!("unsupported chain_id {other}; expected 1, 56, or 8453"),
+        }
+    }
+
+    pub fn as_lowercase(&self) -> &'static str {
+        match self {
+            ChainId::Base => "base",
+            ChainId::Eth => "eth",
+            ChainId::Bsc => "bsc",
+        }
+    }
+}
+
+impl std::str::FromStr for ChainId {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "base" => Ok(ChainId::Base),
+            "eth" | "ethereum" | "mainnet" => Ok(ChainId::Eth),
+            "bsc" | "bnb" => Ok(ChainId::Bsc),
+            _ => Err(format!("unknown chain '{s}', expected base|eth|bsc")),
+        }
+    }
+}
+
 // ── Spec / opt tags ────────────────────────────────────────────────────────
 
 pub fn spec_tag() -> String {
@@ -824,5 +865,23 @@ mod stratified_tests {
             per_bucket[bucket_for_raw_len(fam.skeleton_raw_len)] += 1;
         }
         assert_eq!(per_bucket, [20, 20, 20, 20, 20]);
+    }
+
+    #[test]
+    fn chain_id_from_chain_id_roundtrip() {
+        use super::ChainId;
+        assert_eq!(ChainId::from_chain_id(8453), ChainId::Base);
+        assert_eq!(ChainId::from_chain_id(1), ChainId::Eth);
+        assert_eq!(ChainId::from_chain_id(56), ChainId::Bsc);
+    }
+
+    #[test]
+    fn chain_id_parses_lowercase_string() {
+        use super::ChainId;
+        use std::str::FromStr;
+        assert_eq!(ChainId::from_str("base").unwrap(), ChainId::Base);
+        assert_eq!(ChainId::from_str("eth").unwrap(), ChainId::Eth);
+        assert_eq!(ChainId::from_str("bsc").unwrap(), ChainId::Bsc);
+        assert!(ChainId::from_str("xyz").is_err());
     }
 }
