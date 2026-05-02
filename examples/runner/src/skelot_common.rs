@@ -9,9 +9,9 @@
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-use revm::bytecode::Bytecode;
+use revm::bytecode::{Bytecode, JumpTable};
 use revm::primitives::hardfork::SpecId;
-use revm::primitives::{Address, B256};
+use revm::primitives::{Address, Bytes, B256};
 use revmc::skeleton::SkeletonVariance;
 use revmc::{EvmCompiler, EvmLlvmBackend, OptimizationLevel};
 use serde::{Deserialize, Serialize};
@@ -554,6 +554,77 @@ pub struct CacheSnapshot {
     pub has_state_clear: bool,
     pub accounts: RevmHashMap<Address, AccountSnapshot>,
     pub codes: RevmHashMap<B256, Bytecode>,
+}
+
+// ── v1 schema (BytecodeV86) explicit decode path ──────────────────────────
+
+/// Mirror of `exporter::schema::BytecodeV86`. Kept local so we do not depend
+/// on the exporter crate; converted to revm `Bytecode` via `From`.
+#[derive(Clone, Debug, Deserialize)]
+pub enum BytecodeV86Mirror {
+    Eip7702 { delegated_address: Address, version: u8, raw: Bytes },
+    LegacyAnalyzed { bytecode: Bytes, original_len: usize, jump_table: JumpTable },
+}
+
+impl From<BytecodeV86Mirror> for Bytecode {
+    fn from(v: BytecodeV86Mirror) -> Self {
+        match v {
+            BytecodeV86Mirror::LegacyAnalyzed { bytecode, original_len, jump_table } => {
+                Bytecode::new_analyzed(bytecode, original_len, jump_table)
+            }
+            // The exporter's `Bytecode::new_eip7702_raw` is not exposed by this
+            // workspace's revm fork. `new_raw_checked` peeks the EIP-7702 magic
+            // prefix and produces the same `Bytecode::Eip7702(...)` variant.
+            BytecodeV86Mirror::Eip7702 { raw, .. } => {
+                Bytecode::new_raw_checked(raw).expect("stored EIP-7702 bytecode must be valid")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct V1AccountSnapshot {
+    pub info: Option<AccountInfo>,
+    pub storage: RevmHashMap<U256, U256>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CacheSnapshotV1 {
+    pub block_number: u64,
+    pub has_state_clear: bool,
+    pub accounts: RevmHashMap<Address, V1AccountSnapshot>,
+    pub codes: RevmHashMap<B256, BytecodeV86Mirror>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct BenchManifest {
+    pub schema_version: u32,
+    pub chain_id: Option<u64>,
+    pub start_block: Option<u64>,
+    pub end_block: Option<u64>,
+}
+
+pub fn read_bench_manifest(bench_dir: &std::path::Path) -> Option<BenchManifest> {
+    let p = bench_dir.join("manifest.json");
+    let raw = std::fs::read_to_string(&p).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Decode a bench-data state file. Always goes through `BytecodeV86` then
+/// converts to revm `Bytecode`, removing reliance on enum-tag coincidence.
+pub fn load_state_v1(path: &std::path::Path) -> Result<CacheSnapshotV1, String> {
+    let raw = std::fs::read(path).map_err(|e| format!("read {path:?}: {e}"))?;
+    bincode::deserialize::<CacheSnapshotV1>(&raw).map_err(|e| format!("decode {path:?}: {e}"))
+}
+
+pub fn iter_legacy_bytecode<F: FnMut(&B256, Vec<u8>)>(snap: &CacheSnapshotV1, mut f: F) {
+    for (hash, code) in &snap.codes {
+        let raw = match code.clone() {
+            BytecodeV86Mirror::LegacyAnalyzed { bytecode, .. } => bytecode.to_vec(),
+            BytecodeV86Mirror::Eip7702 { raw, .. } => raw.to_vec(),
+        };
+        f(hash, raw);
+    }
 }
 
 /// Shared cache directory for derived indices over the bench corpus.
