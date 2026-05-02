@@ -364,6 +364,11 @@ fn main() {
     }
     let mut dup_groups: Vec<(u64, Vec<B256>)> =
         skeleton_groups.into_iter().filter(|(_, m)| m.len() >= 2).collect();
+    // Sort each family's member list so the first-N take in the sampling step is
+    // reproducible across processes (HashMap iteration above is RandomState-keyed).
+    for (_, members) in dup_groups.iter_mut() {
+        members.sort();
+    }
     dup_groups.sort_by_key(|(_, m)| std::cmp::Reverse(m.len()));
 
     eprintln!("[deployment_span] querying head block...");
