@@ -14,10 +14,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
-use revm::bytecode::Bytecode;
-use revm::primitives::{Address, HashMap as RevmHashMap, B256, U256};
-use revm::state::AccountInfo;
-use serde::{Deserialize, Serialize};
+use revm::primitives::B256;
+use serde::Serialize;
 
 use crate::skelot_common::{
     bucket_for_raw_len, extract_opcode_skeleton_with_counts, hash_bytes, identify_pattern,
@@ -27,35 +25,18 @@ use crate::skelot_common::{
 #[derive(Parser)]
 #[command(name = "skelot_dataset_scan")]
 struct Args {
+    #[arg(long, default_value = "base")]
+    chain: String,
     #[arg(long)]
     bench_dir: String,
-    #[arg(long, default_value_t = 38004930)]
-    start_block: u64,
-    #[arg(long, default_value_t = 10000)]
-    block_count: u64,
+    #[arg(long)]
+    start_block: Option<u64>,
+    #[arg(long)]
+    block_count: Option<u64>,
     #[arg(long, default_value_t = 1000)]
     window_size: u64,
     #[arg(long)]
     out_dir: String,
-}
-
-#[derive(Deserialize)]
-struct AccountSnapshot {
-    #[allow(dead_code)]
-    info: Option<AccountInfo>,
-    #[allow(dead_code)]
-    storage: RevmHashMap<U256, U256>,
-}
-
-#[derive(Deserialize)]
-struct CacheSnapshot {
-    #[allow(dead_code)]
-    block_number: u64,
-    #[allow(dead_code)]
-    has_state_clear: bool,
-    #[allow(dead_code)]
-    accounts: RevmHashMap<Address, AccountSnapshot>,
-    codes: RevmHashMap<B256, Bytecode>,
 }
 
 #[derive(Serialize, Default, Clone)]
@@ -84,11 +65,17 @@ struct WindowRecord {
     start_block: u64,
     end_block: u64,
     metrics: ScopeMetrics,
+    metrics_local: ScopeMetrics,
 }
 
 #[derive(Serialize)]
 struct DatasetScan {
+    chain: String,
     bucket_scheme: &'static str,
+    schema_version: u32,
+    start_block: u64,
+    block_count: u64,
+    window_size: u64,
     corpus: ScopeMetrics,
     windows: Vec<WindowRecord>,
 }
@@ -149,12 +136,13 @@ impl ScanContext {
 fn scan_window(bench_dir: &PathBuf, start: u64, count: u64, ctx: &mut ScanContext) {
     for bn in start..start + count {
         let path = bench_dir.join(format!("states/{bn}.bin"));
-        let Ok(data) = fs::read(&path) else { continue };
-        let Ok(snap): Result<CacheSnapshot, _> = bincode::deserialize(&data) else { continue };
-        for (hash, bytecode) in snap.codes {
-            let raw = bytecode.original_byte_slice().to_vec();
-            ctx.ingest(raw, hash);
-        }
+        let snap = match crate::skelot_common::load_state_v1(&path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        crate::skelot_common::iter_legacy_bytecode(&snap, |hash, raw| {
+            ctx.ingest(raw, *hash);
+        });
     }
 }
 
@@ -228,15 +216,28 @@ fn metrics_for_hashes(hashes: impl IntoIterator<Item = B256>, ctx: &ScanContext)
 
 fn main() {
     let args = Args::parse();
+    let chain: skelot_common::ChainId = args.chain.parse().expect("invalid --chain");
+    let (default_start, default_count) = match chain {
+        skelot_common::ChainId::Base => (38_004_930u64, 10_000u64),
+        skelot_common::ChainId::Eth => (23_000_000, 1_000),
+        skelot_common::ChainId::Bsc => (95_897_884, 1_000),
+    };
+    let start_block = args.start_block.unwrap_or(default_start);
+    let block_count = args.block_count.unwrap_or(default_count);
+
     let bench_dir = PathBuf::from(&args.bench_dir);
     let out_dir = PathBuf::from(&args.out_dir);
     fs::create_dir_all(&out_dir).expect("create out dir");
 
-    let n_windows = args.block_count / args.window_size;
+    let n_windows = block_count / args.window_size;
     assert!(n_windows >= 1, "block_count must be ≥ window_size");
     eprintln!(
-        "Stage A: scanning {} blocks from {} in {} windows of {}",
-        args.block_count, args.start_block, n_windows, args.window_size
+        "Stage A: scanning {} blocks from {} in {} windows of {} (chain={})",
+        block_count,
+        start_block,
+        n_windows,
+        args.window_size,
+        chain.as_lowercase(),
     );
 
     let t0 = Instant::now();
@@ -246,7 +247,7 @@ fn main() {
     let mut per_window_hashes: Vec<Vec<B256>> = vec![Vec::new(); n_windows as usize];
 
     for w in 0..n_windows {
-        let start = args.start_block + w * args.window_size;
+        let start = start_block + w * args.window_size;
         let before: std::collections::HashSet<B256> = ctx.codes.keys().copied().collect();
         scan_window(&bench_dir, start, args.window_size, &mut ctx);
         let new_hashes: Vec<B256> =
@@ -261,6 +262,24 @@ fn main() {
         per_window_hashes[w as usize] = new_hashes;
     }
 
+    // Build per-window membership (all hashes seen in window) for `metrics_local`.
+    // Re-reads each state file once. For 10K Base blocks at <1s/file the cost is
+    // bounded; if profiling shows it dominates, push membership into scan_window.
+    let mut per_window_hashes_local: Vec<Vec<B256>> = vec![Vec::new(); n_windows as usize];
+    for w in 0..n_windows {
+        let start = start_block + w * args.window_size;
+        let mut seen: std::collections::HashSet<B256> = Default::default();
+        for bn in start..start + args.window_size {
+            let path = bench_dir.join(format!("states/{bn}.bin"));
+            let Ok(snap) = skelot_common::load_state_v1(&path) else { continue };
+            for hash in snap.codes.keys() {
+                seen.insert(*hash);
+            }
+        }
+        per_window_hashes_local[w as usize] =
+            seen.into_iter().filter(|h| ctx.codes.contains_key(h)).collect();
+    }
+
     let all_hashes: Vec<B256> = ctx.codes.keys().copied().collect();
     let corpus = metrics_for_hashes(all_hashes.clone(), &ctx);
 
@@ -269,13 +288,25 @@ fn main() {
         .enumerate()
         .map(|(i, hashes)| WindowRecord {
             window_id: i,
-            start_block: args.start_block + (i as u64) * args.window_size,
-            end_block: args.start_block + ((i + 1) as u64) * args.window_size,
+            start_block: start_block + (i as u64) * args.window_size,
+            end_block: start_block + ((i + 1) as u64) * args.window_size,
             metrics: metrics_for_hashes(hashes.iter().copied(), &ctx),
+            metrics_local: metrics_for_hashes(per_window_hashes_local[i].iter().copied(), &ctx),
         })
         .collect();
 
-    let scan = DatasetScan { bucket_scheme: BUCKET_SCHEME_ID, corpus, windows };
+    let schema_version =
+        skelot_common::read_bench_manifest(&bench_dir).map(|m| m.schema_version).unwrap_or(0);
+    let scan = DatasetScan {
+        chain: chain.as_lowercase().into(),
+        bucket_scheme: BUCKET_SCHEME_ID,
+        schema_version,
+        start_block,
+        block_count,
+        window_size: args.window_size,
+        corpus,
+        windows,
+    };
     let scan_path = out_dir.join("dataset_scan.json");
     fs::write(&scan_path, serde_json::to_vec_pretty(&scan).expect("serialize"))
         .expect("write dataset_scan.json");
