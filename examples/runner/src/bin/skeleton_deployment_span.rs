@@ -1,39 +1,131 @@
 //! Measure actual on-chain deployment time span for the top skeleton groups.
 //!
 //! Rationale: `push_variance` shows invariants are 100% stable within the 10K-block
-//! window. This tool extends the claim by finding, via Alchemy RPC binary search,
+//! window. This tool extends the claim by finding, via archive-RPC binary search,
 //! the deployment block of each skeleton-group member. If the top group's members
 //! span many months of mainnet history, the invariant stability claim is no longer
 //! tied to a 5-hour measurement window.
 
+#[path = "../skelot_common.rs"]
+#[allow(dead_code)]
+mod skelot_common;
+
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use revm::bytecode::Bytecode;
-use revm::primitives::{Address, HashMap as RevmHashMap, B256, U256};
-use revm::state::AccountInfo;
-use serde::Deserialize;
+use clap::Parser;
+use revm::primitives::{Address, B256};
+use serde::Serialize;
 
-const ALCHEMY_URL: &str = "https://base-mainnet.g.alchemy.com/v2/GXFdQW3k-NzViljQzTLnYH8svxlkFifs";
+use crate::skelot_common::{iter_bytecode_raw, load_state_v1, should_skip_bytes, ChainId};
 
-#[derive(Deserialize)]
-struct AccountSnapshot {
-    info: Option<AccountInfo>,
-    #[allow(dead_code)]
-    storage: RevmHashMap<U256, U256>,
+static RPC_URL: OnceLock<String> = OnceLock::new();
+static RATE: OnceLock<RateLimiter> = OnceLock::new();
+
+#[derive(Parser)]
+#[command(name = "skeleton_deployment_span")]
+struct Args {
+    #[arg(long, default_value = "base")]
+    chain: String,
+    #[arg(long)]
+    rpc_url: Option<String>,
+    #[arg(long, default_value = "ALCHEMY_API_KEY")]
+    api_key_env: String,
+    #[arg(long)]
+    bench_dir: Option<String>,
+    #[arg(long)]
+    start_block: Option<u64>,
+    #[arg(long)]
+    block_count: Option<u64>,
+    #[arg(long, default_value_t = 5)]
+    top: usize,
+    #[arg(long, default_value_t = 30)]
+    sample_per_group: usize,
+    #[arg(long, default_value_t = 12)]
+    concurrency: usize,
+    #[arg(long, default_value_t = 12.0)]
+    rps: f64,
+    #[arg(long, default_value_t = 42u64)]
+    seed: u64,
+    #[arg(long)]
+    out: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct CacheSnapshot {
-    #[allow(dead_code)]
-    block_number: u64,
-    #[allow(dead_code)]
-    has_state_clear: bool,
-    accounts: RevmHashMap<Address, AccountSnapshot>,
-    codes: RevmHashMap<B256, Bytecode>,
+fn resolve_rpc_url(chain: ChainId, override_url: Option<&str>, api_key_env: &str) -> String {
+    if let Some(u) = override_url {
+        return u.to_string();
+    }
+    let key = std::env::var(api_key_env).unwrap_or_default();
+    match chain {
+        ChainId::Base => format!("https://base-mainnet.g.alchemy.com/v2/{key}"),
+        ChainId::Eth => format!("https://eth-mainnet.g.alchemy.com/v2/{key}"),
+        ChainId::Bsc if key.is_empty() => "https://bsc-dataseed.binance.org/".to_string(),
+        ChainId::Bsc => format!("https://bnb-mainnet.g.alchemy.com/v2/{key}"),
+    }
+}
+
+fn classify_rpc(chain: ChainId, has_override: bool, url: &str) -> &'static str {
+    if has_override {
+        return "override";
+    }
+    match chain {
+        ChainId::Base => "alchemy_base",
+        ChainId::Eth => "alchemy_eth",
+        ChainId::Bsc => {
+            if url.contains("bsc-dataseed") {
+                "bsc_dataseed"
+            } else {
+                "alchemy_bsc"
+            }
+        }
+    }
+}
+
+fn mask_key(url: &str) -> String {
+    if let Some(idx) = url.rfind('/') {
+        let (prefix, key) = url.split_at(idx + 1);
+        if key.len() > 8 {
+            return format!("{prefix}{}\u{2026}{}", &key[..4], &key[key.len() - 4..]);
+        }
+    }
+    url.to_string()
+}
+
+/// Replace any whitespace-delimited token that looks like the configured RPC URL
+/// with the masked form, so retry messages from `ureq::Error` (which embed the
+/// full URL with the API key in their Display impl) do not leak the key.
+fn mask_url_in_message(msg: &str) -> String {
+    let Some(full_url) = RPC_URL.get() else { return msg.to_string() };
+    if full_url.is_empty() {
+        return msg.to_string();
+    }
+    msg.replace(full_url.as_str(), &mask_key(full_url))
+}
+
+struct RateLimiter {
+    interval: Duration,
+    last: Mutex<Instant>,
+}
+
+impl RateLimiter {
+    fn new(rps: f64) -> Self {
+        Self {
+            interval: Duration::from_secs_f64(1.0 / rps),
+            last: Mutex::new(Instant::now() - Duration::from_secs(1)),
+        }
+    }
+    fn acquire(&self) {
+        let mut g = self.last.lock().unwrap();
+        let now = Instant::now();
+        let earliest = *g + self.interval;
+        if now < earliest {
+            std::thread::sleep(earliest - now);
+        }
+        *g = Instant::now();
+    }
 }
 
 fn hash_skeleton(bytes: &[u8]) -> u64 {
@@ -54,6 +146,8 @@ fn hash_skeleton(bytes: &[u8]) -> u64 {
 }
 
 fn rpc_call(method: &str, params: serde_json::Value) -> serde_json::Value {
+    RATE.get().expect("RATE not initialized").acquire();
+    let url = RPC_URL.get().expect("RPC_URL not initialized").as_str();
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -62,7 +156,7 @@ fn rpc_call(method: &str, params: serde_json::Value) -> serde_json::Value {
     });
     let mut attempt = 0;
     loop {
-        match ureq::post(ALCHEMY_URL).set("Content-Type", "application/json").send_json(&body) {
+        match ureq::post(url).set("Content-Type", "application/json").send_json(&body) {
             Ok(resp) => match resp.into_json::<serde_json::Value>() {
                 Ok(v) => return v,
                 Err(e) => {
@@ -70,7 +164,11 @@ fn rpc_call(method: &str, params: serde_json::Value) -> serde_json::Value {
                 }
             },
             Err(e) => {
-                eprintln!("rpc error ({method}): {e}");
+                // ureq formats the full URL (with API key) into its Display impl;
+                // mask it before printing so retries do not leak the key.
+                let raw = e.to_string();
+                let masked = mask_url_in_message(&raw);
+                eprintln!("rpc error ({method}): {masked}");
             }
         }
         attempt += 1;
@@ -125,40 +223,118 @@ fn find_deployment_block(address: &Address, head: u64) -> Option<u64> {
     Some(lo)
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let parse = |key: &str, default: usize| -> usize {
-        args.windows(2)
-            .find(|w| w[0] == format!("--{}", key))
-            .and_then(|w| w[1].parse().ok())
-            .unwrap_or(default)
+/// Probe the configured RPC for archive-state availability before starting the
+/// family loop. We pick a sentinel contract deployed long before `block` and
+/// require `eth_getCode(addr, block)` to return non-empty code; a non-archive
+/// endpoint will return `0x` for any pre-recent block, making the deployment
+/// binary search meaningless.
+fn probe_archive_rpc(chain: ChainId) {
+    let (addr, block) = match chain {
+        ChainId::Base => ("0x4200000000000000000000000000000000000006", 1_000_000u64),
+        ChainId::Eth => ("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", 14_000_000),
+        ChainId::Bsc => ("0x10ED43C718714eb63d5aA57B78B54704E256024E", 8_000_000),
     };
-    let top = parse("top", 5);
-    let sample = parse("sample-per-group", 50);
-    let concurrency = parse("concurrency", 12);
+    let v = rpc_call("eth_getCode", serde_json::json!([addr, format!("0x{block:x}")]));
+    let code: String = serde_json::from_value(v["result"].clone()).unwrap_or_default();
+    if code.len() < 4 || code == "0x" {
+        panic!(
+            "archive RPC probe FAILED for chain {}: eth_getCode({addr},{block}) returned empty.\n\
+             This endpoint is not an archive node — binary search for first deployment block will be unreliable.\n\
+             Use a different --rpc-url that exposes historical state.",
+            chain.as_lowercase()
+        );
+    }
+    eprintln!(
+        "[deployment_span] archive probe OK: {addr}@{block} returned {} bytes",
+        code.len() / 2
+    );
+}
 
-    let bench_dir = Path::new("/home/ubuntu/sipeng/bench_data");
-    let start: u64 = 38004930;
-    let end: u64 = 38014927;
+#[derive(Serialize)]
+struct DeploymentRecord {
+    address: String,
+    first_block: u64,
+    ts_unix: u64,
+}
 
-    eprintln!("Loading codes + account index from blocks {start}..{end}");
+#[derive(Serialize)]
+struct FamilySpan {
+    rank: usize,
+    skeleton_hash: String,
+    family_size_in_corpus: usize,
+    members_attempted: usize,
+    members_resolved: usize,
+    deployments: Vec<DeploymentRecord>,
+    span_days_min: f64,
+    span_days_p5: f64,
+    span_days_median: f64,
+    span_days_p95: f64,
+    span_days_max: f64,
+}
+
+#[derive(Serialize)]
+struct DeploymentSpansOut {
+    chain: String,
+    rpc_url_kind: String,
+    seed: u64,
+    top_n: usize,
+    sample_per_group: usize,
+    families: Vec<FamilySpan>,
+}
+
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+    let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
+    sorted[idx]
+}
+
+fn main() {
+    let args = Args::parse();
+    let chain: ChainId = args.chain.parse().expect("invalid --chain");
+    let has_override = args.rpc_url.is_some();
+    let url = resolve_rpc_url(chain, args.rpc_url.as_deref(), &args.api_key_env);
+    eprintln!("[deployment_span] chain={} rpc_url={}", chain.as_lowercase(), mask_key(&url));
+    let rpc_kind = classify_rpc(chain, has_override, &url).to_string();
+    if RPC_URL.set(url).is_err() {
+        panic!("RPC_URL already set");
+    }
+    if RATE.set(RateLimiter::new(args.rps)).is_err() {
+        panic!("RATE already set");
+    }
+    probe_archive_rpc(chain);
+
+    let (default_dir, default_start, default_count) = match chain {
+        ChainId::Base => ("/home/ubuntu/sipeng/bench_data", 38_004_930u64, 9_997u64),
+        ChainId::Eth => ("/home/ubuntu/sipeng/bench_data_eth_v1", 23_000_000, 1_000),
+        ChainId::Bsc => ("/home/ubuntu/sipeng/bench_data_bsc_v1", 95_897_884, 1_000),
+    };
+    let dir = args.bench_dir.unwrap_or_else(|| default_dir.to_string());
+    let bench_dir = Path::new(&dir);
+    let start = args.start_block.unwrap_or(default_start);
+    let count = args.block_count.unwrap_or(default_count);
+    let end = start + count;
+
+    eprintln!(
+        "[deployment_span] loading codes + account index from blocks {start}..{end} ({count} blocks)"
+    );
     let mut all_codes: HashMap<B256, Vec<u8>> = HashMap::new();
     let mut code_hash_to_addr: HashMap<B256, Address> = HashMap::new();
     let mut scanned = 0u64;
     for bn in start..end {
         let path = bench_dir.join(format!("states/{bn}.bin"));
-        let data = match std::fs::read(&path) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let snapshot: CacheSnapshot = match bincode::deserialize(&data) {
+        let snap = match load_state_v1(&path) {
             Ok(s) => s,
             Err(_) => continue,
         };
-        for (hash, bytecode) in &snapshot.codes {
-            all_codes.entry(*hash).or_insert_with(|| bytecode.original_byte_slice().to_vec());
-        }
-        for (addr, acct) in &snapshot.accounts {
+        iter_bytecode_raw(&snap, |hash, raw| {
+            if should_skip_bytes(&raw) {
+                return;
+            }
+            all_codes.entry(*hash).or_insert(raw);
+        });
+        for (addr, acct) in &snap.accounts {
             if let Some(ref info) = acct.info {
                 code_hash_to_addr.entry(info.code_hash).or_insert(*addr);
             }
@@ -173,7 +349,7 @@ fn main() {
         }
     }
     eprintln!(
-        "Scanned {scanned} blocks: {} unique bytecodes, {} code_hash→addr mappings",
+        "[deployment_span] scanned {scanned} blocks: {} unique bytecodes, {} code_hash->addr mappings",
         all_codes.len(),
         code_hash_to_addr.len()
     );
@@ -190,43 +366,45 @@ fn main() {
         skeleton_groups.into_iter().filter(|(_, m)| m.len() >= 2).collect();
     dup_groups.sort_by_key(|(_, m)| std::cmp::Reverse(m.len()));
 
-    eprintln!("Querying Base mainnet head block…");
+    eprintln!("[deployment_span] querying head block...");
     let head = eth_block_number();
-    eprintln!("Head block: {head}");
+    eprintln!("[deployment_span] head block: {head}");
 
-    println!("=== Skeleton Group Deployment Time Span ===\n");
-    println!("Head block: {head}");
-    println!("Measurement window: {start}..{end}\n");
-
-    for rank in 0..top.min(dup_groups.len()) {
+    let mut families: Vec<FamilySpan> = Vec::new();
+    for rank in 0..args.top.min(dup_groups.len()) {
         let (skel_hash, members) = &dup_groups[rank];
         let n = members.len();
         let bytecode_len = all_codes[&members[0]].len();
 
-        // Pick members that have addresses in our cache
+        // Pick members that have addresses in our cache. The current sampler is
+        // a deterministic first-N take rather than a seeded shuffle: the runner
+        // crate has no `rand` dependency, so we record the configured seed in
+        // the JSON metadata for reproducibility but do not actually consume it.
         let eligible: Vec<(B256, Address)> =
             members.iter().filter_map(|h| code_hash_to_addr.get(h).map(|a| (*h, *a))).collect();
-        let take = sample.min(eligible.len());
+        let take = args.sample_per_group.min(eligible.len());
         let sampled: Vec<(B256, Address)> = eligible.into_iter().take(take).collect();
+        let attempted = sampled.len();
 
         eprintln!(
-            "\nGroup #{} (skel {:#x}): {} members, bytecode {} bytes — sampling {} with addresses",
+            "\n[deployment_span] group #{} (skel {:#x}): {} members, bytecode {} bytes -- sampling {} with addresses",
             rank + 1,
             skel_hash,
             n,
             bytecode_len,
-            sampled.len()
+            attempted
         );
 
-        // Query deployment blocks in parallel
+        // Query deployment blocks in parallel.
         let deploy_blocks: Arc<Mutex<Vec<(Address, Option<u64>)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let counter = Arc::new(Mutex::new(0usize));
         let total = sampled.len();
         let chunks: Vec<Vec<(B256, Address)>> = {
-            let mut v: Vec<Vec<(B256, Address)>> = (0..concurrency).map(|_| Vec::new()).collect();
+            let mut v: Vec<Vec<(B256, Address)>> =
+                (0..args.concurrency).map(|_| Vec::new()).collect();
             for (i, item) in sampled.into_iter().enumerate() {
-                v[i % concurrency].push(item);
+                v[i % args.concurrency].push(item);
             }
             v
         };
@@ -252,40 +430,106 @@ fn main() {
             }
         });
 
-        let results = deploy_blocks.lock().unwrap().clone();
-        let mut blocks: Vec<u64> = results.iter().filter_map(|(_, db)| *db).collect();
-        blocks.sort();
+        // Collect resolved (addr, deploy_block) pairs.
+        let resolved: Vec<(Address, u64)> = {
+            let guard = deploy_blocks.lock().unwrap();
+            guard.iter().filter_map(|(a, db)| db.map(|b| (*a, b))).collect()
+        };
 
-        if blocks.is_empty() {
-            println!("Group #{}: no deployment blocks resolved", rank + 1);
+        if resolved.is_empty() {
+            eprintln!("[deployment_span] group #{}: no deployment blocks resolved", rank + 1);
+            families.push(FamilySpan {
+                rank: rank + 1,
+                skeleton_hash: format!("{skel_hash:#x}"),
+                family_size_in_corpus: n,
+                members_attempted: attempted,
+                members_resolved: 0,
+                deployments: Vec::new(),
+                span_days_min: f64::NAN,
+                span_days_p5: f64::NAN,
+                span_days_median: f64::NAN,
+                span_days_p95: f64::NAN,
+                span_days_max: f64::NAN,
+            });
             continue;
         }
 
-        let min_b = *blocks.first().unwrap();
-        let max_b = *blocks.last().unwrap();
-        let median_b = blocks[blocks.len() / 2];
+        // Resolve timestamps for every resolved member.
+        let mut deployments: Vec<DeploymentRecord> = resolved
+            .iter()
+            .map(|(addr, db)| {
+                let ts = eth_block_timestamp(*db);
+                DeploymentRecord {
+                    address: format!("0x{}", hex::encode(addr.as_slice())),
+                    first_block: *db,
+                    ts_unix: ts,
+                }
+            })
+            .collect();
+        deployments.sort_by_key(|d| d.first_block);
 
-        // Fetch timestamps
-        let min_ts = eth_block_timestamp(min_b);
-        let max_ts = eth_block_timestamp(max_b);
-        let median_ts = eth_block_timestamp(median_b);
-        let span_days = (max_ts - min_ts) as f64 / 86400.0;
+        let min_ts = deployments.first().unwrap().ts_unix;
+        let max_ts = deployments.last().unwrap().ts_unix;
+        let mut spans: Vec<f64> = deployments
+            .iter()
+            .map(|d| (d.ts_unix.saturating_sub(min_ts)) as f64 / 86_400.0)
+            .collect();
+        spans.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-        println!("-- Group #{} (skel {:#x}) --", rank + 1, skel_hash);
-        println!("  members: {}  |  bytecode len: {}", n, bytecode_len);
-        println!("  sampled: {} resolved / {} attempted", blocks.len(), total);
-        println!("  deploy block  min={}  median={}  max={}", min_b, median_b, max_b);
-        println!("  deploy ts     min={}  median={}  max={}", min_ts, median_ts, max_ts);
-        println!("  span:         {:.1} days", span_days);
-        // Pretty UTC dates
-        println!("  min UTC: {}", fmt_ts(min_ts));
-        println!("  max UTC: {}", fmt_ts(max_ts));
-        println!();
+        let span_days_min = spans.first().copied().unwrap_or(f64::NAN);
+        let span_days_max = spans.last().copied().unwrap_or(f64::NAN);
+        let span_days_median = percentile(&spans, 0.5);
+        let span_days_p5 = percentile(&spans, 0.05);
+        let span_days_p95 = percentile(&spans, 0.95);
+
+        eprintln!(
+            "[deployment_span] group #{}: {} resolved / {} attempted; span min={:.1}d median={:.1}d max={:.1}d ({} -> {})",
+            rank + 1,
+            deployments.len(),
+            attempted,
+            span_days_min,
+            span_days_median,
+            span_days_max,
+            fmt_ts(min_ts),
+            fmt_ts(max_ts)
+        );
+
+        families.push(FamilySpan {
+            rank: rank + 1,
+            skeleton_hash: format!("{skel_hash:#x}"),
+            family_size_in_corpus: n,
+            members_attempted: attempted,
+            members_resolved: deployments.len(),
+            deployments,
+            span_days_min,
+            span_days_p5,
+            span_days_median,
+            span_days_p95,
+            span_days_max,
+        });
+    }
+
+    let out = DeploymentSpansOut {
+        chain: chain.as_lowercase().to_string(),
+        rpc_url_kind: rpc_kind,
+        seed: args.seed,
+        top_n: args.top,
+        sample_per_group: args.sample_per_group,
+        families,
+    };
+
+    if let Some(out_path) = args.out.as_deref() {
+        let json = serde_json::to_string_pretty(&out).expect("serialize spans");
+        std::fs::write(out_path, json).unwrap_or_else(|e| panic!("write {out_path}: {e}"));
+        eprintln!("[deployment_span] wrote {out_path}");
+    } else {
+        let json = serde_json::to_string_pretty(&out).expect("serialize spans");
+        println!("{json}");
     }
 }
 
 fn fmt_ts(ts: u64) -> String {
-    // Seconds since epoch → YYYY-MM-DD HH:MM:SS UTC, minimal impl.
+    // Seconds since epoch -> YYYY-MM-DD HH:MM:SS UTC, minimal impl.
     let days = (ts / 86400) as i64;
     let (year, month, day) = days_to_ymd(days);
     let rem = ts % 86400;

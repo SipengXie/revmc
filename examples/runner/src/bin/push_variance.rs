@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use clap::Parser;
 use revm::primitives::B256;
 
-use crate::skelot_common::{iter_bytecode_raw, load_state_v1, should_skip_bytes};
+use crate::skelot_common::{iter_bytecode_raw, load_state_v1, should_skip_bytes, ChainId};
 
 /// A single PUSH instruction's position and value in a bytecode.
 #[derive(Clone)]
@@ -86,18 +86,21 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    let (default_dir, default_start, default_count) = match args.chain.as_str() {
-        "base" => ("/home/ubuntu/sipeng/bench_data", 38_004_930u64, 9_997u64),
-        "eth" => ("/home/ubuntu/sipeng/bench_data_eth_v1", 23_000_000, 1_000),
-        "bsc" => ("/home/ubuntu/sipeng/bench_data_bsc_v1", 95_897_884, 1_000),
-        other => panic!("unknown --chain {other}"),
+    let chain: ChainId = args.chain.parse().expect("invalid --chain");
+    let (default_dir, default_start, default_count) = match chain {
+        ChainId::Base => ("/home/ubuntu/sipeng/bench_data", 38_004_930u64, 9_997u64),
+        ChainId::Eth => ("/home/ubuntu/sipeng/bench_data_eth_v1", 23_000_000, 1_000),
+        ChainId::Bsc => ("/home/ubuntu/sipeng/bench_data_bsc_v1", 95_897_884, 1_000),
     };
     let dir = args.bench_dir.unwrap_or_else(|| default_dir.to_string());
     let bench_dir = std::path::Path::new(&dir);
     let start = args.start_block.unwrap_or(default_start);
     let count = args.block_count.unwrap_or(default_count);
     let end = start + count;
-    eprintln!("[push_variance] chain={} blocks {start}..{end} ({count} blocks)", args.chain);
+    eprintln!(
+        "[push_variance] chain={} blocks {start}..{end} ({count} blocks)",
+        chain.as_lowercase()
+    );
 
     // Phase 1: collect unique bytecodes
     let mut all_codes: HashMap<B256, Vec<u8>> = HashMap::new();
