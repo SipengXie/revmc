@@ -13,15 +13,15 @@ fn eth_v1_state_decodes() {
     let snap = skelot_common::load_state_v1(path).expect("decode eth v1");
     assert_eq!(snap.block_number, 23_000_000);
     assert!(!snap.codes.is_empty(), "expected >=1 code in eth v1 state");
-    let mut legacy = 0usize;
+    let mut total = 0usize;
     let mut eip7702 = 0usize;
-    skelot_common::iter_legacy_bytecode(&snap, |_, _| legacy += 1);
+    skelot_common::iter_bytecode_raw(&snap, |_, _| total += 1);
     for code in snap.codes.values() {
         if matches!(code, skelot_common::BytecodeV86Mirror::Eip7702 { .. }) {
             eip7702 += 1;
         }
     }
-    eprintln!("eth v1 23000000: {} entries (legacy or eip7702: {} total)", legacy, eip7702);
+    eprintln!("eth v1 23000000: {} entries ({} eip7702)", total, eip7702);
 }
 
 #[test]

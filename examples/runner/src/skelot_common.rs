@@ -684,7 +684,7 @@ pub fn load_state_v1(path: &std::path::Path) -> Result<CacheSnapshotV1, String> 
     bincode::deserialize::<CacheSnapshotV1>(&raw).map_err(|e| format!("decode {path:?}: {e}"))
 }
 
-pub fn iter_legacy_bytecode<F: FnMut(&B256, Vec<u8>)>(snap: &CacheSnapshotV1, mut f: F) {
+pub fn iter_bytecode_raw<F: FnMut(&B256, Vec<u8>)>(snap: &CacheSnapshotV1, mut f: F) {
     for (hash, code) in &snap.codes {
         let raw = match code.clone() {
             BytecodeV86Mirror::LegacyAnalyzed { bytecode, .. } => bytecode.to_vec(),

@@ -140,7 +140,7 @@ fn scan_window(bench_dir: &PathBuf, start: u64, count: u64, ctx: &mut ScanContex
             Ok(s) => s,
             Err(_) => continue,
         };
-        crate::skelot_common::iter_legacy_bytecode(&snap, |hash, raw| {
+        crate::skelot_common::iter_bytecode_raw(&snap, |hash, raw| {
             ctx.ingest(raw, *hash);
         });
     }
