@@ -15,12 +15,13 @@ use std::time::Instant;
 
 use clap::Parser;
 use revm::bytecode::Bytecode;
-use revm::primitives::{Address, B256, HashMap as RevmHashMap, U256};
+use revm::primitives::{Address, HashMap as RevmHashMap, B256, U256};
 use revm::state::AccountInfo;
 use serde::{Deserialize, Serialize};
 
 use crate::skelot_common::{
-    extract_opcode_skeleton_with_counts, hash_bytes, identify_pattern, should_skip_bytes,
+    bucket_for_raw_len, extract_opcode_skeleton_with_counts, hash_bytes, identify_pattern,
+    should_skip_bytes, BUCKET_SCHEME_ID,
 };
 
 #[derive(Parser)]
@@ -87,6 +88,7 @@ struct WindowRecord {
 
 #[derive(Serialize)]
 struct DatasetScan {
+    bucket_scheme: &'static str,
     corpus: ScopeMetrics,
     windows: Vec<WindowRecord>,
 }
@@ -104,16 +106,6 @@ struct Family {
 #[derive(Serialize)]
 struct FamilyFile {
     families: Vec<Family>,
-}
-
-fn bucket_for_raw_len(len: usize) -> &'static str {
-    match len {
-        0..=99 => "tiny",
-        100..=499 => "small",
-        500..=4_999 => "medium",
-        5_000..=14_999 => "large",
-        _ => "huge",
-    }
 }
 
 struct ScanContext {
@@ -166,10 +158,7 @@ fn scan_window(bench_dir: &PathBuf, start: u64, count: u64, ctx: &mut ScanContex
     }
 }
 
-fn metrics_for_hashes(
-    hashes: impl IntoIterator<Item = B256>,
-    ctx: &ScanContext,
-) -> ScopeMetrics {
+fn metrics_for_hashes(hashes: impl IntoIterator<Item = B256>, ctx: &ScanContext) -> ScopeMetrics {
     let mut bytecodes_total = 0usize;
     let mut raw_bytes_total = 0usize;
     let mut imm_bytes_total = 0usize;
@@ -177,7 +166,11 @@ fn metrics_for_hashes(
     let mut skeleton_set: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut buckets: HashMap<
         String,
-        (usize /*bc*/, std::collections::HashSet<u64> /*skel set*/, usize /*raw bytes sum*/),
+        (
+            usize,                          /*bc*/
+            std::collections::HashSet<u64>, /*skel set*/
+            usize,                          /*raw bytes sum*/
+        ),
     > = HashMap::new();
 
     for hash in hashes {
@@ -191,9 +184,8 @@ fn metrics_for_hashes(
         imm_bytes_total += imm;
         skeleton_set.insert(skel_hash);
         let bucket = bucket_for_raw_len(raw_len).to_string();
-        let entry = buckets
-            .entry(bucket)
-            .or_insert_with(|| (0, std::collections::HashSet::new(), 0));
+        let entry =
+            buckets.entry(bucket).or_insert_with(|| (0, std::collections::HashSet::new(), 0));
         entry.0 += 1;
         entry.1.insert(skel_hash);
         entry.2 += raw_len;
@@ -208,11 +200,7 @@ fn metrics_for_hashes(
     let bucket_metrics: HashMap<String, BucketMetric> = buckets
         .into_iter()
         .map(|(name, (bc, skel_set, raw_sum))| {
-            let ratio = if bc == 0 {
-                0.0
-            } else {
-                1.0 - skel_set.len() as f64 / bc as f64
-            };
+            let ratio = if bc == 0 { 0.0 } else { 1.0 - skel_set.len() as f64 / bc as f64 };
             let mean = if bc == 0 { 0.0 } else { raw_sum as f64 / bc as f64 };
             (
                 name,
@@ -261,12 +249,8 @@ fn main() {
         let start = args.start_block + w * args.window_size;
         let before: std::collections::HashSet<B256> = ctx.codes.keys().copied().collect();
         scan_window(&bench_dir, start, args.window_size, &mut ctx);
-        let new_hashes: Vec<B256> = ctx
-            .codes
-            .keys()
-            .copied()
-            .filter(|h| !before.contains(h))
-            .collect();
+        let new_hashes: Vec<B256> =
+            ctx.codes.keys().copied().filter(|h| !before.contains(h)).collect();
         eprintln!(
             "  [window {}/{}] {} new bytecodes ({:.1}s)",
             w + 1,
@@ -291,18 +275,15 @@ fn main() {
         })
         .collect();
 
-    let scan = DatasetScan { corpus, windows };
+    let scan = DatasetScan { bucket_scheme: BUCKET_SCHEME_ID, corpus, windows };
     let scan_path = out_dir.join("dataset_scan.json");
     fs::write(&scan_path, serde_json::to_vec_pretty(&scan).expect("serialize"))
         .expect("write dataset_scan.json");
     eprintln!("wrote {}", scan_path.display());
 
     // ── families ────────────────────────────────────────────────────────
-    let mut families: Vec<(u64, usize, Vec<B256>)> = ctx
-        .skeleton_members
-        .into_iter()
-        .map(|(k, (skel_len, v))| (k, skel_len, v))
-        .collect();
+    let mut families: Vec<(u64, usize, Vec<B256>)> =
+        ctx.skeleton_members.into_iter().map(|(k, (skel_len, v))| (k, skel_len, v)).collect();
     families.sort_by(|a, b| b.2.len().cmp(&a.2.len()).then_with(|| a.0.cmp(&b.0)));
 
     let families_json: Vec<Family> = families

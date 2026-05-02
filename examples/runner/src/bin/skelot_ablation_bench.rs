@@ -934,13 +934,7 @@ fn main() -> anyhow::Result<()> {
             "skelot_forced",
         )?;
 
-        let bucket_name = match skelot_common::bucket_for_raw_len(fam.skeleton_raw_len) {
-            0 => "tiny",
-            1 => "small",
-            2 => "medium",
-            3 => "large",
-            _ => "huge",
-        };
+        let bucket_name = skelot_common::bucket_for_raw_len(fam.skeleton_raw_len);
 
         // Rep (block, tx_index) is computed during cap_members so we don't
         // need tx_index in this scope (the all-done fast path doesn't build

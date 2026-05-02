@@ -77,6 +77,23 @@ pub fn spec_tag_for_chain(chain: ChainId) -> String {
     chain.as_lowercase().to_string()
 }
 
+// ── Size buckets (paper Table 1) ───────────────────────────────────────────
+
+/// Provenance tag embedded in dataset_scan.json so any consumer can detect
+/// which bucket boundaries produced a given file. Bumped only when boundaries
+/// change.
+pub const BUCKET_SCHEME_ID: &str = "paper_v1_small_100_999";
+
+pub fn bucket_for_raw_len(len: usize) -> &'static str {
+    match len {
+        0..=99 => "tiny",
+        100..=999 => "small",
+        1_000..=4_999 => "medium",
+        5_000..=14_999 => "large",
+        _ => "huge",
+    }
+}
+
 pub fn opt_tag(opt: OptimizationLevel) -> &'static str {
     match opt {
         OptimizationLevel::None => "o0",
@@ -794,7 +811,7 @@ pub struct FamilySummary {
 
 /// Exact bucket boundaries used by Stage A.
 /// Returns 0..=4 for tiny/small/medium/large/huge.
-pub fn bucket_for_raw_len(raw_len: usize) -> usize {
+fn bucket_index_for_raw_len(raw_len: usize) -> usize {
     match raw_len {
         0..=99 => 0,
         100..=999 => 1,
@@ -820,7 +837,7 @@ pub fn stratified_family_sample(
         if fam.member_count < 2 {
             continue;
         }
-        buckets[bucket_for_raw_len(fam.skeleton_raw_len)].push(fam);
+        buckets[bucket_index_for_raw_len(fam.skeleton_raw_len)].push(fam);
     }
     let mut out = Vec::with_capacity(per_bucket * 5);
     for mut bucket in buckets {
@@ -871,7 +888,7 @@ mod stratified_tests {
 
         let mut per_bucket = [0usize; 5];
         for fam in &s1 {
-            per_bucket[bucket_for_raw_len(fam.skeleton_raw_len)] += 1;
+            per_bucket[bucket_index_for_raw_len(fam.skeleton_raw_len)] += 1;
         }
         assert_eq!(per_bucket, [20, 20, 20, 20, 20]);
     }
@@ -911,5 +928,26 @@ mod stratified_tests {
     fn spec_tag_default_routes_to_base() {
         use super::{spec_tag, spec_tag_for_chain, ChainId};
         assert_eq!(spec_tag(), spec_tag_for_chain(ChainId::Base));
+    }
+
+    #[test]
+    fn bucket_for_raw_len_paper_boundaries() {
+        use super::bucket_for_raw_len;
+        assert_eq!(bucket_for_raw_len(0), "tiny");
+        assert_eq!(bucket_for_raw_len(99), "tiny");
+        assert_eq!(bucket_for_raw_len(100), "small");
+        assert_eq!(bucket_for_raw_len(999), "small");
+        assert_eq!(bucket_for_raw_len(1000), "medium");
+        assert_eq!(bucket_for_raw_len(4999), "medium");
+        assert_eq!(bucket_for_raw_len(5000), "large");
+        assert_eq!(bucket_for_raw_len(14999), "large");
+        assert_eq!(bucket_for_raw_len(15000), "huge");
+        assert_eq!(bucket_for_raw_len(50000), "huge");
+    }
+
+    #[test]
+    fn bucket_scheme_id_is_stable() {
+        use super::BUCKET_SCHEME_ID;
+        assert_eq!(BUCKET_SCHEME_ID, "paper_v1_small_100_999");
     }
 }
