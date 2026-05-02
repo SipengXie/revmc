@@ -65,7 +65,16 @@ impl std::str::FromStr for ChainId {
 // ── Spec / opt tags ────────────────────────────────────────────────────────
 
 pub fn spec_tag() -> String {
-    format!("{ETH_SPEC:?}").to_lowercase()
+    spec_tag_for_chain(ChainId::Base)
+}
+
+/// Chain-only tag, used as a cache prefix for static analyses.
+/// Static analyses do not execute opcodes, so deriving any fork name from
+/// `OP_SPEC` would falsely imply fork-correct compilation cross-chain. Any
+/// future dynamic measurement task should introduce a separate fork-aware
+/// tag (e.g., `spec_tag_for_dynamic(chain, fork)`).
+pub fn spec_tag_for_chain(chain: ChainId) -> String {
+    chain.as_lowercase().to_string()
 }
 
 pub fn opt_tag(opt: OptimizationLevel) -> &'static str {
@@ -883,5 +892,24 @@ mod stratified_tests {
         assert_eq!(ChainId::from_str("eth").unwrap(), ChainId::Eth);
         assert_eq!(ChainId::from_str("bsc").unwrap(), ChainId::Bsc);
         assert!(ChainId::from_str("xyz").is_err());
+    }
+
+    #[test]
+    fn spec_tag_for_chain_is_chain_only() {
+        use super::{spec_tag_for_chain, ChainId};
+        assert_eq!(spec_tag_for_chain(ChainId::Base), "base");
+        assert_eq!(spec_tag_for_chain(ChainId::Eth), "eth");
+        assert_eq!(spec_tag_for_chain(ChainId::Bsc), "bsc");
+        let base = spec_tag_for_chain(ChainId::Base);
+        assert!(
+            !base.contains("isthmus") && !base.contains("prague"),
+            "static tag must not encode any fork name: {base}"
+        );
+    }
+
+    #[test]
+    fn spec_tag_default_routes_to_base() {
+        use super::{spec_tag, spec_tag_for_chain, ChainId};
+        assert_eq!(spec_tag(), spec_tag_for_chain(ChainId::Base));
     }
 }
