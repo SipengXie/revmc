@@ -687,7 +687,14 @@ pub fn load_state_v1(path: &std::path::Path) -> Result<CacheSnapshotV1, String> 
 pub fn iter_bytecode_raw<F: FnMut(&B256, Vec<u8>)>(snap: &CacheSnapshotV1, mut f: F) {
     for (hash, code) in &snap.codes {
         let raw = match code.clone() {
-            BytecodeV86Mirror::LegacyAnalyzed { bytecode, .. } => bytecode.to_vec(),
+            // LegacyAnalyzed.bytecode includes 33 trailing bytes of safety padding
+            // appended during analysis (32 zero bytes + STOP). Slice to original_len so
+            // callers see only on-chain raw bytes — otherwise raw_len inflates by 33 and
+            // skeleton extraction at end-of-code mid-PUSH boundaries diverges from the
+            // original-bytes semantics used by the canonical paper data.
+            BytecodeV86Mirror::LegacyAnalyzed { bytecode, original_len, .. } => {
+                bytecode[..original_len.min(bytecode.len())].to_vec()
+            }
             BytecodeV86Mirror::Eip7702 { raw, .. } => raw.to_vec(),
         };
         f(hash, raw);
