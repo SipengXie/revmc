@@ -794,6 +794,9 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 self.call_fallible_builtin(Builtin::CallDataCopy, &[self.ecx, sp]);
             }
             op::CODESIZE => {
+                // TODO(emse-compile): see skelot_common.rs - replace baked-in
+                // length with EvmContext.bytecode_len read so metadata-variant
+                // family members can share a compiled artifact safely.
                 let bytecode_len =
                     self.bcx.uconst(self.isize_type, self.bytecode.code.len() as u64);
                 let size = self.call_builtin(Builtin::CodeSize, &[bytecode_len]).unwrap();

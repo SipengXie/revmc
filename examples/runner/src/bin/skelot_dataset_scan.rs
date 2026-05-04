@@ -13,14 +13,29 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use revm::primitives::B256;
 use serde::Serialize;
 
 use crate::skelot_common::{
-    bucket_for_raw_len, extract_opcode_skeleton_with_counts, hash_bytes, identify_pattern,
-    should_skip_bytes, BUCKET_SCHEME_ID,
+    bucket_for_raw_len, extract_emse_skeleton, extract_opcode_skeleton_with_counts, hash_bytes,
+    identify_pattern, should_skip_bytes, BUCKET_SCHEME_ID,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum SkeletonMode {
+    Current,
+    Emse,
+}
+
+impl SkeletonMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            SkeletonMode::Current => "current",
+            SkeletonMode::Emse => "emse",
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "skelot_dataset_scan")]
@@ -35,6 +50,8 @@ struct Args {
     block_count: Option<u64>,
     #[arg(long, default_value_t = 1000)]
     window_size: u64,
+    #[arg(long, value_enum, default_value = "current")]
+    skeleton_mode: SkeletonMode,
     #[arg(long)]
     out_dir: String,
 }
@@ -96,6 +113,7 @@ struct FamilyFile {
 }
 
 struct ScanContext {
+    skeleton_mode: SkeletonMode,
     /// Global dedup map: code_hash -> raw bytecode bytes.
     codes: HashMap<B256, Vec<u8>>,
     /// Per-code skeleton hash so windows can reuse work.
@@ -105,8 +123,9 @@ struct ScanContext {
 }
 
 impl ScanContext {
-    fn new() -> Self {
+    fn new(skeleton_mode: SkeletonMode) -> Self {
         Self {
+            skeleton_mode,
             codes: HashMap::new(),
             skeleton_of: HashMap::new(),
             skeleton_members: HashMap::new(),
@@ -120,7 +139,10 @@ impl ScanContext {
         if self.codes.contains_key(&hash) {
             return;
         }
-        let (skel, _ops, _imm) = extract_opcode_skeleton_with_counts(&bytecode_bytes);
+        let skel = match self.skeleton_mode {
+            SkeletonMode::Current => extract_opcode_skeleton_with_counts(&bytecode_bytes).0,
+            SkeletonMode::Emse => extract_emse_skeleton(&bytecode_bytes),
+        };
         let skel_len = skel.len();
         let skel_hash = hash_bytes(&skel);
         self.codes.insert(hash, bytecode_bytes);
@@ -232,16 +254,17 @@ fn main() {
     let n_windows = block_count / args.window_size;
     assert!(n_windows >= 1, "block_count must be ≥ window_size");
     eprintln!(
-        "Stage A: scanning {} blocks from {} in {} windows of {} (chain={})",
+        "Stage A: scanning {} blocks from {} in {} windows of {} (chain={}, skeleton_mode={})",
         block_count,
         start_block,
         n_windows,
         args.window_size,
         chain.as_lowercase(),
+        args.skeleton_mode.as_str(),
     );
 
     let t0 = Instant::now();
-    let mut ctx = ScanContext::new();
+    let mut ctx = ScanContext::new(args.skeleton_mode);
     // Track which hashes first appeared in which window, so per-window metrics
     // include only the bytecodes newly seen in that window.
     let mut per_window_hashes: Vec<Vec<B256>> = vec![Vec::new(); n_windows as usize];

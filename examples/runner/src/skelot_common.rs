@@ -4,6 +4,10 @@
 //! binary under `examples/runner/src/bin/`, matching the `bin_common.rs`
 //! pattern used elsewhere in this crate.
 
+// TODO: posture C - make CODESIZE runtime-indirect (translate.rs:796-799 baked-in
+// self.bytecode.code.len()) so EMSE skeleton can drive compilation, not just
+// static analysis. Currently EMSE skeleton is static-analysis-only.
+
 #![allow(dead_code)]
 
 use std::hash::{Hash, Hasher};
@@ -140,6 +144,79 @@ pub fn extract_opcode_skeleton_with_counts(bytes: &[u8]) -> (Vec<u8>, usize, usi
         }
     }
     (skeleton, opcode_count, imm_bytes)
+}
+
+/// Extract an EMSE-style static-analysis skeleton.
+///
+/// This strips Solidity CBOR metadata, strips trailing zero bytes from the
+/// remaining code segment, and replaces each PUSH immediate byte with zero
+/// while preserving bytecode length. This is intentionally not used for
+/// skeleton compilation until CODESIZE is runtime-indirect.
+pub fn extract_emse_skeleton(bytes: &[u8]) -> Vec<u8> {
+    let code = strip_solidity_cbor_metadata(bytes);
+    let code = strip_trailing_zeroes(code);
+    let mut skeleton = Vec::with_capacity(code.len());
+    let mut i = 0;
+    while i < code.len() {
+        let op = code[i];
+        skeleton.push(op);
+        i += 1;
+        if (0x60..=0x7f).contains(&op) {
+            let n = (op - 0x5f) as usize;
+            let take = n.min(code.len().saturating_sub(i));
+            skeleton.extend(std::iter::repeat(0).take(take));
+            i += take;
+        }
+    }
+    skeleton
+}
+
+fn strip_solidity_cbor_metadata(bytes: &[u8]) -> &[u8] {
+    if bytes.len() < 2 {
+        return bytes;
+    }
+    let metadata_len =
+        u16::from_be_bytes([bytes[bytes.len() - 2], bytes[bytes.len() - 1]]) as usize;
+    if metadata_len == 0 || bytes.len() < metadata_len + 2 {
+        return bytes;
+    }
+    let metadata_start = bytes.len() - 2 - metadata_len;
+    let metadata = &bytes[metadata_start..bytes.len() - 2];
+    if looks_like_solidity_cbor_metadata(metadata) {
+        &bytes[..metadata_start]
+    } else {
+        bytes
+    }
+}
+
+fn strip_trailing_zeroes(bytes: &[u8]) -> &[u8] {
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1] == 0 {
+        end -= 1;
+    }
+    &bytes[..end]
+}
+
+fn looks_like_solidity_cbor_metadata(metadata: &[u8]) -> bool {
+    if metadata.is_empty() {
+        return false;
+    }
+    let first = metadata[0];
+    let is_cbor_map = (first & 0xe0) == 0xa0 || first == 0xbf;
+    is_cbor_map
+        && ["ipfs", "bzzr0", "bzzr1", "solc", "experimental"]
+            .iter()
+            .any(|key| cbor_text_key_appears(metadata, key.as_bytes()))
+}
+
+fn cbor_text_key_appears(metadata: &[u8], key: &[u8]) -> bool {
+    if key.len() >= 24 {
+        return false;
+    }
+    let mut encoded = Vec::with_capacity(key.len() + 1);
+    encoded.push(0x60 | key.len() as u8);
+    encoded.extend_from_slice(key);
+    metadata.windows(encoded.len()).any(|window| window == encoded.as_slice())
 }
 
 /// FNV-style hash using `DefaultHasher`. Matches existing
@@ -878,6 +955,66 @@ mod stratified_tests {
             member_count: members,
             member_hashes: (0..members).map(|i| format!("{:064x}", i)).collect(),
         }
+    }
+
+    fn with_metadata(mut code: Vec<u8>, metadata: &[u8]) -> Vec<u8> {
+        code.extend_from_slice(metadata);
+        code.extend_from_slice(&(metadata.len() as u16).to_be_bytes());
+        code
+    }
+
+    #[test]
+    fn emse_skeleton_strips_matching_solidity_cbor_metadata() {
+        let code = vec![0x60, 0x2a, 0x01];
+        let metadata = [0xa1, 0x64, b's', b'o', b'l', b'c', 0x43, 0x00, 0x08, 0x11];
+        let bytecode = with_metadata(code, &metadata);
+        assert_eq!(extract_emse_skeleton(&bytecode), vec![0x60, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn emse_skeleton_keeps_non_matching_metadata_like_tail() {
+        let bytecode = with_metadata(vec![0x60, 0x2a, 0x01], &[0xa1, 0x63, b'f', b'o', b'o', 0x01]);
+        let skeleton = extract_emse_skeleton(&bytecode);
+        assert_eq!(&skeleton[..3], &[0x60, 0x00, 0x01]);
+        assert_eq!(skeleton.len(), bytecode.len());
+    }
+
+    #[test]
+    fn emse_skeleton_strips_trailing_zeroes_after_metadata_removal() {
+        assert_eq!(extract_emse_skeleton(&[0x60, 0x2a, 0x01, 0x00, 0x00]), vec![0x60, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn emse_skeleton_groups_eip1167_minimal_proxy_variants() {
+        let proxy_a = hex::decode(
+            "363d3d373d3d3d363d7311111111111111111111111111111111111111115af43d82803e903d91602b57fd5bf3",
+        )
+        .unwrap();
+        let proxy_b = hex::decode(
+            "363d3d373d3d3d363d7322222222222222222222222222222222222222225af43d82803e903d91602b57fd5bf3",
+        )
+        .unwrap();
+        assert_eq!(proxy_a.len(), 45);
+        assert_eq!(proxy_b.len(), 45);
+        assert_eq!(extract_opcode_skeleton(&proxy_a), extract_opcode_skeleton(&proxy_b));
+        assert_eq!(extract_emse_skeleton(&proxy_a), extract_emse_skeleton(&proxy_b));
+        assert_eq!(extract_emse_skeleton(&proxy_a).len(), 45);
+    }
+
+    #[test]
+    fn emse_skeleton_strips_long_solidity_metadata_tail() {
+        let mut code = Vec::new();
+        for i in 0..128u8 {
+            code.extend_from_slice(&[0x60, i, 0x56, 0x5b]);
+        }
+        code.extend_from_slice(&[0x61, 0x12, 0x34, 0x01, 0x00, 0x00]);
+        let metadata = [
+            0xa2, 0x64, b'i', b'p', b'f', b's', 0x58, 0x22, 0x12, 0x20, 0x88, 0x99, 0x64, b's',
+            b'o', b'l', b'c', 0x43, 0x00, 0x08, 0x1f,
+        ];
+        let expected = extract_emse_skeleton(&code);
+        let bytecode = with_metadata(code, &metadata);
+        assert_eq!(extract_emse_skeleton(&bytecode), expected);
     }
 
     #[test]
