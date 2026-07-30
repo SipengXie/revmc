@@ -35,7 +35,7 @@ use bin_common::{
 #[derive(Parser)]
 #[command(name = "icache_experiment")]
 struct Args {
-    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data")]
+    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data_base")]
     dir: String,
     #[arg(long, default_value_t = 38004930)]
     block: u64,

@@ -548,7 +548,7 @@ fn print_block_summary(all_comparisons: &[FrameComparison]) {
 )]
 struct Args {
     /// Path to bench_data directory
-    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data")]
+    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data_base")]
     dir: String,
 
     /// Block number to profile

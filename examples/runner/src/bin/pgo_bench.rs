@@ -357,7 +357,7 @@ struct AnalyzedGroup {
 fn main() {
     let dir = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "/home/ubuntu/sipeng/bench_data".into());
+        .unwrap_or_else(|| "/home/ubuntu/sipeng/bench_data_base".into());
     let bench_dir = Path::new(&dir);
     let block: u64 = std::env::args()
         .nth(2)

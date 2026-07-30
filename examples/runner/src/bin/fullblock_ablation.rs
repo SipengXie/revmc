@@ -39,7 +39,7 @@ use bin_common::{
 #[derive(Parser)]
 #[command(name = "fullblock_ablation", about = "Full-block JIT ablation for whitelist generation")]
 struct Args {
-    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data")]
+    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data_base")]
     dir: String,
     #[arg(long)]
     block: u64,

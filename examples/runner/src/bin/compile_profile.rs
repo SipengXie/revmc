@@ -38,7 +38,7 @@ struct CacheSnapshot {
 }
 
 fn main() {
-    let bench_dir = Path::new("/home/ubuntu/sipeng/bench_data");
+    let bench_dir = Path::new("/home/ubuntu/sipeng/bench_data_base");
     let cache_dir = Path::new("/tmp/compile_profile_cache");
     std::fs::create_dir_all(cache_dir).ok();
     let opt = OptimizationLevel::Aggressive;

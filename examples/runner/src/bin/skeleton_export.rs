@@ -90,7 +90,7 @@ struct SkeletonRecord {
 fn main() {
     let dir = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "/home/ubuntu/sipeng/bench_data".into());
+        .unwrap_or_else(|| "/home/ubuntu/sipeng/bench_data_base".into());
     let bench_dir = Path::new(&dir);
     let start: u64 = std::env::args()
         .nth(2)

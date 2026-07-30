@@ -3,7 +3,7 @@
 //! Usage:
 //!   cargo run -p revmc-examples-runner --bin collect_profile --release [bench_dir] [block]
 //!
-//! Defaults: bench_dir = /home/ubuntu/sipeng/bench_data, block = 38004930
+//! Defaults: bench_dir = /home/ubuntu/sipeng/bench_data_base, block = 38004930
 
 #[allow(dead_code)]
 #[path = "../bin_common.rs"]
@@ -109,7 +109,7 @@ impl SerializableProfiles {
 fn main() {
     let dir = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "/home/ubuntu/sipeng/bench_data".into());
+        .unwrap_or_else(|| "/home/ubuntu/sipeng/bench_data_base".into());
     let bench_dir = Path::new(&dir);
     let block: u64 = std::env::args()
         .nth(2)

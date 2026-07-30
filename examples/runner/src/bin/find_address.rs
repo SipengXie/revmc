@@ -37,7 +37,7 @@ fn find_calldata(args: &[String]) {
 
     println!("Searching for txs with address in calldata: 0x{}", addr_hex);
 
-    let txs_dir = PathBuf::from("/home/ubuntu/sipeng/bench_data/txs");
+    let txs_dir = PathBuf::from("/home/ubuntu/sipeng/bench_data_base/txs");
     let mut entries: Vec<_> = std::fs::read_dir(&txs_dir)
         .expect("cannot read txs dir")
         .filter_map(|e| e.ok())
@@ -115,7 +115,7 @@ fn find_tx(args: &[String]) {
         println!("  Selector filter: 0x{}", hex::encode(sel));
     }
 
-    let txs_dir = PathBuf::from("/home/ubuntu/sipeng/bench_data/txs");
+    let txs_dir = PathBuf::from("/home/ubuntu/sipeng/bench_data_base/txs");
     let mut entries: Vec<_> = std::fs::read_dir(&txs_dir)
         .expect("cannot read txs dir")
         .filter_map(|e| e.ok())
@@ -186,7 +186,7 @@ fn find_code_hash(args: &[String]) {
 
     println!("Searching for code_hash: {:#x}", target);
 
-    let states_dir = PathBuf::from("/home/ubuntu/sipeng/bench_data/states");
+    let states_dir = PathBuf::from("/home/ubuntu/sipeng/bench_data_base/states");
     let mut entries: Vec<_> = std::fs::read_dir(&states_dir)
         .expect("cannot read states dir")
         .filter_map(|e| e.ok())

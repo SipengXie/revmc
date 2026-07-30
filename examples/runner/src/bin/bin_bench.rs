@@ -192,7 +192,7 @@ impl BlockStats {
 )]
 struct Args {
     /// Path to bench_data directory
-    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data")]
+    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data_base")]
     dir: String,
 
     /// First block number

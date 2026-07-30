@@ -43,7 +43,7 @@ struct Args {
     /// Path to native_ranking.bin (bincode Vec<(PathKeyCompat, u64)>)
     #[arg(long)]
     ranking: String,
-    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data")]
+    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data_base")]
     dir: String,
     #[arg(long, default_value = "./jit_cache")]
     cache_dir: String,

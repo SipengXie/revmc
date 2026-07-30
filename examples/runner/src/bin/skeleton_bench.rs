@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Parser)]
 #[command(name = "skeleton_bench")]
 struct Cli {
-    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data")]
+    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data_base")]
     bench_dir: String,
     #[arg(long, default_value_t = 38004930)]
     block: u64,

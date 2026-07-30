@@ -383,7 +383,7 @@ fn main() {
         .unwrap_or(38004930);
     let bench_dir = std::env::args()
         .nth(2)
-        .unwrap_or_else(|| "/home/ubuntu/sipeng/bench_data".into());
+        .unwrap_or_else(|| "/home/ubuntu/sipeng/bench_data_base".into());
     let bench_path = Path::new(&bench_dir);
 
     let states_path = bench_path.join(format!("states/{block}.bin"));

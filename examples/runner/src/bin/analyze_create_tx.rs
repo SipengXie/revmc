@@ -229,7 +229,7 @@ fn time_tx_ns_empty_jit(loader: &BinLoader, rounds: usize) -> Vec<u64> {
 #[derive(Parser)]
 #[command(name = "analyze_create_tx")]
 struct Args {
-    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data")]
+    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data_base")]
     dir: String,
     #[arg(long, default_value_t = 38004930)]
     block: u64,
