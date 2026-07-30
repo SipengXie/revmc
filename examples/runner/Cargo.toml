@@ -181,3 +181,7 @@ path = "src/bin/skeleton_deployment_span.rs"
 [[bin]]
 name = "nested_family_count"
 path = "src/bin/nested_family_count.rs"
+
+[[bin]]
+name = "grouping_stats"
+path = "src/bin/grouping_stats.rs"

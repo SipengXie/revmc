@@ -17,6 +17,16 @@ use revm_primitives::B256;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
+/// g2 member filtering is off under the hardened interpreter semantics
+/// (jumps into the stripped metadata region are invalid on BOTH sides, so a
+/// metadata JUMPDEST can never be taken): the metadata boundary is reliably
+/// identifiable today, so alignment replaces filtering. g1 stays on because
+/// the code/data boundary inside the code region is NOT reliably
+/// identifiable — only the reachability proof works there. Both become
+/// unnecessary once EOF-style formats separate code/data/metadata. Flip to
+/// true for vanilla yellow-paper jump semantics.
+pub const ENFORCE_G2: bool = false;
+
 /// Family-boundary selector for skeleton grouping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkeletonMode {
@@ -199,17 +209,19 @@ pub fn group_skeleton_families(
                     per_hash.extend(group_members);
                     continue;
                 }
-                group_members.retain(|m| {
-                    let full = &contracts[m];
-                    let stripped_len = strip_emse_suffixes(full).len();
-                    if stripped_suffix_has_jumpdest(full, stripped_len) {
-                        stats.g2_rejected_members += 1;
-                        per_hash.push(*m);
-                        false
-                    } else {
-                        true
-                    }
-                });
+                if ENFORCE_G2 {
+                    group_members.retain(|m| {
+                        let full = &contracts[m];
+                        let stripped_len = strip_emse_suffixes(full).len();
+                        if stripped_suffix_has_jumpdest(full, stripped_len) {
+                            stats.g2_rejected_members += 1;
+                            per_hash.push(*m);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
             }
 
             if group_members.len() >= 2 {
@@ -306,28 +318,39 @@ fn cbor_text_key_appears(metadata: &[u8], key: &[u8]) -> bool {
 /// physical end of the stripped code region and fall through into the
 /// stripped suffix.
 ///
-/// Judges only the physically last instruction (no reachability analysis):
-/// unless it is one of STOP / RETURN / REVERT / INVALID / JUMP /
-/// SELFDESTRUCT, the region is considered fall-through and the skeleton must
-/// not be shared under the EMSE boundary. Empty input and a trailing PUSH
-/// with truncated immediate both count as fall-through (conservative).
+/// Reachability argument (no full CFG needed): control reaches a byte
+/// position only via sequential flow or a jump. Sequential flow cannot pass
+/// the last flow-blocking instruction (STOP / RETURN / REVERT / INVALID /
+/// JUMP / SELFDESTRUCT), and a jump needs a valid JUMPDEST at an
+/// instruction boundary. Hence the region after the last blocker — and with
+/// it the physical end — is unreachable iff that region contains no
+/// boundary JUMPDEST. Embedded data tails (e.g. Solidity revert strings)
+/// therefore pass, unless the data happens to contain 0x5b ('[') at an
+/// instruction boundary, in which case the EVM itself would accept a jump
+/// there and we conservatively reject. No blocker at all (includes empty
+/// input) is fall-through. A truncated trailing PUSH inside an unreachable
+/// region is harmless (never executed); with no blocker before it, the
+/// no-blocker rule already rejects.
 pub fn tail_can_fall_through(code: &[u8]) -> bool {
-    let mut last_op = None;
+    let mut saw_blocker = false;
+    let mut jumpdest_after_blocker = false;
     let mut i = 0;
     while i < code.len() {
         let opcode = code[i];
-        last_op = Some(opcode);
         i += 1;
         if (op::PUSH1..=op::PUSH32).contains(&opcode) {
             i += (opcode - op::PUSH0) as usize;
         }
+        match opcode {
+            op::STOP | op::RETURN | op::REVERT | op::INVALID | op::JUMP | op::SELFDESTRUCT => {
+                saw_blocker = true;
+                jumpdest_after_blocker = false;
+            }
+            op::JUMPDEST => jumpdest_after_blocker = true,
+            _ => {}
+        }
     }
-    !matches!(
-        last_op,
-        Some(
-            op::STOP | op::RETURN | op::REVERT | op::INVALID | op::JUMP | op::SELFDESTRUCT
-        )
-    )
+    !saw_blocker || jumpdest_after_blocker
 }
 
 /// Admission guard g2 (member-level): `true` if the member's stripped suffix
@@ -415,6 +438,28 @@ mod tests {
         );
         assert_eq!(extract_emse_skeleton(&proxy_a), extract_emse_skeleton(&proxy_b));
         assert_eq!(extract_emse_skeleton(&proxy_a).len(), 45);
+    }
+
+    #[test]
+    fn fallthrough_guard_proves_data_tail_unreachable() {
+        // REVERT blocks sequential flow; the embedded revert-string data
+        // after it contains no boundary JUMPDEST, so the physical end is
+        // provably unreachable — admissible even though scanning the data
+        // ends in a truncated PUSH.
+        let mut code = vec![0x60, 0x2a, op::REVERT];
+        code.extend_from_slice(b"insufficient balance");
+        assert!(!tail_can_fall_through(&code));
+    }
+
+    #[test]
+    fn fallthrough_guard_rejects_jumpdest_after_last_blocker() {
+        // A boundary 0x5b after the last blocker is a valid EVM jump target,
+        // so the tail region stays reachable — reject.
+        assert!(tail_can_fall_through(&[0x60, 0x2a, op::REVERT, 0x5b]));
+        // '[' (0x5b) at an instruction boundary inside string data: same.
+        let mut code = vec![0x60, 0x2a, op::REVERT];
+        code.extend_from_slice(b"abc[def");
+        assert!(tail_can_fall_through(&code));
     }
 
     #[test]
@@ -514,9 +559,17 @@ mod tests {
         let contracts = contracts_of(&[(b256(1), a), (b256(2), b), (b256(3), c)]);
         let emse = group_skeleton_families(&contracts, SkeletonMode::Emse);
         assert_eq!(emse.families.len(), 1);
-        assert_eq!(emse.families[0].members, vec![b256(1), b256(2)]);
-        assert_eq!(emse.per_hash, vec![b256(3)]);
-        assert_eq!(emse.stats.g2_rejected_members, 1);
+        if ENFORCE_G2 {
+            assert_eq!(emse.families[0].members, vec![b256(1), b256(2)]);
+            assert_eq!(emse.per_hash, vec![b256(3)]);
+            assert_eq!(emse.stats.g2_rejected_members, 1);
+        } else {
+            // Hardened interpreter semantics: metadata JUMPDESTs can never be
+            // taken on either side, so the poisoned member stays shareable.
+            assert_eq!(emse.families[0].members, vec![b256(1), b256(2), b256(3)]);
+            assert!(emse.per_hash.is_empty());
+            assert_eq!(emse.stats.g2_rejected_members, 0);
+        }
         assert_eq!(emse.stats.g1_rejected_skeletons, 0);
     }
 
