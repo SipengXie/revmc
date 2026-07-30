@@ -196,3 +196,55 @@ target/release/skelot_compile_bench \
 ```
 (`--mode both` produces the Naive per-hash row and the SkelOT row in one run; the SkelOT row
 carries the EMSE `grouping` guard counts for the rebuttal.)
+
+## Addendum (paper session, 2026-07-30): same-family nested-call count for C1 rebuttal
+
+Reviewer C asks whether nested same-family calls (same artifact twice on the call
+stack, two different tables) are actually exercised by replay. We want a COUNT from
+the D2 full replay: how many times a frame executes while an ancestor frame (and
+separately: its direct parent) belongs to the same EMSE family, over all 10K blocks.
+
+HARD CONSTRAINT (user): the counting must not perturb the timed replay's timing.
+Preference order:
+1. Offline post-processing — if the replay already emits a per-frame record with call
+   ancestry (or depth + ordering sufficient to reconstruct the frame tree) plus
+   code_hash, derive the count entirely offline; zero runtime change.
+2. If ancestry is not reconstructible from existing output, count only in a
+   NON-timed arm (exec_sanity or a separate untimed pass) — never in the timed path.
+
+Deliverables: (a) same-family ancestor-descendant frame count, (b) same-family
+direct parent-child count, 10K-block Base replay, EMSE families.
+
+### Result (revmc session, 2026-07-30)
+
+Option 1 (offline) was not possible: no existing replay output records frame
+ancestry (frame_bench tracks a frame stack internally but emits only aggregates).
+Implemented option 2 as a standalone, fully untimed tool —
+`nested_family_count` (commit 81740807): interpreter-only replay with a
+frame-stack hook (pattern from frame_bench's InstrumentedHandler), EMSE family
+map from the shared verified grouping over the same 10K corpus, deposits
+skipped per the exec-sanity convention. No timed path was touched.
+
+Base 10K (blocks 38004930..38014929, EMSE families, 16 threads, 372s replay):
+
+| metric | count |
+|---|---|
+| blocks replayed | 10,000 |
+| txs replayed | 3,510,205 |
+| total call frames | 50,333,517 |
+| frames in EMSE families | 29,428,441 (58.5%) |
+| **(a) same-family ancestor-descendant** | **3,061,778** (10.4% of family frames) |
+| **(b) same-family direct parent-child** | **440** |
+| families exhibiting nesting | 135 |
+
+Top families: f44a4732 (1,389,814), 81d06818 (737,716), c35ff2d7 (508,705).
+Reading for the rebuttal: the reviewer's scenario is not an edge case — the
+same shared artifact sits above itself on the call stack ~3.06M times across
+10K blocks (typically router → ... → same-family pool patterns; direct
+self-recursion between family members is rare at 440). Every such frame gets
+its own `EvmContext` with its own `imm_data_ptr`, which is exactly why the
+per-call-context design matters at workload scale.
+
+JSON: `/home/ubuntu/sipeng/skelot-paper/data/nested_family_count_emse_base10k.json`.
+Rerun: `target/release/nested_family_count --bench-dir /home/ubuntu/sipeng/bench_data_base \
+--start-block 38004930 --block-count 10000 --threads 16 --skeleton-mode emse --out <path>`.
