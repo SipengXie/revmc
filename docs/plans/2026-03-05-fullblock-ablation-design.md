@@ -15,7 +15,7 @@ New binary: `examples/runner/src/bin/fullblock_ablation.rs`
 ```
 fullblock_ablation \
   --block 38004930 \
-  --dir /home/ubuntu/sipeng/bench_data \
+  --dir /home/ubuntu/sipeng/bench_data_base \
   --cache-dir /tmp/jit_cache \
   --rounds 15 --warmup 3 --alpha 0.05 \
   --output whitelist.json
@@ -86,7 +86,7 @@ Output to JSON file: `{ block, whitelist: [GOOD hashes], blacklist: [BAD hashes]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--block` | required | Block number |
-| `--dir` | `/home/ubuntu/sipeng/bench_data` | Bench data directory |
+| `--dir` | `/home/ubuntu/sipeng/bench_data_base` | Bench data directory |
 | `--cache-dir` | required | AOT cache directory |
 | `--rounds` | 15 | Measurement rounds per config |
 | `--warmup` | 3 | Untimed warmup runs |

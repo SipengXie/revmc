@@ -104,7 +104,7 @@ use bin_common::{
 #[command(name = "ablation_bench", about = "Per-contract JIT ablation experiment")]
 struct Args {
     /// Path to bench_data directory containing states/ and txs/
-    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data")]
+    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data_base")]
     dir: String,
 
     /// Block number to analyze

@@ -6,13 +6,13 @@
 
 ## 仓库与工作区
 
-- Revmc 主仓：`/home/ubuntu/sipeng/helios/revmc`（git 受控）
+- Revmc 主仓：`/home/ubuntu/sipeng/skelot/revmc`（git 受控）
 - 论文工作区：`/home/ubuntu/hermes-shared-workspace/skelot-paper`（**非 git 仓**，所有数据/表/图/脚本/schema 存此）
-- Bench 原始数据：`/home/ubuntu/sipeng/bench_data/states/{bn}.bin` + `/home/ubuntu/sipeng/bench_data/txs/{bn}.bin`（10K block 快照 + tx，blocks 38004930..38014929）
+- Bench 原始数据：`/home/ubuntu/sipeng/bench_data_base/states/{bn}.bin` + `/home/ubuntu/sipeng/bench_data_base/txs/{bn}.bin`（10K block 快照 + tx，blocks 38004930..38014929）
 - 扫描缓存：`/home/ubuntu/.cache/skelot_index/bytecodes_38004930_10000.bin` + `.../tx_index_38004930_10000.bin`
 - Stage E .so 缓存：`/home/ubuntu/hermes-shared-workspace/skelot-paper/data/stage_e_so_cache/cap32/{skeleton_id}/`
 - Memory：`/home/ubuntu/.claude/projects/-home-ubuntu-sipeng-helios-revmc/memory/`
-- 实验辅料：`/home/ubuntu/sipeng/helios/revmc/docs/experiments/skeleton-data/`（PUSH variance log、部署时间 log）
+- 实验辅料：`/home/ubuntu/sipeng/skelot/revmc/docs/experiments/skeleton-data/`（PUSH variance log、部署时间 log）
 
 ---
 
@@ -20,7 +20,7 @@
 
 **目的**：验证 EVM 字节码可剥离 PUSH 立即数得到 opcode 骨架，并测骨架级去重率。
 
-**方法论**：`/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/opcode_dedup.rs` 扫 10K block 语料，按 PUSH1-PUSH32 剥离后 hash 聚类；按 raw 长度分桶。
+**方法论**：`/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/opcode_dedup.rs` 扫 10K block 语料，按 PUSH1-PUSH32 剥离后 hash 聚类；按 raw 长度分桶。
 
 **结论**：19,197 unique 字节码 → 11,259 unique skeleton（**1.7× 去重，41.4% 减少**）。huge 桶 (>15KB) 去重率 **64.3%**。Top skeleton：Uniswap V3 Pool 3323 份（14,788 B），ERC-20 465 份，EIP-1167 minimal proxy 342 份。
 
@@ -29,9 +29,9 @@
 - Memory: `/home/ubuntu/.claude/projects/-home-ubuntu-sipeng-helios-revmc/memory/skeleton-dedup.md`
 
 **相关源**：
-- `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/opcode_dedup.rs`
-- `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/skeleton_identify.rs`
-- `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/skeleton_export.rs`
+- `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/opcode_dedup.rs`
+- `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/skeleton_identify.rs`
+- `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/skeleton_export.rs`
 
 ---
 
@@ -39,7 +39,7 @@
 
 **目的**：证明 invariant/variant 分类不是空设——invariant 位占多数，支撑"share .so + 保留 LLVM 折叠"两全的设计合理性。
 
-**方法论**：`/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/push_variance.rs` 跨 428 个 ≥2 成员 family（8366 字节码）逐位比较 PUSH 立即数；按桶 × variant% 与 variant-distinct-count 二维分析。
+**方法论**：`/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/push_variance.rs` 跨 428 个 ≥2 成员 family（8366 字节码）逐位比较 PUSH 立即数；按桶 × variant% 与 variant-distinct-count 二维分析。
 
 **结论**：
 - **99.37% PUSH 位是 invariant**（586,950/590,650）
@@ -49,7 +49,7 @@
 - "耗子屎"（近 invariant 被误标 variant）仅 0.2%，可忽略
 
 **数据**：
-- `/home/ubuntu/sipeng/helios/revmc/docs/experiments/skeleton-data/push_variance.log`（21 KB，原 `/tmp` 迁入仓）
+- `/home/ubuntu/sipeng/skelot/revmc/docs/experiments/skeleton-data/push_variance.log`（21 KB，原 `/tmp` 迁入仓）
 - Memory: `/home/ubuntu/.claude/projects/-home-ubuntu-sipeng-helios-revmc/memory/push-variance-results.md`
 
 ---
@@ -58,7 +58,7 @@
 
 **目的**：把 invariant 从"5 小时窗口巧合"升级为"协议寿命常量"——反驳"窗口短，invariant 是统计偶然"的潜在 reviewer 质疑。
 
-**方法论**：`/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/skeleton_deployment_span.rs`，对 top-5 family 各取 30 成员，用 Alchemy Base mainnet RPC 二分搜 `eth_getCode(addr, block)` 找首次部署块，`eth_getBlockByNumber` 转 UTC。命令：`cargo run --release -p revmc-examples-runner --bin skeleton_deployment_span -- --top 5 --sample-per-group 30 --concurrency 12`。
+**方法论**：`/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/skeleton_deployment_span.rs`，对 top-5 family 各取 30 成员，用 Alchemy Base mainnet RPC 二分搜 `eth_getCode(addr, block)` 找首次部署块，`eth_getBlockByNumber` 转 UTC。命令：`cargo run --release -p revmc-examples-runner --bin skeleton_deployment_span -- --top 5 --sample-per-group 30 --concurrency 12`。
 
 **结论**：
 | Rank | Members | Bytecode | Span | 起始 | 截止 |
@@ -70,7 +70,7 @@
 | 5 | 199 | 5,129 B | **797.1 天** | 2023-09-05 | 2025-11-10 |
 
 **数据**：
-- `/home/ubuntu/sipeng/helios/revmc/docs/experiments/skeleton-data/skeleton_span.log`
+- `/home/ubuntu/sipeng/skelot/revmc/docs/experiments/skeleton-data/skeleton_span.log`
 - Memory: `/home/ubuntu/.claude/projects/-home-ubuntu-sipeng-helios-revmc/memory/push-variance-temporal-validation.md`
 
 ---
@@ -90,12 +90,12 @@ API：`EvmCompiler::translate_skeleton(name, bytecode, spec, &variance)` + `jit_
 **结论（block 38004930 单块 benchmark）**：11 skeleton 编译 vs 50 per-hash = **6.2× compile 加速**；执行 skeleton 比 native **1.16-1.28×**（per-hash 因 304 份 `.so` 的 L1i 抖动几乎打平 native）。
 
 **关键源**：
-- `/home/ubuntu/sipeng/helios/revmc/crates/revmc/src/skeleton.rs`
-- `/home/ubuntu/sipeng/helios/revmc/crates/revmc/src/bytecode/mod.rs`（`apply_variance` 183-211）
-- `/home/ubuntu/sipeng/helios/revmc/crates/revmc/src/compiler/translate.rs`（PUSH 分支 1005-1037）
-- `/home/ubuntu/sipeng/helios/revmc/crates/revmc-context/src/lib.rs`
-- `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/skeleton_bench.rs`
-- AOT 缓存：`/home/ubuntu/sipeng/helios/revmc/jit_cache/skel_{hash}__{spec}__{opt}.so` + `skeleton_registry.bin`
+- `/home/ubuntu/sipeng/skelot/revmc/crates/revmc/src/skeleton.rs`
+- `/home/ubuntu/sipeng/skelot/revmc/crates/revmc/src/bytecode/mod.rs`（`apply_variance` 183-211）
+- `/home/ubuntu/sipeng/skelot/revmc/crates/revmc/src/compiler/translate.rs`（PUSH 分支 1005-1037）
+- `/home/ubuntu/sipeng/skelot/revmc/crates/revmc-context/src/lib.rs`
+- `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/skeleton_bench.rs`
+- AOT 缓存：`/home/ubuntu/sipeng/skelot/revmc/jit_cache/skel_{hash}__{spec}__{opt}.so` + `skeleton_registry.bin`
 - Memory: `/home/ubuntu/.claude/projects/-home-ubuntu-sipeng-helios-revmc/memory/skeleton-compilation.md`
 
 ---
@@ -109,7 +109,7 @@ API：`EvmCompiler::translate_skeleton(name, bytecode, spec, &variance)` + `jit_
 **结论**：11 个模块测试 + 1 个 crate 级集成测试（`skeleton_admission_matches_existing_data_table_semantics`）——admission 产出的 ImmDataTable 与 `build_data_table` 结果 byte-identical。
 
 **关键源**：
-- `/home/ubuntu/sipeng/helios/revmc/crates/revmc/src/skeleton_admission.rs`
+- `/home/ubuntu/sipeng/skelot/revmc/crates/revmc/src/skeleton_admission.rs`
 - Memory: `/home/ubuntu/.claude/projects/-home-ubuntu-sipeng-helios-revmc/memory/skeleton-admission-check.md`
 
 ---
@@ -118,7 +118,7 @@ API：`EvmCompiler::translate_skeleton(name, bytecode, spec, &variance)` + `jit_
 
 **目的**：给 SkelOT 论文提供权威的 10K block 语料去重统计。
 
-**方法论**：`/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/skelot_dataset_scan.rs` 扫 `states/{38004930..38014929}.bin`。
+**方法论**：`/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/skelot_dataset_scan.rs` 扫 `states/{38004930..38014929}.bin`。
 
 **结论**：10K block 跑 364 秒；**19,130 字节码 → 11,189 skeleton = 41.51% 减少**（与早期 `opcode_dedup` 结果差 +0.001 pp）；huge 桶 **64.3% 精确**；Uniswap V3 Pool 3,323 成员精确。
 
@@ -134,7 +134,7 @@ API：`EvmCompiler::translate_skeleton(name, bytecode, spec, &variance)` + `jit_
 
 **目的**：量化 SkelOT AOT 相对 per-hash 的编译时间 + `.o` 产物尺寸收益，展示生产可用性。
 
-**方法论**：`/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/skelot_compile_bench.rs`，冷 cache 两模式各跑一遍全 10K，记录 `per_unit_ms`、`per_unit_o_bytes`、`fallback_count`。并行编译（8 线程）。OOM 修复 commit `afd2dc28`：LLVM Context 由 `Box::leak` 换 `Box::into_raw`/`Box::from_raw` scoping，RSS 从 57 GB 稳到 2.2 GB。
+**方法论**：`/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/skelot_compile_bench.rs`，冷 cache 两模式各跑一遍全 10K，记录 `per_unit_ms`、`per_unit_o_bytes`、`fallback_count`。并行编译（8 线程）。OOM 修复 commit `afd2dc28`：LLVM Context 由 `Box::leak` 换 `Box::into_raw`/`Box::from_raw` scoping，RSS 从 57 GB 稳到 2.2 GB。
 
 **结论**：
 | 指标 | per-hash | SkelOT | 对比 |
@@ -158,7 +158,7 @@ API：`EvmCompiler::translate_skeleton(name, bytecode, spec, &variance)` + `jit_
 
 **目的**：block 38004930 上 native/per_hash/skelot 三路径 gas 与 result 一致性，并测执行加速。
 
-**方法论**：`/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/skeleton_bench.rs`，block 38004930（228 txs）重放三路径，rounds + warmup + Welch p 统计。
+**方法论**：`/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/skeleton_bench.rs`，block 38004930（228 txs）重放三路径，rounds + warmup + Welch p 统计。
 
 **结论**：**228/228 tx gas & result 完全相等**；native 22.0 ms / per_hash 17.1 ms / **skelot 16.6 ms**，skelot 相对 native **1.33× 加速**。
 
@@ -172,7 +172,7 @@ API：`EvmCompiler::translate_skeleton(name, bytecode, spec, &variance)` + `jit_
 
 **目的**：给编译预算曲线——"只编译 top-N 覆盖 X% 执行流量，N 怎么选"。
 
-**方法论**：`/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/overlap_analysis.rs --export-budget-curve`，以 `entrypoint_timing.bin`（每 tx 入口合约+执行时间）为输入，per-hash 和 SkelOT 两维生成 Pareto 二线曲线。
+**方法论**：`/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/overlap_analysis.rs --export-budget-curve`，以 `entrypoint_timing.bin`（每 tx 入口合约+执行时间）为输入，per-hash 和 SkelOT 两维生成 Pareto 二线曲线。
 
 **结论**：同覆盖率下 skeleton 维所需编译单元数比 per-hash 小约 40%（与 Stage A/B 对齐）。
 
@@ -231,12 +231,12 @@ API：`EvmCompiler::translate_skeleton(name, bytecode, spec, &variance)` + `jit_
 - Run log（Task 13 per-frame full）：`/home/ubuntu/hermes-shared-workspace/skelot-paper/data/logs/stage_e_full_20260416T141939Z.log`
 - .so 缓存（供反汇编/IR 分析）：`/home/ubuntu/hermes-shared-workspace/skelot-paper/data/stage_e_so_cache/cap32/{skeleton_id}/`
 - Wrapper：`/home/ubuntu/hermes-shared-workspace/skelot-paper/scripts/run_stage_e_ablation.sh`
-- 计划+设计+方法学：`/home/ubuntu/sipeng/helios/revmc/.planning/plan_stage_e.md` + `.planning/design_stage_e_ablation.md` + `/home/ubuntu/hermes-shared-workspace/skelot-paper/methodology.md`
+- 计划+设计+方法学：`/home/ubuntu/sipeng/skelot/revmc/.planning/plan_stage_e.md` + `.planning/design_stage_e_ablation.md` + `/home/ubuntu/hermes-shared-workspace/skelot-paper/methodology.md`
 
 **关键源**：
-- `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/skelot_ablation_bench.rs`（955 LOC）
-- `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/skelot_common.rs`
-- `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin_common.rs`（含 `snapshot_before_tx` + `single_tx_evm` + `build_tx_index_cached`）
+- `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/skelot_ablation_bench.rs`（955 LOC）
+- `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/skelot_common.rs`
+- `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin_common.rs`（含 `snapshot_before_tx` + `single_tx_evm` + `build_tx_index_cached`）
 
 **Memory**：
 - `/home/ubuntu/.claude/projects/-home-ubuntu-sipeng-helios-revmc/memory/project-stage-e-status.md`
@@ -250,7 +250,7 @@ API：`EvmCompiler::translate_skeleton(name, bytecode, spec, &variance)` + `jit_
 **目的**：为 Stage C/E TimingHandler 模式提供原型——测 per-hash vs skeleton 在单 block 上的 frame-level 延迟。
 
 **源 + 数据**：
-- `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/skeleton_vs_perhash_bench.rs`（`TimingPerHashHandler` / `TimingSkeletonHandler` 原始定义，Stage E 复制改造）
+- `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/skeleton_vs_perhash_bench.rs`（`TimingPerHashHandler` / `TimingSkeletonHandler` 原始定义，Stage E 复制改造）
 - `/home/ubuntu/hermes-shared-workspace/skelot-paper/data/skeleton_vs_perhash.json`（历史基线数据）
 
 ---
@@ -260,7 +260,7 @@ API：`EvmCompiler::translate_skeleton(name, bytecode, spec, &variance)` + `jit_
 **结论要点**：ORC v2 与 MCJIT 共享 LLVM 管线，编译速度相当；价值在"管理"（增量、精确回收、替换 deprecated API）非"更快"。瓶颈是 LLVM O2 本身；skeleton dedup（6.2× compile 加速）比切 JIT 引擎更有效。AOT `.so` 缓存独立于 JIT 引擎。
 
 **关键文档**：
-- `/home/ubuntu/sipeng/helios/revmc/docs/plans/2026-03-12-progressive-skeleton-jit-design.md`
+- `/home/ubuntu/sipeng/skelot/revmc/docs/plans/2026-03-12-progressive-skeleton-jit-design.md`
 - Memory: `/home/ubuntu/.claude/projects/-home-ubuntu-sipeng-helios-revmc/memory/orc-v2-design.md`
 
 ---
@@ -270,12 +270,12 @@ API：`EvmCompiler::translate_skeleton(name, bytecode, spec, &variance)` + `jit_
 **结论**：对 revmc 做 branch profile 引导再编译 payoff 可忽略。设计保留不上生产。
 
 **关键源/文档**：
-- `/home/ubuntu/sipeng/helios/revmc/crates/revmc/src/profile.rs`
-- `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/pgo_bench.rs`
-- `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/pgo_single_bench.rs`
-- `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/collect_profile.rs`
-- `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/compile_profile.rs`
-- PGO 缓存：`/home/ubuntu/sipeng/helios/revmc/jit_cache_pgo/`
+- `/home/ubuntu/sipeng/skelot/revmc/crates/revmc/src/profile.rs`
+- `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/pgo_bench.rs`
+- `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/pgo_single_bench.rs`
+- `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/collect_profile.rs`
+- `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/compile_profile.rs`
+- PGO 缓存：`/home/ubuntu/sipeng/skelot/revmc/jit_cache_pgo/`
 - Memory: `/home/ubuntu/.claude/projects/-home-ubuntu-sipeng-helios-revmc/memory/pgo-profiling.md`
 
 ---
@@ -315,34 +315,34 @@ SkelOT 的性能和架构价值**无法从一个单一数字刻画**，是五样
 | Stage E .so 缓存（证据） | `/home/ubuntu/hermes-shared-workspace/skelot-paper/data/stage_e_so_cache/cap32/` |
 | Stage E cap=128 部分数据（受阻 abort） | `/home/ubuntu/hermes-shared-workspace/skelot-paper/data/ablation_allvariant.cap128_partial.json` |
 | Skeleton vs perhash 基线 | `/home/ubuntu/hermes-shared-workspace/skelot-paper/data/skeleton_vs_perhash.json` |
-| PUSH variance raw log | `/home/ubuntu/sipeng/helios/revmc/docs/experiments/skeleton-data/push_variance.log` |
-| PUSH 时间稳定性 log | `/home/ubuntu/sipeng/helios/revmc/docs/experiments/skeleton-data/skeleton_span.log` |
+| PUSH variance raw log | `/home/ubuntu/sipeng/skelot/revmc/docs/experiments/skeleton-data/push_variance.log` |
+| PUSH 时间稳定性 log | `/home/ubuntu/sipeng/skelot/revmc/docs/experiments/skeleton-data/skeleton_span.log` |
 | 扫描缓存（复现用） | `/home/ubuntu/.cache/skelot_index/bytecodes_38004930_10000.bin` + `tx_index_38004930_10000.bin` |
-| AOT 缓存（Stage B/C） | `/home/ubuntu/sipeng/helios/revmc/jit_cache/{hash}__{spec}__{opt}.so` + `skel_{hash}__...so` + `skeleton_registry.bin` |
-| PGO 缓存 | `/home/ubuntu/sipeng/helios/revmc/jit_cache_pgo/` |
+| AOT 缓存（Stage B/C） | `/home/ubuntu/sipeng/skelot/revmc/jit_cache/{hash}__{spec}__{opt}.so` + `skel_{hash}__...so` + `skeleton_registry.bin` |
+| PGO 缓存 | `/home/ubuntu/sipeng/skelot/revmc/jit_cache_pgo/` |
 
 ## 关键源码速查表
 
 | 主题 | 绝对路径 |
 |---|---|
-| Skeleton 分析 + data table | `/home/ubuntu/sipeng/helios/revmc/crates/revmc/src/skeleton.rs` |
-| Admission check | `/home/ubuntu/sipeng/helios/revmc/crates/revmc/src/skeleton_admission.rs` |
-| Bytecode 分析 + `apply_variance` | `/home/ubuntu/sipeng/helios/revmc/crates/revmc/src/bytecode/mod.rs` |
-| Translate 入口（PUSH 分支） | `/home/ubuntu/sipeng/helios/revmc/crates/revmc/src/compiler/translate.rs` |
-| EvmContext（`imm_data_ptr`） | `/home/ubuntu/sipeng/helios/revmc/crates/revmc-context/src/lib.rs` |
-| Stage A 扫描器 | `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/skelot_dataset_scan.rs` |
-| Stage B 编译 bench | `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/skelot_compile_bench.rs` |
-| Stage C 执行 bench | `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/skeleton_bench.rs` |
-| Stage D 预算分析 | `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/overlap_analysis.rs` |
-| Stage E 消融 bench | `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/skelot_ablation_bench.rs` |
-| PUSH variance 工具 | `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/push_variance.rs` |
-| 部署时间跨度工具 | `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/skeleton_deployment_span.rs` |
-| 骨架去重工具 | `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/opcode_dedup.rs` |
-| 协议识别 | `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/skeleton_identify.rs` |
-| 骨架映射导出 | `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/skeleton_export.rs` |
-| 共享 bench 工具 | `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin_common.rs` + `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/skelot_common.rs` |
-| Baseline 对照 | `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/skeleton_vs_perhash_bench.rs` |
-| Single-tx 原始工具 | `/home/ubuntu/sipeng/helios/revmc/examples/runner/src/bin/single_tx_bench.rs` |
+| Skeleton 分析 + data table | `/home/ubuntu/sipeng/skelot/revmc/crates/revmc/src/skeleton.rs` |
+| Admission check | `/home/ubuntu/sipeng/skelot/revmc/crates/revmc/src/skeleton_admission.rs` |
+| Bytecode 分析 + `apply_variance` | `/home/ubuntu/sipeng/skelot/revmc/crates/revmc/src/bytecode/mod.rs` |
+| Translate 入口（PUSH 分支） | `/home/ubuntu/sipeng/skelot/revmc/crates/revmc/src/compiler/translate.rs` |
+| EvmContext（`imm_data_ptr`） | `/home/ubuntu/sipeng/skelot/revmc/crates/revmc-context/src/lib.rs` |
+| Stage A 扫描器 | `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/skelot_dataset_scan.rs` |
+| Stage B 编译 bench | `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/skelot_compile_bench.rs` |
+| Stage C 执行 bench | `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/skeleton_bench.rs` |
+| Stage D 预算分析 | `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/overlap_analysis.rs` |
+| Stage E 消融 bench | `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/skelot_ablation_bench.rs` |
+| PUSH variance 工具 | `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/push_variance.rs` |
+| 部署时间跨度工具 | `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/skeleton_deployment_span.rs` |
+| 骨架去重工具 | `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/opcode_dedup.rs` |
+| 协议识别 | `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/skeleton_identify.rs` |
+| 骨架映射导出 | `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/skeleton_export.rs` |
+| 共享 bench 工具 | `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin_common.rs` + `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/skelot_common.rs` |
+| Baseline 对照 | `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/skeleton_vs_perhash_bench.rs` |
+| Single-tx 原始工具 | `/home/ubuntu/sipeng/skelot/revmc/examples/runner/src/bin/single_tx_bench.rs` |
 
 ## 关键 commits（`jit-integration` 分支）
 

@@ -71,7 +71,7 @@ warning: missing documentation for an associated function
 
 warning: `revmc` (lib) generated 10 warnings (run `cargo fix --lib -p revmc` to apply 1 suggestion)
 warning: `revmc` (lib) generated 10 warnings (10 duplicates)
-   Compiling revmc-examples-runner v0.1.0 (/home/ubuntu/sipeng/helios/revmc/examples/runner)
+   Compiling revmc-examples-runner v0.1.0 (/home/ubuntu/sipeng/skelot/revmc/examples/runner)
 warning: unused variable: `ref_push`
    --> examples/runner/src/bin/push_variance.rs:623:29
     |

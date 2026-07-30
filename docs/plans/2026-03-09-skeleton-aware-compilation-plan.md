@@ -636,10 +636,10 @@ use std::time::Instant;
 #[derive(Parser)]
 struct Args {
     /// Path to the state .bin files
-    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data/states")]
+    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data_base/states")]
     states_dir: String,
     /// Path to the txs .bin files
-    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data/txs")]
+    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data_base/txs")]
     txs_dir: String,
     /// Block number to use
     #[arg(long)]

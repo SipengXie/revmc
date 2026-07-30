@@ -345,7 +345,7 @@ impl<CTX, INTR: InterpreterTypes> Inspector<CTX, INTR> for BranchCollector {
 fn main() {
     let dir = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "/home/ubuntu/sipeng/bench_data".into());
+        .unwrap_or_else(|| "/home/ubuntu/sipeng/bench_data_base".into());
     let bench_dir = Path::new(&dir);
     let block: u64 = std::env::args()
         .nth(2)
@@ -509,7 +509,7 @@ cargo run -p revmc-examples-runner --bin pgo_bench --release
 ```bash
 perf stat -e L1-icache-load-misses,iTLB-load-misses,branch-misses,instructions \
   cargo run -p revmc-examples-runner --bin pgo_bench --release -- \
-  /home/ubuntu/sipeng/bench_data 38004930 2>&1
+  /home/ubuntu/sipeng/bench_data_base 38004930 2>&1
 ```
 
 **Step 4: Record findings**
