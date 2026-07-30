@@ -205,8 +205,23 @@ impl BinLoader {
 
         let snapshot_data =
             std::fs::read(&states_path).map_err(|e| format!("read {:?}: {e}", states_path))?;
-        let snapshot: CacheSnapshot = bincode::deserialize(&snapshot_data)
+        let mut snapshot: CacheSnapshot = bincode::deserialize(&snapshot_data)
             .map_err(|e| format!("deserialize states/{block_number}.bin: {e}"))?;
+
+        // Re-analyze legacy code from original bytes: the snapshot's stored
+        // jump tables predate the linked revm's metadata jump mask, and
+        // execution must see the current (hardened) semantics.
+        let reanalyze = |bytecode: &mut Bytecode| {
+            if let Bytecode::LegacyAnalyzed(analyzed) = &*bytecode {
+                *bytecode = Bytecode::new_legacy(analyzed.original_bytes());
+            }
+        };
+        snapshot.codes.values_mut().for_each(reanalyze);
+        for acc in snapshot.accounts.values_mut() {
+            if let Some(code) = acc.info.as_mut().and_then(|info| info.code.as_mut()) {
+                reanalyze(code);
+            }
+        }
 
         let txs_data = std::fs::read(&txs_path).map_err(|e| format!("read {:?}: {e}", txs_path))?;
         let block_bin: BlockBin = bincode::deserialize(&txs_data)
