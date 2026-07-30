@@ -403,24 +403,6 @@ fn cohens_d(a: &[f64], b: &[f64]) -> f64 {
     }
 }
 
-fn welch_t(a: &[f64], b: &[f64]) -> (f64, f64) {
-    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
-    let var = |v: &[f64], m: f64| {
-        v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (v.len() as f64 - 1.0).max(1.0)
-    };
-    let ma = mean(a);
-    let mb = mean(b);
-    let va = var(a, ma);
-    let vb = var(b, mb);
-    let se = ((va / a.len() as f64) + (vb / b.len() as f64)).sqrt();
-    if se == 0.0 {
-        return (0.0, 1.0);
-    }
-    let t = (ma - mb) / se;
-    let z = t.abs();
-    let p = 2.0 * (1.0 - 0.5 * (1.0 + libm::erf(z / std::f64::consts::SQRT_2)));
-    (t, p)
-}
 
 fn load_skeleton_so(
     path: &Path,
@@ -1266,7 +1248,7 @@ fn main() {
         let delta = mean_sk - mean_ph;
         let ratio = if mean_sk > 0.0 { mean_ph / mean_sk } else { 1.0 };
 
-        let (_, p) = welch_t(&ph_vals, &sk_vals);
+        let (_, p) = skelot_common::welch_t(&ph_vals, &sk_vals);
         let d = cohens_d(&ph_vals, &sk_vals);
 
         let verdict = if p >= cli.alpha {
