@@ -208,6 +208,22 @@ pub(crate) fn skip_logic_push_mask(bytecode: &[u8]) -> Vec<bool> {
     mask
 }
 
+/// Extract the opcode skeleton: all opcodes kept, PUSH1..PUSH32 immediate
+/// bytes removed.
+pub fn extract_opcode_skeleton(bytecode: &[u8]) -> Vec<u8> {
+    let mut skeleton = Vec::with_capacity(bytecode.len());
+    let mut i = 0;
+    while i < bytecode.len() {
+        let op_byte = bytecode[i];
+        skeleton.push(op_byte);
+        i += 1;
+        if op_byte >= op::PUSH1 && op_byte <= op::PUSH32 {
+            i += (op_byte - op::PUSH0) as usize;
+        }
+    }
+    skeleton
+}
+
 /// Extract PUSH1..PUSH32 immediate byte slices from bytecode, in opcode order.
 /// Skips PUSH0 (no immediate bytes, always zero).
 pub(crate) fn extract_push_immediates(bytecode: &[u8]) -> Vec<&[u8]> {

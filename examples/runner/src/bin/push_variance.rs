@@ -13,8 +13,9 @@ mod skelot_common;
 
 use std::collections::HashMap;
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use revm::primitives::B256;
+use revmc::emse::SkeletonMode;
 
 use crate::skelot_common::{
     extract_emse_skeleton, hash_bytes, iter_bytecode_raw, load_state_v1, should_skip_bytes,
@@ -74,21 +75,6 @@ fn hash_skeleton(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum SkeletonMode {
-    Current,
-    Emse,
-}
-
-impl SkeletonMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            SkeletonMode::Current => "current",
-            SkeletonMode::Emse => "emse",
-        }
-    }
-}
-
 fn hash_skeleton_for_mode(bytes: &[u8], mode: SkeletonMode) -> u64 {
     match mode {
         SkeletonMode::Current => hash_skeleton(bytes),
@@ -118,7 +104,7 @@ struct Args {
     start_block: Option<u64>,
     #[arg(long)]
     block_count: Option<u64>,
-    #[arg(long, value_enum, default_value = "current")]
+    #[arg(long, default_value = "current")]
     skeleton_mode: SkeletonMode,
 }
 
