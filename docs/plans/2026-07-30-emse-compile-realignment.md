@@ -298,3 +298,49 @@ why their fates now differ):
   3. exec_sanity re-run over the final 818-family grouping (g1-upgraded + g2-off).
   Tonight's compile launch uses this grouping (g2 off) — the fork change lands before
   any execution-side measurement.
+
+## Addendum 4 (revmc session, 2026-07-30): full-experiment execution log
+
+Running the hand-off brief `skelot-paper/.planning/handoff-experiment-prompt.md`.
+This section accumulates per-step numbers, anchor checks, and any deviations.
+
+### Pre-flight (done 2026-07-30 ~16:10 UTC)
+- g1-reachability + g2-off finalized state committed: revmc `c74b09f7` (emse.rs
+  ENFORCE_G2=false, reachability-based tail_can_fall_through, grouping_stats bin)
+  + docs `b033a808`. Release binaries rebuilt AFTER these commits.
+- **Grouping anchor check (grouping_stats, Base 10K, emse): ALL MATCH** —
+  19,130 bytecodes; 818 multi-member families (9,913 members); 9,217 per-hash;
+  10,035 units (47.5% reduction); g1 rejected 7 skeletons / 17 members;
+  g2 rejected 0; 0 collision splits. Grouping wall 0.80 s.
+
+### Step 2 — Base dual-mode full compile: LAUNCHED
+- Started 2026-07-30 16:09:31 UTC, cold cache (cache-dir did not exist), 16 threads.
+- Log: `skelot-paper/data/logs/stage_b_emse_base_20260730T160931Z.log`;
+  out: `skelot-paper/data/compile_bench_emse_base.json`.
+- Binary built at revmc `b033a808` (post-finalization), revm fork rev `46dc92f`
+  (pre-mask — compile timing does not touch the interpreter jump table; the
+  fork mask lands before any execution-side measurement per Addendum 3).
+- Early log confirms 19,130 collected bytecodes (Naive side will compile all).
+- Deviation note (recorded for transparency): during the first ~30 min of the
+  Naive arm, `nice -19 -j2` cargo check/test of the revm fork ran concurrently
+  (~2 low-priority threads for a few minutes against 16 compile workers,
+  estimated <0.1% wall-clock effect). All heavy builds/tests are deferred to
+  after the timed window; no further concurrent load will be introduced.
+
+### Step 1 — interpreter fork changes: IN PROGRESS (code written, tests pending)
+- skelot-revm working copy at `/home/ubuntu/sipeng/skelot/skelot-revm`.
+- (a) `analyze_legacy` masks stripped-suffix positions (metadata + trailing
+  zeros) out of the legacy jump table; boundary via a fork-local copy of
+  `strip_emse_suffixes` (`crates/bytecode/src/legacy/emse.rs`), guarded by a
+  cross-repo equivalence test in revmc's emse.rs (fixed sample set).
+- (b) [JUMP-HIT]: `is_valid_legacy_jump` cold path (invalid target only) calls
+  `emse_jump_audit::record_if_masked_hit` — counts targets that are ≥ stripped
+  len AND vanilla-valid JUMPDESTs on the original bytes. Global AtomicU64,
+  read/take APIs; valid-jump hot path untouched. Timed arms read the total
+  AFTER the timed window; tx-hash attribution (if count ≠ 0) will use a
+  separate untimed replay.
+- Replay-side hydration fix (required for the mask to matter): snapshots store
+  pre-analyzed jump tables, so `BinLoader::new` now re-analyzes legacy code
+  from original bytes (load phase, all arms symmetric). Recorded here because
+  it is a runner-side change beyond the fork — without it the stored
+  (unmasked) tables would silently bypass the hardened semantics.
