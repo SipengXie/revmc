@@ -136,10 +136,10 @@ pub fn build_data_table(bytecode: &[u8], variance: &SkeletonVariance) -> ImmData
     );
 
     let mut data = vec![0u8; variance.num_variant as usize * 32];
-    for (imm, classification) in pushes.iter().zip(variance.pushes.iter()) {
+    for ((declared_len, imm), classification) in pushes.iter().zip(variance.pushes.iter()) {
         if let PushClassification::Variant { table_index } = classification {
             let offset = *table_index as usize * 32;
-            let le_bytes = normalize_push_immediate(imm);
+            let le_bytes = normalize_push_immediate(imm, *declared_len);
             data[offset..offset + 32].copy_from_slice(&le_bytes);
         }
     }
@@ -147,8 +147,15 @@ pub fn build_data_table(bytecode: &[u8], variance: &SkeletonVariance) -> ImmData
     ImmDataTable { data }
 }
 
-pub(crate) fn normalize_push_immediate(imm: &[u8]) -> [u8; 32] {
-    U256::from_be_slice(imm).to_le_bytes::<32>()
+/// Normalize a PUSH immediate to its 32-byte LE runtime value.
+///
+/// `declared_len` is the PUSH opcode's declared width. When the immediate is
+/// truncated by the physical end of code, the EVM reads the missing bytes as
+/// zero — i.e. the value is zero-extended on the RIGHT (low side), so the
+/// present bytes must be shifted up to their declared positions.
+pub(crate) fn normalize_push_immediate(imm: &[u8], declared_len: usize) -> [u8; 32] {
+    let missing = declared_len.saturating_sub(imm.len());
+    (U256::from_be_slice(imm) << (8 * missing)).to_le_bytes::<32>()
 }
 
 /// Mask of PUSH1..PUSH32 instructions whose immediate is baked into a static
@@ -224,9 +231,11 @@ pub fn extract_opcode_skeleton(bytecode: &[u8]) -> Vec<u8> {
     skeleton
 }
 
-/// Extract PUSH1..PUSH32 immediate byte slices from bytecode, in opcode order.
-/// Skips PUSH0 (no immediate bytes, always zero).
-pub(crate) fn extract_push_immediates(bytecode: &[u8]) -> Vec<&[u8]> {
+/// Extract PUSH1..PUSH32 immediates as `(declared_len, bytes)` pairs, in
+/// opcode order. `bytes` is shorter than `declared_len` only for a PUSH
+/// truncated by the physical end of code. Skips PUSH0 (no immediate bytes,
+/// always zero).
+pub(crate) fn extract_push_immediates(bytecode: &[u8]) -> Vec<(usize, &[u8])> {
     let mut result = Vec::new();
     let mut i = 0;
     while i < bytecode.len() {
@@ -235,7 +244,7 @@ pub(crate) fn extract_push_immediates(bytecode: &[u8]) -> Vec<&[u8]> {
         if op_byte >= op::PUSH1 && op_byte <= op::PUSH32 {
             let n = (op_byte - op::PUSH0) as usize;
             let end = (i + n).min(bytecode.len());
-            result.push(&bytecode[i..end]);
+            result.push((n, &bytecode[i..end]));
             i = end;
         }
     }
@@ -305,12 +314,34 @@ mod tests {
         bc.extend_from_slice(&[0xff; 32]);
 
         let pushes = extract_push_immediates(&bc);
-        let a = normalize_push_immediate(pushes[0]);
-        let b = normalize_push_immediate(pushes[1]);
+        let a = normalize_push_immediate(pushes[0].1, pushes[0].0);
+        let b = normalize_push_immediate(pushes[1].1, pushes[1].0);
 
         assert_eq!(a[0], 0x2a);
         assert_eq!(a[1..], [0u8; 31]);
         assert_eq!(b, [0xff; 32]);
+    }
+
+    #[test]
+    fn test_truncated_push_immediate_zero_extends_right() {
+        // PUSH2 with only one immediate byte present: the EVM reads the
+        // missing byte as zero, so the value is 0xAB00, not 0x00AB.
+        let bc = &[0x61, 0xAB];
+        let pushes = extract_push_immediates(bc);
+        assert_eq!(pushes, vec![(2usize, &bc[1..2])]);
+        let le = normalize_push_immediate(pushes[0].1, pushes[0].0);
+        assert_eq!(le[0], 0x00);
+        assert_eq!(le[1], 0xAB);
+        assert_eq!(le[2..], [0u8; 30]);
+
+        // End-to-end through the data table with two differing members.
+        let bc1 = &[0x61, 0xAB];
+        let bc2 = &[0x61, 0xCD];
+        let variance = analyze_skeleton_group(&[bc1, bc2]);
+        assert_eq!(variance.num_variant, 1);
+        let table = build_data_table(bc1, &variance);
+        assert_eq!(table.data[0], 0x00);
+        assert_eq!(table.data[1], 0xAB);
     }
 
     #[test]

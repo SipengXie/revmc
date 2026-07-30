@@ -1036,10 +1036,9 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                     let value = self.bcx.load(self.word_type, elem_ptr, "imm.val");
                     self.push(value);
                 } else {
-                    // Existing path: compile-time constant.
-                    // NOTE: This can be None if the bytecode is invalid.
-                    let imm = self.bytecode.get_imm(data);
-                    let value = imm.map(U256::from_be_slice).unwrap_or_default();
+                    // Existing path: compile-time constant. Truncated
+                    // immediates zero-extend on the right per EVM semantics.
+                    let value = self.bytecode.push_imm_value(data);
                     let value = self.bcx.iconst_256(value);
                     self.push(value);
                 }

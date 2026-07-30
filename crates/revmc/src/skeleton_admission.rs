@@ -29,13 +29,14 @@ impl AdmissionDescriptor {
         let mut variant_positions = Vec::new();
         let mut invariant_values = Vec::new();
 
-        for (ordinal, (imm, classification)) in
+        for (ordinal, ((declared_len, imm), classification)) in
             pushes.iter().zip(variance.pushes.iter()).enumerate()
         {
             match classification {
                 PushClassification::Variant { .. } => variant_positions.push(ordinal as u32),
                 PushClassification::Invariant => {
-                    invariant_values.push((ordinal as u32, normalize_push_immediate(imm)));
+                    invariant_values
+                        .push((ordinal as u32, normalize_push_immediate(imm, *declared_len)));
                 }
             }
         }
@@ -93,14 +94,15 @@ pub(crate) fn check_admission(
     }
 
     let pushes = extract_push_immediates(candidate);
-    let get_push = |ordinal: u32| -> Result<&[u8], AdmissionError> {
+    let get_push = |ordinal: u32| -> Result<(usize, &[u8]), AdmissionError> {
         pushes.get(ordinal as usize).copied().ok_or(AdmissionError::Descriptor(
             DescriptorError::OrdinalOutOfRange { push_ordinal: ordinal },
         ))
     };
 
     for &(ordinal, expected) in &descriptor.invariant_values {
-        let actual = normalize_push_immediate(get_push(ordinal)?);
+        let (declared_len, imm) = get_push(ordinal)?;
+        let actual = normalize_push_immediate(imm, declared_len);
         if actual != expected {
             return Err(AdmissionError::Mismatch(AdmissionMismatch::InvariantMismatch {
                 push_ordinal: ordinal,
@@ -112,7 +114,8 @@ pub(crate) fn check_admission(
 
     let mut data = vec![0u8; descriptor.variant_positions.len() * 32];
     for (table_index, &ordinal) in descriptor.variant_positions.iter().enumerate() {
-        let value = normalize_push_immediate(get_push(ordinal)?);
+        let (declared_len, imm) = get_push(ordinal)?;
+        let value = normalize_push_immediate(imm, declared_len);
         let offset = table_index * 32;
         data[offset..offset + 32].copy_from_slice(&value);
     }

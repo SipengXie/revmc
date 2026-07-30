@@ -58,6 +58,11 @@ tests! {
             expected_stack: &[U256::ZERO],
             expected_gas: 2,
         }),
+        truncated_push(@raw {
+            bytecode: &[op::PUSH2, 0xab],
+            expected_stack: &[U256::from(0xab00u64)],
+            expected_gas: 3,
+        }),
         stop(@raw {
             bytecode: &[op::STOP],
             expected_gas: 0,

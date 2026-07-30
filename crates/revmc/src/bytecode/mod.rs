@@ -2,7 +2,7 @@
 
 use bitvec::vec::BitVec;
 use revm_bytecode::opcode as op;
-use revm_primitives::{hardfork::SpecId, hex};
+use revm_primitives::{hardfork::SpecId, hex, U256};
 use revmc_backend::Result;
 use rustc_hash::FxHashMap;
 use std::fmt;
@@ -344,6 +344,20 @@ impl<'a> Bytecode<'a> {
         }
         let start = data.pc as usize + 1;
         self.code.get(start..start + imm_len)
+    }
+
+    /// The runtime value of a PUSH immediate. Immediate bytes truncated by
+    /// the physical end of code read as zero in the EVM, i.e. the present
+    /// bytes are zero-extended on the right up to the declared width.
+    pub(crate) fn push_imm_value(&self, data: &InstData) -> U256 {
+        let imm_len = data.imm_len() as usize;
+        if imm_len == 0 {
+            return U256::ZERO;
+        }
+        let start = data.pc as usize + 1;
+        let Some(avail) = self.code.get(start..) else { return U256::ZERO };
+        let take = imm_len.min(avail.len());
+        U256::from_be_slice(&avail[..take]) << (8 * (imm_len - take))
     }
 
     /// Returns `true` if the given program counter is a valid jump destination.
