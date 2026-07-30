@@ -21,8 +21,8 @@ use op_revm::DefaultOp;
 use revm::database::EmptyDB;
 use revm::handler::Handler;
 use revm::primitives::B256;
-use revmc::emse::{bytecode_view, group_skeleton_families, SkeletonMode};
-use revmc::skeleton::{analyze_skeleton_group_with_mode, build_data_table, ClassifyMode};
+use revmc::emse::{bytecode_view, SkeletonMode};
+use revmc::skeleton::{build_data_table, ClassifyMode};
 use revmc::OptimizationLevel;
 use revmc_builtins as _;
 use revmc_context::{EvmCompilerFn, RawEvmCompilerFn};
@@ -98,93 +98,14 @@ struct Cli {
 mod perf_events;
 use perf_events::{perf_event_names, perf_init, PerfEventSet, PERF_NEVENTS};
 
-#[derive(Serialize)]
-struct Config {
-    blocks_sampled: usize,
-    rounds: usize,
-    warmup: usize,
-    alpha: f64,
-}
-
-#[derive(Serialize)]
-struct Summary {
-    total_family_members_measured: usize,
-    skeleton_faster: usize,
-    equivalent: usize,
-    skeleton_slower: usize,
-    median_speedup_ratio: f64,
-    mean_delta_us: f64,
-    p95_delta_us: f64,
-}
-
-#[derive(Serialize)]
-struct RawSample {
-    block: u64,
-    round: usize,
-    per_hash_us: f64,
-    skeleton_us: f64,
-}
-
-#[derive(Serialize)]
-struct FamilyAggregate {
-    skeleton_hash: String,
-    family_size: usize,
-    members_measured: usize,
-    median_speedup: f64,
-    mean_delta_us: f64,
-    pct_faster: f64,
-    pct_equivalent: f64,
-    pct_slower: f64,
-}
-
-#[derive(Serialize)]
-struct BlockSummary {
-    block: u64,
-    contracts_measured: usize,
-    median_speedup: f64,
-    mean_delta_us: f64,
-}
-
-#[derive(Serialize)]
-struct ContractRecord {
-    code_hash: String,
-    skeleton_hash: String,
-    family_size: usize,
-    blocks_seen: usize,
-    mean_per_hash_us: f64,
-    mean_skeleton_us: f64,
-    delta_us: f64,
-    speedup_ratio: f64,
-    welch_p: f64,
-    cohens_d: f64,
-    verdict: String,
-    raw_samples: Vec<RawSample>,
-}
-
-#[derive(Serialize)]
-struct Output {
-    config: Config,
-    summary: Summary,
-    per_family: Vec<FamilyAggregate>,
-    per_block: Vec<BlockSummary>,
-    per_contract: Vec<ContractRecord>,
-}
-
-fn cohens_d(a: &[f64], b: &[f64]) -> f64 {
-    let mean_a = a.iter().sum::<f64>() / a.len() as f64;
-    let mean_b = b.iter().sum::<f64>() / b.len() as f64;
-    let var_a =
-        a.iter().map(|x| (x - mean_a).powi(2)).sum::<f64>() / (a.len() as f64 - 1.0).max(1.0);
-    let var_b =
-        b.iter().map(|x| (x - mean_b).powi(2)).sum::<f64>() / (b.len() as f64 - 1.0).max(1.0);
-    let pooled_std = ((var_a + var_b) / 2.0).sqrt();
-    if pooled_std == 0.0 {
-        0.0
-    } else {
-        (mean_a - mean_b) / pooled_std
-    }
-}
-
+#[path = "../vs_perhash_report.rs"]
+mod vs_perhash_report;
+#[path = "../vs_perhash_families.rs"]
+mod vs_perhash_families;
+use vs_perhash_families::{load_or_build_families, AnalyzedGroup};
+use vs_perhash_report::{
+    cohens_d, BlockSummary, Config, ContractRecord, FamilyAggregate, Output, RawSample, Summary,
+};
 
 fn load_skeleton_so(
     path: &Path,
@@ -295,258 +216,19 @@ fn main() {
         t0.elapsed().as_secs_f64()
     );
 
-    // Phase 2: Load or reconstruct skeleton families.
-    // Variance must match what was used at compile time — using a different member
-    // set produces wrong data-table slot assignments and silent correctness bugs.
-
-    #[derive(serde::Serialize, serde::Deserialize)]
-    struct RegistryEntry {
-        skel_hash: u64,
-        member_hashes: Vec<[u8; 32]>,
-        variance_pushes: Vec<i32>, // -1 = Invariant, >= 0 = Variant(table_index)
-        num_variant: u32,
-        #[serde(default)]
-        member_data_tables: Vec<Vec<u8>>, // pre-computed data tables, one per member
-    }
-
-    struct AnalyzedGroup {
-        skel_hash: u64,
-        members: Vec<(B256, Vec<u8>)>,
-        variance: revmc::skeleton::SkeletonVariance,
-        cached_data_tables: Option<Vec<(B256, Vec<u8>)>>,
-    }
-
-    fn variance_from_registry(entry: &RegistryEntry) -> revmc::skeleton::SkeletonVariance {
-        use revmc::skeleton::PushClassification;
-        let pushes = entry
-            .variance_pushes
-            .iter()
-            .map(|&v| {
-                if v < 0 {
-                    PushClassification::Invariant
-                } else {
-                    PushClassification::Variant { table_index: v as u32 }
-                }
-            })
-            .collect();
-        revmc::skeleton::SkeletonVariance { pushes, num_variant: entry.num_variant }
-    }
-
-    let analyzed: Vec<AnalyzedGroup>;
+    // Phase 2: Load or reconstruct skeleton families (see vs_perhash_families.rs).
     let t1 = Instant::now();
+    let analyzed: Vec<AnalyzedGroup> = load_or_build_families(
+        cli.registry.as_deref(),
+        cli.out.as_deref(),
+        bench_dir,
+        cli.start_block,
+        cli.block_count,
+        cli.skeleton_mode,
+        classify_mode,
+        t1,
+    );
 
-    if let Some(ref registry_path) = cli.registry {
-        // Fast path: load pre-built registry with cached data tables
-        println!("\n--- Phase 2: Loading skeleton registry from {} ---", registry_path);
-        let data = std::fs::read(registry_path).expect("read registry");
-        let entries: Vec<RegistryEntry> =
-            bincode::deserialize(&data).expect("deserialize registry");
-
-        let has_cached_tables = entries.first().map_or(false, |e| !e.member_data_tables.is_empty());
-
-        if has_cached_tables {
-            // Ultra-fast path: data tables pre-computed, no bytecode scan needed
-            println!("  Using cached data tables (no bytecode scan)");
-            // We don't need AnalyzedGroup.members bytecodes — only for build_data_table
-            // which is already cached. Store empty bytecodes as placeholder.
-            analyzed = entries
-                .into_iter()
-                .filter(|entry| {
-                    entry.member_hashes.len() >= 2
-                        && entry.member_data_tables.len() == entry.member_hashes.len()
-                })
-                .map(|entry| {
-                    let variance = variance_from_registry(&entry);
-                    let members: Vec<(B256, Vec<u8>)> = entry
-                        .member_hashes
-                        .iter()
-                        .map(|raw| (B256::from(*raw), Vec::new()))
-                        .collect();
-                    AnalyzedGroup {
-                        skel_hash: entry.skel_hash,
-                        members,
-                        variance,
-                        cached_data_tables: Some(
-                            entry
-                                .member_hashes
-                                .iter()
-                                .zip(entry.member_data_tables.into_iter())
-                                .map(|(raw, dt)| (B256::from(*raw), dt))
-                                .collect(),
-                        ),
-                    }
-                })
-                .collect();
-        } else {
-            // Registry without cached tables — fall back to bytecode scan
-            println!("  Registry lacks cached data tables, scanning bytecodes...");
-            let mut all_codes: HashMap<B256, Vec<u8>> = HashMap::new();
-            let mut blocks_loaded = 0usize;
-            for bn in cli.start_block..cli.start_block + cli.block_count {
-                if let Ok(loader) = BinLoader::new(bench_dir, bn) {
-                    for (h, bc) in loader.code_values() {
-                        if !bc.is_empty() {
-                            all_codes
-                                .entry(*h)
-                                .or_insert_with(|| bc.original_byte_slice().to_vec());
-                        }
-                    }
-                    blocks_loaded += 1;
-                    if blocks_loaded % 1000 == 0 {
-                        eprint!("  [{blocks_loaded}] {} unique bytecodes\r", all_codes.len());
-                    }
-                }
-            }
-            println!("  Scanned {blocks_loaded} blocks, {} unique bytecodes", all_codes.len());
-
-            analyzed = entries
-                .into_iter()
-                .filter_map(|entry| {
-                    let variance = variance_from_registry(&entry);
-                    let members: Vec<(B256, Vec<u8>)> = entry
-                        .member_hashes
-                        .iter()
-                        .filter_map(|raw| {
-                            let hash = B256::from(*raw);
-                            all_codes.get(&hash).map(|bytes| (hash, bytes.clone()))
-                        })
-                        .collect();
-                    if members.len() >= 2 {
-                        Some(AnalyzedGroup {
-                            skel_hash: entry.skel_hash,
-                            members,
-                            variance,
-                            cached_data_tables: None,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-        }
-
-        println!(
-            "  {} skeleton families loaded from registry in {:.2}s",
-            analyzed.len(),
-            t1.elapsed().as_secs_f64()
-        );
-    } else {
-        // Slow path: full scan + analyze
-        println!(
-            "\n--- Phase 2: Reconstructing skeleton families (full {}-block scan) ---",
-            cli.block_count
-        );
-
-        let mut all_codes: HashMap<B256, Vec<u8>> = HashMap::new();
-        let mut blocks_loaded = 0usize;
-        for bn in cli.start_block..cli.start_block + cli.block_count {
-            if let Ok(loader) = BinLoader::new(bench_dir, bn) {
-                for (h, bc) in loader.code_values() {
-                    if !bc.is_empty() {
-                        all_codes.entry(*h).or_insert_with(|| bc.original_byte_slice().to_vec());
-                    }
-                }
-                blocks_loaded += 1;
-                if blocks_loaded % 1000 == 0 {
-                    eprint!("  [{blocks_loaded}] {} unique bytecodes\r", all_codes.len());
-                }
-            }
-        }
-        println!("  Scanned {blocks_loaded} blocks, {} unique bytecodes", all_codes.len());
-
-        all_codes.retain(|_, bytes| !skelot_common::should_skip_bytes(bytes));
-
-        // Shared grouping: in-bucket skeleton-byte verification plus (under
-        // EMSE) the g1/g2 admission guards. Must match the compile driver so
-        // guard-rejected members never get skeleton-dispatched here.
-        let grouping = group_skeleton_families(&all_codes, cli.skeleton_mode);
-        println!(
-            "  admission ({}): {} families; g1 rejected {} skeletons ({} members), g2 rejected {} members, {} collision groups split",
-            cli.skeleton_mode.as_str(),
-            grouping.families.len(),
-            grouping.stats.g1_rejected_skeletons,
-            grouping.stats.g1_rejected_members,
-            grouping.stats.g2_rejected_members,
-            grouping.stats.collision_groups_split
-        );
-
-        analyzed = grouping
-            .families
-            .into_iter()
-            .map(|family| {
-                let views: Vec<&[u8]> = family
-                    .members
-                    .iter()
-                    .map(|h| bytecode_view(&all_codes[h], cli.skeleton_mode))
-                    .collect();
-                let variance = analyze_skeleton_group_with_mode(&views, classify_mode);
-                let members: Vec<(B256, Vec<u8>)> =
-                    family.members.into_iter().map(|h| (h, all_codes[&h].clone())).collect();
-                AnalyzedGroup { skel_hash: family.skel_hash, members, variance, cached_data_tables: None }
-            })
-            .collect();
-
-        println!(
-            "  {} skeleton families found in {:.2}s",
-            analyzed.len(),
-            t1.elapsed().as_secs_f64()
-        );
-
-        // Save registry for fast reuse (with pre-computed data tables).
-        // Both boundary and classify mode get their own filename: member
-        // sets, variance, and data tables are specific to the
-        // (skeleton_mode, classify_mode) combination and must never cross.
-        let registry_file_name = match (cli.skeleton_mode, classify_mode) {
-            (SkeletonMode::Current, ClassifyMode::Auto) => "skeleton_registry_full.bin",
-            (SkeletonMode::Emse, ClassifyMode::Auto) => "skeleton_registry_full_emse.bin",
-            (SkeletonMode::Current, ClassifyMode::ForceAllVariant) => {
-                "skeleton_registry_full_forced.bin"
-            }
-            (SkeletonMode::Emse, ClassifyMode::ForceAllVariant) => {
-                "skeleton_registry_full_emse_forced.bin"
-            }
-        };
-        let registry_save_path = cli
-            .out
-            .as_ref()
-            .map(|p| std::path::Path::new(p).with_file_name(registry_file_name))
-            .unwrap_or_else(|| std::path::PathBuf::from(registry_file_name));
-        let entries: Vec<RegistryEntry> = analyzed
-            .iter()
-            .map(|g| {
-                use revmc::skeleton::PushClassification;
-                RegistryEntry {
-                    skel_hash: g.skel_hash,
-                    member_hashes: g.members.iter().map(|(h, _)| h.0).collect(),
-                    variance_pushes: g
-                        .variance
-                        .pushes
-                        .iter()
-                        .map(|p| match p {
-                            PushClassification::Invariant => -1i32,
-                            PushClassification::Variant { table_index } => *table_index as i32,
-                        })
-                        .collect(),
-                    num_variant: g.variance.num_variant,
-                    member_data_tables: g
-                        .members
-                        .iter()
-                        .map(|(_, bytes)| {
-                            build_data_table(bytecode_view(bytes, cli.skeleton_mode), &g.variance)
-                                .data
-                        })
-                        .collect(),
-                }
-            })
-            .collect();
-        let data = bincode::serialize(&entries).expect("serialize registry");
-        std::fs::write(&registry_save_path, &data).expect("write registry");
-        println!(
-            "  Registry saved to {} ({:.1} MB) with cached data tables",
-            registry_save_path.display(),
-            data.len() as f64 / 1048576.0
-        );
-    }
 
     // Phase 3: Load skeleton .so files and build dispatch tables
     println!("\n--- Phase 3: Loading skeleton .so files ---");

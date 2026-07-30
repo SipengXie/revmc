@@ -33,7 +33,7 @@ use revm::handler::{EvmTr, FrameResult, Handler, ItemOrResult};
 use revm::primitives::B256;
 use revmc::emse::{bytecode_view, group_skeleton_families, SkeletonMode};
 use revmc::skeleton::{
-    analyze_skeleton_group, build_data_table, PushClassification, SkeletonVariance,
+    analyze_skeleton_group, build_data_table, SkeletonVariance,
 };
 use revmc::{EvmCompiler, EvmLlvmBackend, OptimizationLevel};
 use revmc_builtins as _;
@@ -63,63 +63,6 @@ struct Cli {
     skeleton_mode: SkeletonMode,
 }
 
-// ── JSON output schema ──────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-struct PerTxRecord {
-    success: bool,
-    gas: u64,
-}
-
-#[derive(Serialize)]
-struct ModeRecord {
-    rounds_ms: Vec<f64>,
-    mean_ms: f64,
-    std_ms: f64,
-    per_tx: Vec<PerTxRecord>,
-}
-
-#[derive(Serialize)]
-struct PairMatch {
-    matches: usize,
-    total: usize,
-    mismatches: usize,
-}
-
-#[derive(Serialize)]
-struct NoiseFloor {
-    mean_ms: f64,
-    std_ms: f64,
-    cv: f64,
-}
-
-#[derive(Serialize)]
-struct ExecSanity {
-    block: u64,
-    rounds: usize,
-    warmup: usize,
-    alpha: f64,
-    noise_floor: NoiseFloor,
-    modes: std::collections::HashMap<String, ModeRecord>,
-    pairwise_match: std::collections::HashMap<String, PairMatch>,
-    gas_totals: std::collections::HashMap<String, u64>,
-    welch_per_hash_vs_native: (f64, f64),
-    welch_skelot_vs_native: (f64, f64),
-    welch_skelot_vs_per_hash: (f64, f64),
-}
-
-fn build_mode(rounds: &[f64], per_tx: &[(bool, u64)]) -> ModeRecord {
-    let mean = rounds.iter().sum::<f64>() / rounds.len() as f64;
-    let var = rounds.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
-        / (rounds.len() as f64 - 1.0).max(1.0);
-    ModeRecord {
-        rounds_ms: rounds.to_vec(),
-        mean_ms: mean,
-        std_ms: var.sqrt(),
-        per_tx: per_tx.iter().map(|(s, g)| PerTxRecord { success: *s, gas: *g }).collect(),
-    }
-}
-
 #[path = "../skelot_common.rs"]
 #[allow(dead_code)]
 mod skelot_common;
@@ -130,119 +73,13 @@ use bin_common::{
     BinLoader, JitHandler, NativeHandler, OpCtx,
 };
 
-const OPT: OptimizationLevel = OptimizationLevel::Aggressive;
-
-fn opt_tag(opt: OptimizationLevel) -> &'static str {
-    match opt {
-        OptimizationLevel::None => "o0",
-        OptimizationLevel::Less => "o1",
-        OptimizationLevel::Default => "o2",
-        OptimizationLevel::Aggressive => "o3",
-    }
-}
-
-// ── Skeleton Registry ────────────────────────────────────────────────────────
-
-#[derive(Serialize, Deserialize)]
-struct SkeletonRegistry {
-    groups: Vec<RegistryGroup>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct RegistryGroup {
-    skeleton_hash: u64,
-    member_hashes: Vec<[u8; 32]>,
-    /// Variance per PUSH: 0 = Invariant, N > 0 = Variant(table_index = N - 1).
-    push_variance: Vec<u32>,
-    num_variant: u32,
-}
-
-impl RegistryGroup {
-    fn from_analysis(
-        skeleton_hash: u64,
-        member_hashes: &[B256],
-        variance: &SkeletonVariance,
-    ) -> Self {
-        let push_variance = variance
-            .pushes
-            .iter()
-            .map(|p| match p {
-                PushClassification::Invariant => 0,
-                PushClassification::Variant { table_index } => table_index + 1,
-            })
-            .collect();
-        Self {
-            skeleton_hash,
-            member_hashes: member_hashes.iter().map(|h| h.0).collect(),
-            push_variance,
-            num_variant: variance.num_variant,
-        }
-    }
-}
-
-fn registry_path(cache_dir: &Path) -> PathBuf {
-    cache_dir.join("skeleton_registry.bin")
-}
-
-fn save_registry(cache_dir: &Path, registry: &SkeletonRegistry) {
-    std::fs::create_dir_all(cache_dir).ok();
-    let data = bincode::serialize(registry).expect("serialize registry");
-    std::fs::write(registry_path(cache_dir), data).expect("write registry");
-}
-
-// ── Skeleton AOT Cache ───────────────────────────────────────────────────────
-
-struct SkeletonCacheArtifacts {
-    symbol: String,
-    object: PathBuf,
-    library: PathBuf,
-}
-
-fn skeleton_cache_artifacts(cache_dir: &Path, skeleton_hash: u64) -> SkeletonCacheArtifacts {
-    let tag = opt_tag(OPT);
-    let spec_tag = format!("{:?}", bin_common::ETH_SPEC).to_lowercase();
-    let key = format!("skel_{skeleton_hash:016x}__{spec_tag}__{tag}");
-    let stem = cache_dir.join(&key);
-    SkeletonCacheArtifacts {
-        symbol: format!("skel_{skeleton_hash:016x}"),
-        object: stem.with_extension("o"),
-        library: stem.with_extension(std::env::consts::DLL_EXTENSION),
-    }
-}
-
-fn compile_skeleton_to_cache(
-    bytecode: &[u8],
-    variance: &SkeletonVariance,
-    artifacts: &SkeletonCacheArtifacts,
-) -> Result<(), String> {
-    if let Some(parent) = artifacts.object.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let context = Box::leak(Box::new(revmc::llvm::inkwell::context::Context::create()));
-    let backend =
-        EvmLlvmBackend::new(context, true, OPT).map_err(|e| format!("AOT backend: {e}"))?;
-    let mut compiler = EvmCompiler::new(backend);
-    compiler
-        .translate_skeleton(&artifacts.symbol, bytecode, bin_common::ETH_SPEC, variance)
-        .map_err(|e| format!("translate_skeleton: {e}"))?;
-    compiler.write_object_to_file(&artifacts.object).map_err(|e| format!("write: {e}"))?;
-    revmc::Linker::new()
-        .link(&artifacts.library, [&artifacts.object])
-        .map_err(|e| format!("link: {e}"))?;
-    Ok(())
-}
-
-fn load_skeleton_cached(
-    artifacts: &SkeletonCacheArtifacts,
-) -> Result<(RawEvmCompilerFn, libloading::Library), String> {
-    let library = unsafe { libloading::Library::new(&artifacts.library) }
-        .map_err(|e| format!("dlopen: {e}"))?;
-    let symbol = unsafe { library.get::<RawEvmCompilerFn>(artifacts.symbol.as_bytes()) }
-        .map_err(|e| format!("dlsym: {e}"))?;
-    let function = *symbol;
-    drop(symbol);
-    Ok((function, library))
-}
+#[path = "../skeleton_bench_support.rs"]
+mod skeleton_bench_support;
+use skeleton_bench_support::{
+    build_mode, OPT, compile_skeleton_to_cache, load_skeleton_cached, registry_path, save_registry,
+    skeleton_cache_artifacts, ExecSanity, ModeRecord, NoiseFloor, PairMatch, RegistryGroup,
+    SkeletonCacheArtifacts, SkeletonRegistry,
+};
 
 // ── Skeleton Handler ─────────────────────────────────────────────────────────
 
