@@ -921,11 +921,18 @@ fn main() {
         );
 
         // Save registry for fast reuse (with pre-computed data tables).
-        // EMSE registries get their own filename: member sets and data
-        // tables are boundary-specific and must never cross modes.
-        let registry_file_name = match cli.skeleton_mode {
-            SkeletonMode::Current => "skeleton_registry_full.bin",
-            SkeletonMode::Emse => "skeleton_registry_full_emse.bin",
+        // Both boundary and classify mode get their own filename: member
+        // sets, variance, and data tables are specific to the
+        // (skeleton_mode, classify_mode) combination and must never cross.
+        let registry_file_name = match (cli.skeleton_mode, classify_mode) {
+            (SkeletonMode::Current, ClassifyMode::Auto) => "skeleton_registry_full.bin",
+            (SkeletonMode::Emse, ClassifyMode::Auto) => "skeleton_registry_full_emse.bin",
+            (SkeletonMode::Current, ClassifyMode::ForceAllVariant) => {
+                "skeleton_registry_full_forced.bin"
+            }
+            (SkeletonMode::Emse, ClassifyMode::ForceAllVariant) => {
+                "skeleton_registry_full_emse_forced.bin"
+            }
         };
         let registry_save_path = cli
             .out

@@ -19,4 +19,4 @@ examples/runner/scripts/runtime_attribution/output/
 examples/runner/scripts/runtime_attribution/paths.env
 __pycache__/
 # Generated skeleton registry data (200+ MB)
-skeleton_registry_full.bin
+skeleton_registry_full*.bin

@@ -260,7 +260,7 @@ def problem4_characterize_slower():
             "ph_calls": int(p["ph_calls"]),
             "ph_cycles_per_call": float(p["ph_cycles_per_call"]),
             "family_size": int(j["family_size"]),
-            "bytecode_len": int(j["bytecode_len"]),
+            "bytecode_len": int(j["bytecode_len"]) if j.get("bytecode_len") else None,
             "bucket": j["bucket"],
             "av_variant_ratio": (
                 float(j["av_variant_ratio"]) if j.get("av_variant_ratio") else None

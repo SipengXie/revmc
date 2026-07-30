@@ -356,6 +356,16 @@ fn run_skeleton(
 
 fn main() {
     let args = Args::parse();
+    // Validate before any compilation: with --mode both a bad value here
+    // must not discard hours of completed per-hash work.
+    let classify_mode = match args.classify_mode.as_str() {
+        "auto" => ClassifyMode::Auto,
+        "force-all-variant" => ClassifyMode::ForceAllVariant,
+        other => {
+            eprintln!("ERROR: --classify-mode must be auto or force-all-variant (got {other})");
+            std::process::exit(2);
+        }
+    };
     let contracts =
         collect_bytecodes(Path::new(&args.bench_dir), args.start_block, args.block_count);
     eprintln!("Collected {} compilable bytecodes", contracts.len());
@@ -386,14 +396,6 @@ fn main() {
         });
     }
     if args.mode == "skeleton" || args.mode == "both" {
-        let classify_mode = match args.classify_mode.as_str() {
-            "auto" => ClassifyMode::Auto,
-            "force-all-variant" => ClassifyMode::ForceAllVariant,
-            other => {
-                eprintln!("ERROR: --classify-mode must be auto or force-all-variant (got {other})");
-                std::process::exit(2);
-            }
-        };
         let sk_cache = cache_dir.join(match (args.skeleton_mode, classify_mode) {
             (SkeletonMode::Current, ClassifyMode::Auto) => "skelot",
             (SkeletonMode::Emse, ClassifyMode::Auto) => "skelot_emse",
