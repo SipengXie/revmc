@@ -10,6 +10,7 @@ mod bin_common;
 #[path = "../skelot_common.rs"]
 mod skelot_common;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,10 +19,12 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use op_revm::transaction::OpTransaction;
 use op_revm::DefaultOp;
+use perf_event::events::{Cache, CacheOp, CacheResult, Hardware, WhichCache};
+use perf_event::{Builder, Counter, Group};
 use revm::database::EmptyDB;
 use revm::handler::{EvmTr, FrameResult, Handler, ItemOrResult};
 use revm::primitives::B256;
-use revmc::skeleton::{analyze_skeleton_group, build_data_table};
+use revmc::skeleton::{analyze_skeleton_group_with_mode, build_data_table, ClassifyMode};
 use revmc::OptimizationLevel;
 use revmc_builtins as _;
 use revmc_context::{EvmCompilerFn, RawEvmCompilerFn};
@@ -34,7 +37,7 @@ const OPT: OptimizationLevel = OptimizationLevel::Aggressive;
 #[derive(Parser)]
 #[command(name = "skeleton_vs_perhash_bench")]
 struct Cli {
-    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data")]
+    #[arg(long, default_value = "/home/ubuntu/sipeng/bench_data_base")]
     bench_dir: String,
     #[arg(long)]
     per_hash_cache: String,
@@ -58,6 +61,253 @@ struct Cli {
     /// Saves ~5 min on repeat runs. Generated automatically on first run.
     #[arg(long)]
     registry: Option<String>,
+    /// Restrict measurement loop to a single dispatch mode for clean per-mode
+    /// hardware-counter wraps. "both" (default) preserves the original mixed-mode
+    /// behavior used to produce skeleton_vs_perhash.json.
+    #[arg(long, default_value = "both")]
+    only_mode: String,
+    /// If set, bracket every JIT call on a target bytecode_hash with
+    /// perf_event_open ioctl reads and dump per-hash counters to this path.
+    /// Default event set: cycles, instructions, L1i miss, iTLB miss,
+    /// branches, branch-misses. See --perf-events for alternative groups.
+    #[arg(long)]
+    perf_out: Option<String>,
+    /// Which 6-event perf group to bracket each JIT call with.
+    ///   default  — cycles, instructions, L1i miss, iTLB miss, branches, branch-misses (Hardware/Cache events)
+    ///   frontend — cycles, instructions, icache_data.stalls, icache_tag.stalls, dsb2mite_switches.penalty_cycles, cycle_activity.stalls_total (RAW configs for Sapphire Rapids)
+    ///   backend  — cycles, instructions, cycle_activity.stalls_total, cycle_activity.stalls_l1d_miss, idq.dsb_uops, idq.mite_uops (RAW configs)
+    ///   tma_l1   — cycles, instructions, TMA slots, retiring slots, bad-spec slots, backend-bound slots (RAW configs)
+    ///   tma_l2_bw — cycles, instructions, IDQ DSB/MITE any/ok cycles (frontend bandwidth diagnostics)
+    ///   tma_l3_fetch — cycles, instructions, I-cache stalls plus L2/offcore code-read diagnostics
+    #[arg(long, default_value = "default")]
+    perf_events: String,
+    /// SkelOT classification mode: "auto" (default — most PUSHes hardcoded
+    /// as movq-imm, only structurally-variant PUSHes go via data table) or
+    /// "force-all-variant" (every PUSH is a data-table load). Used together
+    /// with `--skeleton-cache` pointing at a directory of `skelot_forced.so`
+    /// renamed to `skel_<short>__prague__o3.so` to test whether SkelOT's
+    /// data-table cost B is small in the cross-instance regime (P3).
+    #[arg(long, default_value = "auto")]
+    classify_mode: String,
+}
+
+const PERF_NEVENTS: usize = 6;
+
+#[derive(Clone, Copy)]
+enum PerfEventSet {
+    Default,
+    Frontend,
+    Backend,
+    TmaL1,
+    TmaL2Bw,
+    TmaL3Fetch,
+}
+
+impl PerfEventSet {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "default" => Some(PerfEventSet::Default),
+            "frontend" => Some(PerfEventSet::Frontend),
+            "backend" => Some(PerfEventSet::Backend),
+            "tma_l1" => Some(PerfEventSet::TmaL1),
+            "tma_l2_bw" => Some(PerfEventSet::TmaL2Bw),
+            "tma_l3_fetch" => Some(PerfEventSet::TmaL3Fetch),
+            _ => None,
+        }
+    }
+
+    fn names(self) -> [&'static str; PERF_NEVENTS] {
+        match self {
+            PerfEventSet::Default => {
+                ["cycles", "instructions", "L1i_misses", "iTLB_misses", "branches", "branch_misses"]
+            }
+            PerfEventSet::Frontend => [
+                "cycles",
+                "instructions",
+                "icache_data_stalls",
+                "icache_tag_stalls",
+                "dsb2mite_penalty_cycles",
+                "cycle_activity_stalls_total",
+            ],
+            PerfEventSet::Backend => [
+                "cycles",
+                "instructions",
+                "cycle_activity_stalls_total",
+                "cycle_activity_stalls_l1d_miss",
+                "idq_dsb_uops",
+                "idq_mite_uops",
+            ],
+            PerfEventSet::TmaL1 => [
+                "cycles",
+                "instructions",
+                "topdown_slots",
+                "uops_retired_slots",
+                "topdown_bad_spec_slots",
+                "topdown_backend_bound_slots",
+            ],
+            PerfEventSet::TmaL2Bw => [
+                "cycles",
+                "instructions",
+                "idq_dsb_cycles_any",
+                "idq_dsb_cycles_ok",
+                "idq_mite_cycles_any",
+                "idq_mite_cycles_ok",
+            ],
+            PerfEventSet::TmaL3Fetch => [
+                "cycles",
+                "instructions",
+                "icache_data_stalls",
+                "icache_tag_stalls",
+                "offcore_cycles_demand_code_rd",
+                "l2_rqsts_code_rd_miss",
+            ],
+        }
+    }
+}
+
+// Build a Counter for a raw PERF_TYPE_RAW event with the given config.
+// Used for Sapphire Rapids stall/uop events that perf-event 0.4.9 does
+// not expose via Hardware/Cache enums.
+fn build_raw(group: &mut Group, config: u64) -> std::io::Result<Counter> {
+    use perf_event_open_sys::bindings;
+    let mut b = Builder::new();
+    {
+        let attrs = b.attrs_mut();
+        attrs.type_ = bindings::PERF_TYPE_RAW;
+        attrs.config = config;
+    }
+    b.group(group).build()
+}
+
+struct PerfBracket {
+    group: Group,
+    counters: [Counter; PERF_NEVENTS],
+}
+
+impl PerfBracket {
+    fn new(event_set: PerfEventSet) -> std::io::Result<Self> {
+        let mut group = Group::new()?;
+        let cycles = Builder::new().group(&mut group).kind(Hardware::CPU_CYCLES).build()?;
+        let instructions = Builder::new().group(&mut group).kind(Hardware::INSTRUCTIONS).build()?;
+        let counters = match event_set {
+            PerfEventSet::Default => {
+                let l1i_miss = Builder::new()
+                    .group(&mut group)
+                    .kind(Cache {
+                        which: WhichCache::L1I,
+                        operation: CacheOp::READ,
+                        result: CacheResult::MISS,
+                    })
+                    .build()?;
+                let itlb_miss = Builder::new()
+                    .group(&mut group)
+                    .kind(Cache {
+                        which: WhichCache::ITLB,
+                        operation: CacheOp::READ,
+                        result: CacheResult::MISS,
+                    })
+                    .build()?;
+                let branches =
+                    Builder::new().group(&mut group).kind(Hardware::BRANCH_INSTRUCTIONS).build()?;
+                let branch_misses =
+                    Builder::new().group(&mut group).kind(Hardware::BRANCH_MISSES).build()?;
+                [cycles, instructions, l1i_miss, itlb_miss, branches, branch_misses]
+            }
+            PerfEventSet::Frontend => {
+                // Sapphire Rapids RAW configs from perf -vv:
+                let icache_data = build_raw(&mut group, 0x480)?;
+                let icache_tag = build_raw(&mut group, 0x483)?;
+                let dsb2mite = build_raw(&mut group, 0x261)?;
+                let stalls_total = build_raw(&mut group, 0x40004a3)?;
+                [cycles, instructions, icache_data, icache_tag, dsb2mite, stalls_total]
+            }
+            PerfEventSet::Backend => {
+                let stalls_total = build_raw(&mut group, 0x40004a3)?;
+                let stalls_l1d_miss = build_raw(&mut group, 0xc000ca3)?;
+                let dsb_uops = build_raw(&mut group, 0x879)?;
+                let mite_uops = build_raw(&mut group, 0x479)?;
+                [cycles, instructions, stalls_total, stalls_l1d_miss, dsb_uops, mite_uops]
+            }
+            PerfEventSet::TmaL1 => {
+                // Sapphire Rapids RAW configs from `perf list --details`.
+                // These are top-level TMA slots and form an additive partition:
+                // slots = retiring + bad_spec + backend_bound + frontend_bound.
+                let topdown_slots = build_raw(&mut group, 0x1a4)?;
+                let retired_slots = build_raw(&mut group, 0x2c2)?;
+                let bad_spec_slots = build_raw(&mut group, 0x4a4)?;
+                let backend_bound_slots = build_raw(&mut group, 0x2a4)?;
+                [
+                    cycles,
+                    instructions,
+                    topdown_slots,
+                    retired_slots,
+                    bad_spec_slots,
+                    backend_bound_slots,
+                ]
+            }
+            PerfEventSet::TmaL2Bw => {
+                // TMA L2 frontend-bandwidth children use these IDQ cycle events:
+                // tma_dsb  = (IDQ.DSB_CYCLES_ANY  - IDQ.DSB_CYCLES_OK)  / core_clks / 2
+                // tma_mite = (IDQ.MITE_CYCLES_ANY - IDQ.MITE_CYCLES_OK) / core_clks / 2
+                let dsb_cycles_any = build_raw(&mut group, 0x1000879)?;
+                let dsb_cycles_ok = build_raw(&mut group, 0x6000879)?;
+                let mite_cycles_any = build_raw(&mut group, 0x1000479)?;
+                let mite_cycles_ok = build_raw(&mut group, 0x6000479)?;
+                [
+                    cycles,
+                    instructions,
+                    dsb_cycles_any,
+                    dsb_cycles_ok,
+                    mite_cycles_any,
+                    mite_cycles_ok,
+                ]
+            }
+            PerfEventSet::TmaL3Fetch => {
+                // TMA L3/L4 frontend-latency diagnostics around instruction fetch:
+                // tma_icache_misses = ICACHE_DATA.STALLS / thread_clks;
+                // tma_code_l2_miss = OFFCORE_REQUESTS_OUTSTANDING.CYCLES_WITH_DEMAND_CODE_RD / thread_clks.
+                let icache_data = build_raw(&mut group, 0x480)?;
+                let icache_tag = build_raw(&mut group, 0x483)?;
+                let offcore_code_rd = build_raw(&mut group, 0x1000220)?;
+                let l2_code_miss = build_raw(&mut group, 0x2424)?;
+                [cycles, instructions, icache_data, icache_tag, offcore_code_rd, l2_code_miss]
+            }
+        };
+        group.enable()?;
+        Ok(Self { group, counters })
+    }
+
+    fn read(&mut self) -> [u64; PERF_NEVENTS] {
+        let c = self.group.read().expect("perf read");
+        let mut out = [0u64; PERF_NEVENTS];
+        for (i, ctr) in self.counters.iter().enumerate() {
+            out[i] = c[ctr];
+        }
+        out
+    }
+}
+
+thread_local! {
+    static PERF_BRACKET: RefCell<Option<PerfBracket>> = const { RefCell::new(None) };
+    static PERF_EVENT_SET: RefCell<PerfEventSet> = const { RefCell::new(PerfEventSet::Default) };
+}
+
+fn perf_init(event_set: PerfEventSet) {
+    PERF_EVENT_SET.with(|p| *p.borrow_mut() = event_set);
+    PERF_BRACKET.with(|p| {
+        *p.borrow_mut() = Some(
+            PerfBracket::new(event_set)
+                .expect("perf_event_open: paranoid level too high or event unsupported?"),
+        )
+    });
+}
+
+fn perf_snapshot() -> Option<[u64; PERF_NEVENTS]> {
+    PERF_BRACKET.with(|p| p.borrow_mut().as_mut().map(|b| b.read()))
+}
+
+fn perf_event_names() -> [&'static str; PERF_NEVENTS] {
+    PERF_EVENT_SET.with(|p| p.borrow().names())
 }
 
 #[derive(Serialize)]
@@ -171,17 +421,26 @@ fn load_skeleton_so(
     symbol: &str,
 ) -> Result<(RawEvmCompilerFn, libloading::Library), String> {
     let library = unsafe { libloading::Library::new(path) }.map_err(|e| format!("dlopen: {e}"))?;
-    let sym = unsafe { library.get::<RawEvmCompilerFn>(symbol.as_bytes()) }
-        .map_err(|e| format!("dlsym: {e}"))?;
-    let function = *sym;
-    drop(sym);
-    Ok((function, library))
+    // Try the requested symbol first (skel_<short> for normal skelot artifacts,
+    // c_<hash> for per_hash artifacts). Fall back to the names used by
+    // skelot_ablation_bench's stage_e cache so we can drop those .so files
+    // into a renamed dir for cross-instance B comparisons (P3).
+    let candidates = [symbol, "skelot_forced", "skelot_auto"];
+    for cand in candidates {
+        if let Ok(sym) = unsafe { library.get::<RawEvmCompilerFn>(cand.as_bytes()) } {
+            let function = *sym;
+            drop(sym);
+            return Ok((function, library));
+        }
+    }
+    Err(format!("dlsym: none of {candidates:?} found"))
 }
 
 struct TimingPerHashHandler {
     functions: Arc<HashMap<B256, RawEvmCompilerFn>>,
     target_hashes: Arc<HashSet<B256>>,
     timings: HashMap<B256, Duration>,
+    perf_counts: HashMap<B256, [u64; PERF_NEVENTS + 1]>,
 }
 
 impl Handler for TimingPerHashHandler {
@@ -240,9 +499,17 @@ impl TimingPerHashHandler {
         if let Some(&raw_fn) = self.functions.get(&bytecode_hash) {
             let f = EvmCompilerFn::new(raw_fn);
             let t0 = if is_target { Some(Instant::now()) } else { None };
+            let perf_before = if is_target { perf_snapshot() } else { None };
             let action = unsafe { f.call_with_interpreter(&mut frame.interpreter, ctx) };
             if let Some(t0) = t0 {
                 *self.timings.entry(bytecode_hash).or_default() += t0.elapsed();
+            }
+            if let (Some(before), Some(after)) = (perf_before, perf_snapshot()) {
+                let agg = self.perf_counts.entry(bytecode_hash).or_insert([0u64; PERF_NEVENTS + 1]);
+                for i in 0..PERF_NEVENTS {
+                    agg[i] = agg[i].wrapping_add(after[i].wrapping_sub(before[i]));
+                }
+                agg[PERF_NEVENTS] += 1;
             }
             let result = frame.process_next_action::<_, BenchError>(ctx, action).inspect(|i| {
                 if i.is_result() {
@@ -262,6 +529,7 @@ struct TimingSkeletonHandler {
     skeleton_dispatch: Arc<HashMap<B256, (EvmCompilerFn, Vec<u8>)>>,
     target_hashes: Arc<HashSet<B256>>,
     timings: HashMap<B256, Duration>,
+    perf_counts: HashMap<B256, [u64; PERF_NEVENTS + 1]>,
 }
 
 impl Handler for TimingSkeletonHandler {
@@ -319,11 +587,19 @@ impl TimingSkeletonHandler {
 
         if let Some((skel_fn, data_table)) = self.skeleton_dispatch.get(&bytecode_hash) {
             let t0 = if is_target { Some(Instant::now()) } else { None };
+            let perf_before = if is_target { perf_snapshot() } else { None };
             let action = unsafe {
                 skel_fn.call_with_interpreter_data(&mut frame.interpreter, ctx, data_table.as_ptr())
             };
             if let Some(t0) = t0 {
                 *self.timings.entry(bytecode_hash).or_default() += t0.elapsed();
+            }
+            if let (Some(before), Some(after)) = (perf_before, perf_snapshot()) {
+                let agg = self.perf_counts.entry(bytecode_hash).or_insert([0u64; PERF_NEVENTS + 1]);
+                for i in 0..PERF_NEVENTS {
+                    agg[i] = agg[i].wrapping_add(after[i].wrapping_sub(before[i]));
+                }
+                agg[PERF_NEVENTS] += 1;
             }
             let result = frame.process_next_action::<_, BenchError>(ctx, action).inspect(|i| {
                 if i.is_result() {
@@ -374,6 +650,16 @@ fn execute_block_timed(
 fn main() {
     let cli = Cli::parse();
     let bench_dir = Path::new(&cli.bench_dir);
+    let classify_mode = match cli.classify_mode.as_str() {
+        "auto" => ClassifyMode::Auto,
+        "force-all-variant" => ClassifyMode::ForceAllVariant,
+        other => {
+            eprintln!(
+                "ERROR: --classify-mode must be one of: auto, force-all-variant (got {other})"
+            );
+            std::process::exit(2);
+        }
+    };
     let per_hash_cache = PathBuf::from(&cli.per_hash_cache);
     let skeleton_cache = PathBuf::from(&cli.skeleton_cache);
 
@@ -608,7 +894,7 @@ fn main() {
             .map(|(skel_hash, member_hashes)| {
                 let refs: Vec<&[u8]> =
                     member_hashes.iter().map(|h| all_codes[h].as_slice()).collect();
-                let variance = analyze_skeleton_group(&refs);
+                let variance = analyze_skeleton_group_with_mode(&refs, classify_mode);
                 let members: Vec<(B256, Vec<u8>)> =
                     member_hashes.into_iter().map(|h| (h, all_codes[&h].clone())).collect();
                 AnalyzedGroup { skel_hash, members, variance, cached_data_tables: None }
@@ -721,10 +1007,46 @@ fn main() {
     let target_hashes = Arc::new(target_hashes);
 
     // Phase 5: Run blocks with timing
-    println!("\n--- Phase 5: Measuring {} blocks ---", block_numbers.len());
+    let mode_per_hash = matches!(cli.only_mode.as_str(), "both" | "per_hash");
+    let mode_skeleton = matches!(cli.only_mode.as_str(), "both" | "skeleton");
+    if !mode_per_hash && !mode_skeleton {
+        eprintln!(
+            "ERROR: --only_mode must be one of: both, per_hash, skeleton (got {})",
+            cli.only_mode
+        );
+        std::process::exit(2);
+    }
+    println!(
+        "\n--- Phase 5: Measuring {} blocks (only_mode={}) ---",
+        block_numbers.len(),
+        cli.only_mode
+    );
+    let record_perf = cli.perf_out.is_some();
+    let perf_set = if record_perf {
+        match PerfEventSet::parse(&cli.perf_events) {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "ERROR: --perf-events must be one of: default, frontend, backend, tma_l1, tma_l2_bw, tma_l3_fetch (got {})",
+                    cli.perf_events
+                );
+                std::process::exit(2);
+            }
+        }
+    } else {
+        PerfEventSet::Default
+    };
+    if record_perf {
+        perf_init(perf_set);
+    }
+    eprintln!("MEASUREMENT_PHASE_BEGIN only_mode={}", cli.only_mode);
 
     let mut per_hash_samples: HashMap<B256, Vec<(u64, usize, f64)>> = HashMap::new();
     let mut skeleton_samples: HashMap<B256, Vec<(u64, usize, f64)>> = HashMap::new();
+    let mut per_hash_perf: HashMap<B256, [u64; PERF_NEVENTS + 1]> = HashMap::new();
+    let mut skeleton_perf: HashMap<B256, [u64; PERF_NEVENTS + 1]> = HashMap::new();
+    let mut per_hash_wall_ns: HashMap<B256, u128> = HashMap::new();
+    let mut skeleton_wall_ns: HashMap<B256, u128> = HashMap::new();
     let mut blocks_measured = 0usize;
 
     for (bi, &block) in block_numbers.iter().enumerate() {
@@ -734,111 +1056,148 @@ fn main() {
         };
         let chain_id = loader.raw_txs().first().and_then(|tx| tx.chain_id);
 
-        // Correctness check: run once with each mode, compare (success, gas) per tx.
-        // Handler created ONCE per mode (not per-tx) to avoid cloning dispatch maps.
-        let mut ph_check = TimingPerHashHandler {
-            functions: per_hash_fns.clone(),
-            target_hashes: target_hashes.clone(),
-            timings: HashMap::new(),
-        };
-        let ph_results = execute_block_timed(&loader, chain_id, |evm| match ph_check.run(evm) {
-            Ok(rr) => extract_gas(&rr),
-            Err(_) => (false, 0),
-        });
-        let mut sk_check = TimingSkeletonHandler {
-            per_hash_fns: per_hash_fns.clone(),
-            skeleton_dispatch: skeleton_dispatch.clone(),
-            target_hashes: target_hashes.clone(),
-            timings: HashMap::new(),
-        };
-        let sk_results = execute_block_timed(&loader, chain_id, |evm| match sk_check.run(evm) {
-            Ok(rr) => extract_gas(&rr),
-            Err(_) => (false, 0),
-        });
-        let mut mismatches = 0u32;
-        for (i, (ph, sk)) in ph_results.iter().zip(sk_results.iter()).enumerate() {
-            if ph != sk {
-                mismatches += 1;
-                eprintln!(
-                    "  MISMATCH block {} tx[{}]: per-hash=({},{}) skeleton=({},{})",
-                    block, i, ph.0, ph.1, sk.0, sk.1
-                );
-            }
-        }
-        if mismatches > 0 {
-            eprintln!("  ABORT block {}: {} mismatches — skipping", block, mismatches);
-            continue;
-        }
-
-        // Per-hash warmup
-        for _ in 0..cli.warmup {
-            execute_block_timed(&loader, chain_id, |evm| {
-                let mut h = TimingPerHashHandler {
-                    functions: per_hash_fns.clone(),
-                    target_hashes: target_hashes.clone(),
-                    timings: HashMap::new(),
-                };
-                match h.run(evm) {
-                    Ok(rr) => extract_gas(&rr),
-                    Err(_) => (false, 0),
-                }
-            });
-        }
-
-        // Per-hash measured rounds
-        for round_idx in 0..cli.rounds {
-            let mut handler = TimingPerHashHandler {
+        // Correctness check: only run when comparing both modes; for single-mode
+        // hardware-counter wraps the cross-check would double the work and bias
+        // perf totals (and is already covered by mixed-mode runs of this bench).
+        if mode_per_hash && mode_skeleton {
+            let mut ph_check = TimingPerHashHandler {
                 functions: per_hash_fns.clone(),
                 target_hashes: target_hashes.clone(),
                 timings: HashMap::new(),
+                perf_counts: HashMap::new(),
             };
-            execute_block_timed(&loader, chain_id, |evm| match handler.run(evm) {
-                Ok(rr) => extract_gas(&rr),
-                Err(_) => (false, 0),
-            });
-            for (hash, dur) in &handler.timings {
-                per_hash_samples.entry(*hash).or_default().push((
-                    block,
-                    round_idx,
-                    dur.as_nanos() as f64 / 1000.0,
-                ));
-            }
-        }
-
-        // Skeleton warmup
-        for _ in 0..cli.warmup {
-            execute_block_timed(&loader, chain_id, |evm| {
-                let mut h = TimingSkeletonHandler {
-                    per_hash_fns: per_hash_fns.clone(),
-                    skeleton_dispatch: skeleton_dispatch.clone(),
-                    target_hashes: target_hashes.clone(),
-                    timings: HashMap::new(),
-                };
-                match h.run(evm) {
+            let ph_results =
+                execute_block_timed(&loader, chain_id, |evm| match ph_check.run(evm) {
                     Ok(rr) => extract_gas(&rr),
                     Err(_) => (false, 0),
-                }
-            });
-        }
-
-        // Skeleton measured rounds
-        for round_idx in 0..cli.rounds {
-            let mut handler = TimingSkeletonHandler {
+                });
+            let mut sk_check = TimingSkeletonHandler {
                 per_hash_fns: per_hash_fns.clone(),
                 skeleton_dispatch: skeleton_dispatch.clone(),
                 target_hashes: target_hashes.clone(),
                 timings: HashMap::new(),
+                perf_counts: HashMap::new(),
             };
-            execute_block_timed(&loader, chain_id, |evm| match handler.run(evm) {
-                Ok(rr) => extract_gas(&rr),
-                Err(_) => (false, 0),
-            });
-            for (hash, dur) in &handler.timings {
-                skeleton_samples.entry(*hash).or_default().push((
-                    block,
-                    round_idx,
-                    dur.as_nanos() as f64 / 1000.0,
-                ));
+            let sk_results =
+                execute_block_timed(&loader, chain_id, |evm| match sk_check.run(evm) {
+                    Ok(rr) => extract_gas(&rr),
+                    Err(_) => (false, 0),
+                });
+            let mut mismatches = 0u32;
+            for (i, (ph, sk)) in ph_results.iter().zip(sk_results.iter()).enumerate() {
+                if ph != sk {
+                    mismatches += 1;
+                    eprintln!(
+                        "  MISMATCH block {} tx[{}]: per-hash=({},{}) skeleton=({},{})",
+                        block, i, ph.0, ph.1, sk.0, sk.1
+                    );
+                }
+            }
+            if mismatches > 0 {
+                eprintln!("  ABORT block {}: {} mismatches — skipping", block, mismatches);
+                continue;
+            }
+        }
+
+        if mode_per_hash {
+            // Per-hash warmup
+            for _ in 0..cli.warmup {
+                execute_block_timed(&loader, chain_id, |evm| {
+                    let mut h = TimingPerHashHandler {
+                        functions: per_hash_fns.clone(),
+                        target_hashes: target_hashes.clone(),
+                        timings: HashMap::new(),
+                        perf_counts: HashMap::new(),
+                    };
+                    match h.run(evm) {
+                        Ok(rr) => extract_gas(&rr),
+                        Err(_) => (false, 0),
+                    }
+                });
+            }
+
+            // Per-hash measured rounds
+            for round_idx in 0..cli.rounds {
+                let mut handler = TimingPerHashHandler {
+                    functions: per_hash_fns.clone(),
+                    target_hashes: target_hashes.clone(),
+                    timings: HashMap::new(),
+                    perf_counts: HashMap::new(),
+                };
+                execute_block_timed(&loader, chain_id, |evm| match handler.run(evm) {
+                    Ok(rr) => extract_gas(&rr),
+                    Err(_) => (false, 0),
+                });
+                for (hash, dur) in &handler.timings {
+                    per_hash_samples.entry(*hash).or_default().push((
+                        block,
+                        round_idx,
+                        dur.as_nanos() as f64 / 1000.0,
+                    ));
+                    if record_perf {
+                        *per_hash_wall_ns.entry(*hash).or_insert(0) += dur.as_nanos();
+                    }
+                }
+                if record_perf {
+                    for (hash, counts) in &handler.perf_counts {
+                        let agg = per_hash_perf.entry(*hash).or_insert([0u64; PERF_NEVENTS + 1]);
+                        for i in 0..=PERF_NEVENTS {
+                            agg[i] = agg[i].wrapping_add(counts[i]);
+                        }
+                    }
+                }
+            }
+        }
+
+        if mode_skeleton {
+            // Skeleton warmup
+            for _ in 0..cli.warmup {
+                execute_block_timed(&loader, chain_id, |evm| {
+                    let mut h = TimingSkeletonHandler {
+                        per_hash_fns: per_hash_fns.clone(),
+                        skeleton_dispatch: skeleton_dispatch.clone(),
+                        target_hashes: target_hashes.clone(),
+                        timings: HashMap::new(),
+                        perf_counts: HashMap::new(),
+                    };
+                    match h.run(evm) {
+                        Ok(rr) => extract_gas(&rr),
+                        Err(_) => (false, 0),
+                    }
+                });
+            }
+
+            // Skeleton measured rounds
+            for round_idx in 0..cli.rounds {
+                let mut handler = TimingSkeletonHandler {
+                    per_hash_fns: per_hash_fns.clone(),
+                    skeleton_dispatch: skeleton_dispatch.clone(),
+                    target_hashes: target_hashes.clone(),
+                    timings: HashMap::new(),
+                    perf_counts: HashMap::new(),
+                };
+                execute_block_timed(&loader, chain_id, |evm| match handler.run(evm) {
+                    Ok(rr) => extract_gas(&rr),
+                    Err(_) => (false, 0),
+                });
+                for (hash, dur) in &handler.timings {
+                    skeleton_samples.entry(*hash).or_default().push((
+                        block,
+                        round_idx,
+                        dur.as_nanos() as f64 / 1000.0,
+                    ));
+                    if record_perf {
+                        *skeleton_wall_ns.entry(*hash).or_insert(0) += dur.as_nanos();
+                    }
+                }
+                if record_perf {
+                    for (hash, counts) in &handler.perf_counts {
+                        let agg = skeleton_perf.entry(*hash).or_insert([0u64; PERF_NEVENTS + 1]);
+                        for i in 0..=PERF_NEVENTS {
+                            agg[i] = agg[i].wrapping_add(counts[i]);
+                        }
+                    }
+                }
             }
         }
 
@@ -1039,6 +1398,161 @@ fn main() {
         std::fs::write(out_path, serde_json::to_vec_pretty(&output).expect("serialize"))
             .expect("write output");
         println!("\nWrote {out_path}");
+    }
+
+    if let Some(ref perf_out) = cli.perf_out {
+        // Generic per-target row. cycles + instructions are always present;
+        // e2..e5 hold the four extra events whose semantics are defined by
+        // event_order at the PerModePerf level. Legacy fields (l1i_misses
+        // etc.) are also emitted *only* when --perf-events default for
+        // backward compat with parsers that predate --perf-events.
+        #[derive(Serialize)]
+        struct PerfRow {
+            code_hash: String,
+            calls: u64,
+            cycles: u64,
+            instructions: u64,
+            e2: u64,
+            e3: u64,
+            e4: u64,
+            e5: u64,
+            wall_ns: u128,
+            // Legacy named slots, populated only in default event set.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            l1i_misses: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            itlb_misses: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            branches: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            branch_misses: Option<u64>,
+        }
+        #[derive(Serialize)]
+        struct PerModePerf {
+            event_set: String,
+            event_order: [&'static str; PERF_NEVENTS],
+            n_target_hashes: usize,
+            total_calls: u64,
+            total_cycles: u64,
+            total_instructions: u64,
+            total_e2: u64,
+            total_e3: u64,
+            total_e4: u64,
+            total_e5: u64,
+            total_wall_ns: u128,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            total_l1i_misses: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            total_itlb_misses: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            total_branches: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            total_branch_misses: Option<u64>,
+            per_hash: Vec<PerfRow>,
+        }
+        #[derive(Serialize)]
+        struct PerfOut {
+            only_mode: String,
+            blocks_sampled: usize,
+            rounds: usize,
+            warmup: usize,
+            per_hash_mode: Option<PerModePerf>,
+            skeleton_mode: Option<PerModePerf>,
+        }
+        fn build(
+            counts: &HashMap<B256, [u64; PERF_NEVENTS + 1]>,
+            walls: &HashMap<B256, u128>,
+            event_set_name: &str,
+            event_order: [&'static str; PERF_NEVENTS],
+            is_default: bool,
+        ) -> PerModePerf {
+            let mut rows: Vec<PerfRow> = counts
+                .iter()
+                .map(|(h, c)| PerfRow {
+                    code_hash: format!("0x{h:x}"),
+                    cycles: c[0],
+                    instructions: c[1],
+                    e2: c[2],
+                    e3: c[3],
+                    e4: c[4],
+                    e5: c[5],
+                    calls: c[6],
+                    wall_ns: walls.get(h).copied().unwrap_or(0),
+                    l1i_misses: if is_default { Some(c[2]) } else { None },
+                    itlb_misses: if is_default { Some(c[3]) } else { None },
+                    branches: if is_default { Some(c[4]) } else { None },
+                    branch_misses: if is_default { Some(c[5]) } else { None },
+                })
+                .collect();
+            rows.sort_by(|a, b| a.code_hash.cmp(&b.code_hash));
+            let total_calls = rows.iter().map(|r| r.calls).sum();
+            let total_cycles = rows.iter().map(|r| r.cycles).sum();
+            let total_instructions = rows.iter().map(|r| r.instructions).sum();
+            let total_e2 = rows.iter().map(|r| r.e2).sum();
+            let total_e3 = rows.iter().map(|r| r.e3).sum();
+            let total_e4 = rows.iter().map(|r| r.e4).sum();
+            let total_e5 = rows.iter().map(|r| r.e5).sum();
+            let total_wall_ns = rows.iter().map(|r| r.wall_ns).sum();
+            PerModePerf {
+                event_set: event_set_name.to_string(),
+                event_order,
+                n_target_hashes: rows.len(),
+                total_calls,
+                total_cycles,
+                total_instructions,
+                total_e2,
+                total_e3,
+                total_e4,
+                total_e5,
+                total_wall_ns,
+                total_l1i_misses: if is_default { Some(total_e2) } else { None },
+                total_itlb_misses: if is_default { Some(total_e3) } else { None },
+                total_branches: if is_default { Some(total_e4) } else { None },
+                total_branch_misses: if is_default { Some(total_e5) } else { None },
+                per_hash: rows,
+            }
+        }
+        let event_set_name = match perf_set {
+            PerfEventSet::Default => "default",
+            PerfEventSet::Frontend => "frontend",
+            PerfEventSet::Backend => "backend",
+            PerfEventSet::TmaL1 => "tma_l1",
+            PerfEventSet::TmaL2Bw => "tma_l2_bw",
+            PerfEventSet::TmaL3Fetch => "tma_l3_fetch",
+        };
+        let event_order = perf_event_names();
+        let is_default = matches!(perf_set, PerfEventSet::Default);
+        let out = PerfOut {
+            only_mode: cli.only_mode.clone(),
+            blocks_sampled: blocks_measured,
+            rounds: cli.rounds,
+            warmup: cli.warmup,
+            per_hash_mode: if mode_per_hash {
+                Some(build(
+                    &per_hash_perf,
+                    &per_hash_wall_ns,
+                    event_set_name,
+                    event_order,
+                    is_default,
+                ))
+            } else {
+                None
+            },
+            skeleton_mode: if mode_skeleton {
+                Some(build(
+                    &skeleton_perf,
+                    &skeleton_wall_ns,
+                    event_set_name,
+                    event_order,
+                    is_default,
+                ))
+            } else {
+                None
+            },
+        };
+        std::fs::write(perf_out, serde_json::to_vec_pretty(&out).expect("serialize perf"))
+            .expect("write perf out");
+        println!("Wrote per-target-tx perf counters to {perf_out}");
     }
 
     println!("\nDone.");
