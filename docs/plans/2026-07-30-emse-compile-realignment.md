@@ -248,3 +248,53 @@ per-call-context design matters at workload scale.
 JSON: `/home/ubuntu/sipeng/skelot-paper/data/nested_family_count_emse_base10k.json`.
 Rerun: `target/release/nested_family_count --bench-dir /home/ubuntu/sipeng/bench_data_base \
 --start-block 38004930 --block-count 10000 --threads 16 --skeleton-mode emse --out <path>`.
+
+## Addendum 2 (paper session, 2026-07-30): g1 upgraded to reachability-based check
+
+User caught that g1 was rejecting 205 skeletons (903 members) whose tails are embedded
+Solidity revert-string DATA — the linear scan misread data bytes as non-terminal
+instructions. Fixed in `tail_can_fall_through` (crates/revmc/src/emse.rs): the region
+after the LAST flow-blocking instruction (STOP/RETURN/REVERT/INVALID/JUMP/SELFDESTRUCT)
+is unreachable iff it contains no boundary JUMPDEST (sequential flow blocked + no jump
+landing site) — in that case the physical end cannot be reached and the skeleton is
+admissible regardless of what the data looks like (truncated PUSH included). Data
+containing 0x5b ('[') at a boundary, or code genuinely ending in JUMPDEST, still
+rejects (the EVM itself would accept a jump there). 3 new unit tests; all 16 emse
+tests green.
+
+Effect on Base 10K EMSE grouping (grouping_stats, same shared function):
+- g1: 205 skeletons/903 members → **7/17**; g2: 283 → 317 (+34 newly checked)
+- units: 10,994 (42.5%) → **10,337 = 46.0% reduction**; families 594 → 783
+- PRE-LAUNCH REQUIREMENT: exec_sanity must re-run over the newly-shared families
+  (189 additional families) before the timed compile launch; grouping change is
+  admission-semantics change.
+
+## Addendum 3 (paper session, 2026-07-30): g2 OFF via interpreter alignment; g1 stays
+
+User decision + core rationale (both guards were designed deliberately; this records
+why their fates now differ):
+- **g2 switched OFF** (`ENFORCE_G2 = false`, emse.rs): the metadata / non-metadata
+  boundary IS reliably identifiable today (length trailer + CBOR whitelist check), so
+  instead of filtering members whose metadata contains a boundary 0x5b, we ALIGN the
+  interpreter: our skelot-revm fork must mark stripped-metadata positions as invalid
+  jump targets when building the jump table (same strip function decides the boundary).
+  Then "jump into metadata" faults on BOTH sides — behaviors agree, filtering is
+  redundant. Effect: 317 members return to sharing; Base 10K grouping is now
+  **818 families (9,913 members) + 9,217 per-hash = 10,035 units = 47.5% reduction**
+  (static ceiling 10,025; only g1's 7/17 and degradations remain).
+- **g1 stays ON**: the code/data boundary INSIDE the code region is NOT reliably
+  identifiable (EVM has no data sections), so only the reachability proof
+  (last-blocker + no-JUMPDEST) works there. 7 skeletons / 17 members rejected.
+- **EOF endgame**: once EOF-style formats separate code/data/metadata at the format
+  level, both guards become unnecessary. Upstream positioning: propose the metadata
+  jump-mask as an OPT-IN hardening flag / EIP-direction discussion (EIP-3779/EOF are
+  already headed there) — never as a semantics-changing default PR.
+- **WORK FOR THIS SESSION (revmc side), required BEFORE the D2 replay:**
+  1. skelot-revm fork: mask stripped-metadata positions out of the legacy jump table
+     (use strip_emse_suffixes for the boundary; ~tens of lines).
+  2. Add a replay counter: how many executed JUMP/JUMPI actually target the stripped
+     region over the 10K blocks (expect 0 — that zero is the paper's evidence that the
+     hardened semantics changes nothing on real workloads).
+  3. exec_sanity re-run over the final 818-family grouping (g1-upgraded + g2-off).
+  Tonight's compile launch uses this grouping (g2 off) — the fork change lands before
+  any execution-side measurement.
