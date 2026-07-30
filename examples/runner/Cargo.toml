@@ -177,3 +177,7 @@ path = "src/bin/skeleton_vs_perhash_bench.rs"
 [[bin]]
 name = "skeleton_deployment_span"
 path = "src/bin/skeleton_deployment_span.rs"
+
+[[bin]]
+name = "nested_family_count"
+path = "src/bin/nested_family_count.rs"
