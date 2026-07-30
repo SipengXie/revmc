@@ -9,9 +9,9 @@
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-use revm::bytecode::{Bytecode, JumpTable};
+use revm::bytecode::Bytecode;
 use revm::primitives::hardfork::SpecId;
-use revm::primitives::{Address, Bytes, B256};
+use revm::primitives::{Address, B256};
 use revmc::skeleton::SkeletonVariance;
 use revmc::{EvmCompiler, EvmLlvmBackend, OptimizationLevel};
 use serde::{Deserialize, Serialize};
@@ -79,6 +79,19 @@ pub fn spec_tag() -> String {
 /// tag (e.g., `spec_tag_for_dynamic(chain, fork)`).
 pub fn spec_tag_for_chain(chain: ChainId) -> String {
     chain.as_lowercase().to_string()
+}
+
+/// Default corpus location for the dynamic-analysis binaries
+/// (`push_variance`, `skeleton_deployment_span`): `(bench_dir, start_block,
+/// block_count)`. `skelot_dataset_scan` keeps its own table — its Eth/BSC
+/// windows and Base block count differ on purpose.
+pub fn chain_data_defaults(chain: ChainId) -> (&'static str, u64, u64) {
+    match chain {
+        ChainId::Base => ("/home/ubuntu/sipeng/bench_data_base", 38_004_930, 9_997),
+        ChainId::Eth => ("/home/ubuntu/sipeng/bench_data_eth", 23_000_000, 10_000),
+        ChainId::Bsc => ("/home/ubuntu/sipeng/bench_data_bsc", 95_897_884, 10_000),
+        ChainId::Arb => ("/home/ubuntu/sipeng/bench_data_arb", 458_863_320, 10_000),
+    }
 }
 
 // ── Size buckets (paper Table 1) ───────────────────────────────────────────
@@ -258,169 +271,7 @@ pub fn compile_skeleton_group(
     result
 }
 
-// ── Protocol identification (lifted from skeleton_identify.rs) ─────────────
-
-pub struct KnownSelector {
-    pub bytes: [u8; 4],
-    pub name: &'static str,
-}
-
-pub const KNOWN_SELECTORS: &[KnownSelector] = &[
-    // ERC-20
-    KnownSelector { bytes: [0xa9, 0x05, 0x9c, 0xbb], name: "transfer(address,uint256)" },
-    KnownSelector {
-        bytes: [0x23, 0xb8, 0x72, 0xdd],
-        name: "transferFrom(address,address,uint256)",
-    },
-    KnownSelector { bytes: [0x09, 0x5e, 0xa7, 0xb3], name: "approve(address,uint256)" },
-    KnownSelector { bytes: [0x70, 0xa0, 0x82, 0x31], name: "balanceOf(address)" },
-    KnownSelector { bytes: [0x18, 0x16, 0x0d, 0xdd], name: "totalSupply()" },
-    KnownSelector { bytes: [0xdd, 0x62, 0xed, 0x3e], name: "allowance(address,address)" },
-    // ERC-721
-    KnownSelector {
-        bytes: [0x42, 0x84, 0x2e, 0x0e],
-        name: "safeTransferFrom(address,address,uint256)",
-    },
-    KnownSelector { bytes: [0x63, 0x52, 0x21, 0x1e], name: "ownerOf(uint256)" },
-    // Uniswap V2
-    KnownSelector {
-        bytes: [0x02, 0x2c, 0x0d, 0x9f],
-        name: "UniV2:swap(uint256,uint256,address,bytes)",
-    },
-    KnownSelector { bytes: [0x09, 0x02, 0xf1, 0xac], name: "UniV2:getReserves()" },
-    KnownSelector { bytes: [0x6a, 0x62, 0x78, 0x42], name: "UniV2:mint(address)" },
-    KnownSelector { bytes: [0xd2, 0x12, 0x20, 0xa7], name: "UniV2:factory()" },
-    // Uniswap V3
-    KnownSelector {
-        bytes: [0x12, 0x8a, 0xcb, 0x08],
-        name: "UniV3:swap(address,bool,int256,uint160,bytes)",
-    },
-    KnownSelector { bytes: [0x3c, 0x8a, 0x7d, 0x8d], name: "UniV3:collect(CollectParams)" },
-    KnownSelector { bytes: [0x25, 0x14, 0x00, 0x00], name: "UniV3:positions(uint256)" },
-    KnownSelector { bytes: [0xf3, 0x05, 0x83, 0x99], name: "UniV3:observe(uint32[])" },
-    KnownSelector { bytes: [0x1a, 0x68, 0x65, 0x02], name: "UniV3:slot0()" },
-    KnownSelector {
-        bytes: [0x49, 0x04, 0x88, 0x76],
-        name: "UniV3:flash(address,uint256,uint256,bytes)",
-    },
-    // Uniswap V3 Router
-    KnownSelector {
-        bytes: [0xac, 0x96, 0x50, 0xd8],
-        name: "UniV3Router:multicall(uint256,bytes[])",
-    },
-    KnownSelector {
-        bytes: [0x04, 0xe4, 0x5a, 0xaf],
-        name: "UniV3Router:exactInputSingle(ExactInputSingleParams)",
-    },
-    // Aave V3
-    KnownSelector {
-        bytes: [0xe8, 0xed, 0xa9, 0xdf],
-        name: "Aave:supply(address,uint256,address,uint16)",
-    },
-    KnownSelector {
-        bytes: [0x69, 0x32, 0x8d, 0xec],
-        name: "Aave:withdraw(address,uint256,address)",
-    },
-    KnownSelector {
-        bytes: [0xa4, 0x15, 0xbc, 0xad],
-        name: "Aave:borrow(address,uint256,uint256,uint16,address)",
-    },
-    KnownSelector {
-        bytes: [0x57, 0x3e, 0xad, 0x4c],
-        name: "Aave:repay(address,uint256,uint256,address)",
-    },
-    // Compound
-    KnownSelector { bytes: [0xa0, 0x71, 0x2d, 0x68], name: "Compound:mint(uint256)" },
-    KnownSelector { bytes: [0xdb, 0x00, 0x6a, 0x75], name: "Compound:redeem(uint256)" },
-    // Proxy patterns
-    KnownSelector { bytes: [0x5c, 0x60, 0xda, 0x1b], name: "Proxy:implementation()" },
-    KnownSelector { bytes: [0xf8, 0x51, 0xa4, 0x40], name: "Proxy:admin()" },
-    KnownSelector { bytes: [0x36, 0x59, 0xcf, 0xe6], name: "Proxy:upgradeTo(address)" },
-    KnownSelector {
-        bytes: [0x4f, 0x1e, 0xf2, 0x86],
-        name: "Proxy:upgradeToAndCall(address,bytes)",
-    },
-    // OpenZeppelin AccessControl / Ownable
-    KnownSelector { bytes: [0x8d, 0xa5, 0xcb, 0x5b], name: "OZ:renounceOwnership()" },
-    KnownSelector { bytes: [0xf2, 0xfd, 0xe3, 0x8b], name: "OZ:transferOwnership(address)" },
-    KnownSelector { bytes: [0x8d, 0xa5, 0xcb, 0x5b], name: "OZ:owner()" },
-    // Safe (Gnosis Safe)
-    KnownSelector { bytes: [0x6a, 0x76, 0x12, 0x02], name: "Safe:execTransaction(...)" },
-    KnownSelector { bytes: [0xaf, 0xfe, 0xd0, 0xe0], name: "Safe:nonce()" },
-    // Multicall
-    KnownSelector { bytes: [0xac, 0x96, 0x50, 0xd8], name: "Multicall:multicall(uint256,bytes[])" },
-    KnownSelector { bytes: [0x25, 0x2d, 0xba, 0x42], name: "Multicall:multicall(bytes[])" },
-    // Curve
-    KnownSelector {
-        bytes: [0x3d, 0xf0, 0x21, 0x24],
-        name: "Curve:exchange(int128,int128,uint256,uint256)",
-    },
-    // 1inch
-    KnownSelector {
-        bytes: [0x12, 0xaa, 0x3c, 0xaf],
-        name: "1inch:swap(IAggregationExecutor,SwapDescription,bytes,bytes)",
-    },
-    // EIP-4337 Account Abstraction
-    KnownSelector {
-        bytes: [0x1f, 0xad, 0x94, 0x8c],
-        name: "AA:validateUserOp(UserOperation,bytes32,uint256)",
-    },
-    KnownSelector { bytes: [0xb6, 0x1d, 0x27, 0xf6], name: "AA:execute(address,uint256,bytes)" },
-    KnownSelector {
-        bytes: [0x18, 0xdf, 0xb3, 0xc7],
-        name: "AA:handleOps(UserOperation[],address)",
-    },
-    // Create2 / Deployer
-    KnownSelector {
-        bytes: [0xcd, 0xcb, 0x76, 0x0a],
-        name: "Create2:deploy(uint256,bytes32,bytes)",
-    },
-];
-
-/// Scan bytecode for known 4-byte selectors (checking PUSH4 opcodes).
-pub fn find_selectors_in_bytecode(bytes: &[u8]) -> Vec<&'static str> {
-    let mut found = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let op = bytes[i];
-        i += 1;
-        if (0x60..=0x7f).contains(&op) {
-            let n = (op - 0x5f) as usize;
-            if op == 0x63 && i + 4 <= bytes.len() {
-                let sel: [u8; 4] = bytes[i..i + 4].try_into().unwrap();
-                for ks in KNOWN_SELECTORS {
-                    if ks.bytes == sel && !found.contains(&ks.name) {
-                        found.push(ks.name);
-                    }
-                }
-            }
-            i += n;
-        }
-    }
-    found
-}
-
-/// Scan bytecode for ANY 4-byte selectors via PUSH4, return unique hex strings.
-pub fn find_all_push4_selectors(bytes: &[u8]) -> Vec<String> {
-    let mut selectors = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let op = bytes[i];
-        i += 1;
-        if (0x60..=0x7f).contains(&op) {
-            let n = (op - 0x5f) as usize;
-            if op == 0x63 && i + 4 <= bytes.len() {
-                let sel: [u8; 4] = bytes[i..i + 4].try_into().unwrap();
-                if seen.insert(sel) {
-                    selectors.push(hex::encode(sel));
-                }
-            }
-            i += n;
-        }
-    }
-    selectors
-}
+// ── Protocol identification (identify_pattern; used by dataset scan) ──────
 
 /// Identify a contract pattern (EIP-1167, Uniswap, ERC-20, etc.) from raw bytecode.
 pub fn identify_pattern(bytes: &[u8]) -> &'static str {
@@ -600,179 +451,12 @@ pub fn contains_bytes(bytecode: &[u8], needle: &[u8; 4]) -> bool {
     false
 }
 
-// ── Bench-data bytecode loader (shared by Stage B / Stage E) ──────────────
+// ── Bench-data loading & decoding (see skelot_data.rs) ────────────────────
 
-use revm::primitives::{HashMap as RevmHashMap, U256};
-use revm::state::AccountInfo;
-
-#[derive(Deserialize)]
-pub struct AccountSnapshot {
-    pub info: Option<AccountInfo>,
-    pub storage: RevmHashMap<U256, U256>,
-}
-
-#[derive(Deserialize)]
-pub struct CacheSnapshot {
-    pub block_number: u64,
-    pub has_state_clear: bool,
-    pub accounts: RevmHashMap<Address, AccountSnapshot>,
-    pub codes: RevmHashMap<B256, Bytecode>,
-}
-
-// ── v1 schema (BytecodeV86) explicit decode path ──────────────────────────
-
-/// Mirror of `exporter::schema::BytecodeV86`. Kept local so we do not depend
-/// on the exporter crate; converted to revm `Bytecode` via `From`.
-#[derive(Clone, Debug, Deserialize)]
-pub enum BytecodeV86Mirror {
-    Eip7702 { delegated_address: Address, version: u8, raw: Bytes },
-    LegacyAnalyzed { bytecode: Bytes, original_len: usize, jump_table: JumpTable },
-}
-
-impl From<BytecodeV86Mirror> for Bytecode {
-    fn from(v: BytecodeV86Mirror) -> Self {
-        match v {
-            BytecodeV86Mirror::LegacyAnalyzed { bytecode, original_len, jump_table } => {
-                Bytecode::new_analyzed(bytecode, original_len, jump_table)
-            }
-            // The exporter's `Bytecode::new_eip7702_raw` is not exposed by this
-            // workspace's revm fork. `new_raw_checked` peeks the EIP-7702 magic
-            // prefix and produces the same `Bytecode::Eip7702(...)` variant.
-            BytecodeV86Mirror::Eip7702 { raw, .. } => {
-                Bytecode::new_raw_checked(raw).expect("stored EIP-7702 bytecode must be valid")
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct V1AccountSnapshot {
-    pub info: Option<AccountInfo>,
-    pub storage: RevmHashMap<U256, U256>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct CacheSnapshotV1 {
-    pub block_number: u64,
-    pub has_state_clear: bool,
-    pub accounts: RevmHashMap<Address, V1AccountSnapshot>,
-    pub codes: RevmHashMap<B256, BytecodeV86Mirror>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct BenchManifest {
-    pub schema_version: u32,
-    pub chain_id: Option<u64>,
-    pub start_block: Option<u64>,
-    pub end_block: Option<u64>,
-}
-
-pub fn read_bench_manifest(bench_dir: &std::path::Path) -> Option<BenchManifest> {
-    let p = bench_dir.join("manifest.json");
-    let raw = std::fs::read_to_string(&p).ok()?;
-    serde_json::from_str(&raw).ok()
-}
-
-/// Decode a bench-data state file. Always goes through `BytecodeV86` then
-/// converts to revm `Bytecode`, removing reliance on enum-tag coincidence.
-pub fn load_state_v1(path: &std::path::Path) -> Result<CacheSnapshotV1, String> {
-    let raw = std::fs::read(path).map_err(|e| format!("read {path:?}: {e}"))?;
-    bincode::deserialize::<CacheSnapshotV1>(&raw).map_err(|e| format!("decode {path:?}: {e}"))
-}
-
-pub fn iter_bytecode_raw<F: FnMut(&B256, Vec<u8>)>(snap: &CacheSnapshotV1, mut f: F) {
-    for (hash, code) in &snap.codes {
-        let raw = match code.clone() {
-            // LegacyAnalyzed.bytecode includes 33 trailing bytes of safety padding
-            // appended during analysis (32 zero bytes + STOP). Slice to original_len so
-            // callers see only on-chain raw bytes — otherwise raw_len inflates by 33 and
-            // skeleton extraction at end-of-code mid-PUSH boundaries diverges from the
-            // original-bytes semantics used by the canonical paper data.
-            BytecodeV86Mirror::LegacyAnalyzed { bytecode, original_len, .. } => {
-                bytecode[..original_len.min(bytecode.len())].to_vec()
-            }
-            BytecodeV86Mirror::Eip7702 { raw, .. } => raw.to_vec(),
-        };
-        f(hash, raw);
-    }
-}
-
-/// Shared cache directory for derived indices over the bench corpus.
-/// Falls back to `/tmp/skelot_index` when `$HOME` is unset.
-pub fn index_cache_dir() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".cache").join("skelot_index"))
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/skelot_index"))
-}
-
-/// Gather non-skippable bytecodes from `states/{bn}.bin` snapshots over a block range.
-pub fn collect_bytecodes(
-    bench_dir: &Path,
-    start_block: u64,
-    block_count: u64,
-) -> std::collections::HashMap<B256, Vec<u8>> {
-    let mut all: std::collections::HashMap<B256, Vec<u8>> = std::collections::HashMap::new();
-    for bn in start_block..start_block + block_count {
-        let path = bench_dir.join(format!("states/{bn}.bin"));
-        let Ok(data) = std::fs::read(&path) else { continue };
-        let Ok(mut snapshot): Result<CacheSnapshot, _> = bincode::deserialize(&data) else {
-            continue;
-        };
-        let codes = std::mem::take(&mut snapshot.codes);
-        drop(snapshot);
-        for (hash, bytecode) in codes {
-            let raw = bytecode.original_byte_slice().to_vec();
-            if should_skip_bytes(&raw) {
-                continue;
-            }
-            all.entry(hash).or_insert(raw);
-        }
-    }
-    all
-}
-
-/// Cached wrapper around `collect_bytecodes`. Reads from
-/// `~/.cache/skelot_index/bytecodes_{start_block}_{block_count}.bin` when
-/// present, otherwise rebuilds and atomically writes the cache. The bench
-/// corpus is assumed static; remove the cache file if it changes.
-pub fn collect_bytecodes_cached(
-    bench_dir: &Path,
-    start_block: u64,
-    block_count: u64,
-) -> std::collections::HashMap<B256, Vec<u8>> {
-    let cache_dir = index_cache_dir();
-    let cache_path = cache_dir.join(format!("bytecodes_{start_block}_{block_count}.bin"));
-    if let Ok(data) = std::fs::read(&cache_path) {
-        match bincode::deserialize::<std::collections::HashMap<B256, Vec<u8>>>(&data) {
-            Ok(map) => {
-                eprintln!(
-                    "[cache] loaded bytecodes ({} entries) from {}",
-                    map.len(),
-                    cache_path.display()
-                );
-                return map;
-            }
-            Err(e) => eprintln!("[cache] {} unreadable ({e}); rebuilding", cache_path.display()),
-        }
-    }
-    let map = collect_bytecodes(bench_dir, start_block, block_count);
-    let _ = std::fs::create_dir_all(&cache_dir);
-    match bincode::serialize(&map) {
-        Ok(bytes) => {
-            let tmp = cache_path.with_extension("bin.tmp");
-            if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &cache_path).is_ok() {
-                eprintln!(
-                    "[cache] wrote bytecodes ({} entries, {} bytes) to {}",
-                    map.len(),
-                    bytes.len(),
-                    cache_path.display()
-                );
-            }
-        }
-        Err(e) => eprintln!("[cache] serialize bytecodes: {e}"),
-    }
-    map
-}
+#[path = "skelot_data.rs"]
+pub mod skelot_data;
+#[allow(unused_imports)]
+pub use skelot_data::*;
 
 // ── Statistics (Welch's t) ─────────────────────────────────────────────────
 

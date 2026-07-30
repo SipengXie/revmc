@@ -10,19 +10,16 @@ mod bin_common;
 #[path = "../skelot_common.rs"]
 mod skelot_common;
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use clap::Parser;
 use op_revm::transaction::OpTransaction;
 use op_revm::DefaultOp;
-use perf_event::events::{Cache, CacheOp, CacheResult, Hardware, WhichCache};
-use perf_event::{Builder, Counter, Group};
 use revm::database::EmptyDB;
-use revm::handler::{EvmTr, FrameResult, Handler, ItemOrResult};
+use revm::handler::Handler;
 use revm::primitives::B256;
 use revmc::emse::{bytecode_view, group_skeleton_families, SkeletonMode};
 use revmc::skeleton::{analyze_skeleton_group_with_mode, build_data_table, ClassifyMode};
@@ -31,7 +28,7 @@ use revmc_builtins as _;
 use revmc_context::{EvmCompilerFn, RawEvmCompilerFn};
 use serde::Serialize;
 
-use bin_common::{build_op_cfg, build_op_tx, extract_gas, BenchError, BenchEvm, BinLoader, OpCtx};
+use bin_common::{build_op_cfg, build_op_tx, extract_gas, BenchEvm, BinLoader, OpCtx};
 
 const OPT: OptimizationLevel = OptimizationLevel::Aggressive;
 
@@ -89,7 +86,7 @@ struct Cli {
     /// renamed to `skel_<short>__prague__o3.so` to test whether SkelOT's
     /// data-table cost B is small in the cross-instance regime (P3).
     #[arg(long, default_value = "auto")]
-    classify_mode: String,
+    classify_mode: ClassifyMode,
     /// Family boundary: "current" (PUSH-immediates-only skeleton) or "emse"
     /// (also strips CBOR metadata + trailing zeros; admission guards apply).
     /// Must match the mode used to compile `--skeleton-cache`.
@@ -97,224 +94,9 @@ struct Cli {
     skeleton_mode: SkeletonMode,
 }
 
-const PERF_NEVENTS: usize = 6;
-
-#[derive(Clone, Copy)]
-enum PerfEventSet {
-    Default,
-    Frontend,
-    Backend,
-    TmaL1,
-    TmaL2Bw,
-    TmaL3Fetch,
-}
-
-impl PerfEventSet {
-    fn parse(s: &str) -> Option<Self> {
-        match s {
-            "default" => Some(PerfEventSet::Default),
-            "frontend" => Some(PerfEventSet::Frontend),
-            "backend" => Some(PerfEventSet::Backend),
-            "tma_l1" => Some(PerfEventSet::TmaL1),
-            "tma_l2_bw" => Some(PerfEventSet::TmaL2Bw),
-            "tma_l3_fetch" => Some(PerfEventSet::TmaL3Fetch),
-            _ => None,
-        }
-    }
-
-    fn names(self) -> [&'static str; PERF_NEVENTS] {
-        match self {
-            PerfEventSet::Default => {
-                ["cycles", "instructions", "L1i_misses", "iTLB_misses", "branches", "branch_misses"]
-            }
-            PerfEventSet::Frontend => [
-                "cycles",
-                "instructions",
-                "icache_data_stalls",
-                "icache_tag_stalls",
-                "dsb2mite_penalty_cycles",
-                "cycle_activity_stalls_total",
-            ],
-            PerfEventSet::Backend => [
-                "cycles",
-                "instructions",
-                "cycle_activity_stalls_total",
-                "cycle_activity_stalls_l1d_miss",
-                "idq_dsb_uops",
-                "idq_mite_uops",
-            ],
-            PerfEventSet::TmaL1 => [
-                "cycles",
-                "instructions",
-                "topdown_slots",
-                "uops_retired_slots",
-                "topdown_bad_spec_slots",
-                "topdown_backend_bound_slots",
-            ],
-            PerfEventSet::TmaL2Bw => [
-                "cycles",
-                "instructions",
-                "idq_dsb_cycles_any",
-                "idq_dsb_cycles_ok",
-                "idq_mite_cycles_any",
-                "idq_mite_cycles_ok",
-            ],
-            PerfEventSet::TmaL3Fetch => [
-                "cycles",
-                "instructions",
-                "icache_data_stalls",
-                "icache_tag_stalls",
-                "offcore_cycles_demand_code_rd",
-                "l2_rqsts_code_rd_miss",
-            ],
-        }
-    }
-}
-
-// Build a Counter for a raw PERF_TYPE_RAW event with the given config.
-// Used for Sapphire Rapids stall/uop events that perf-event 0.4.9 does
-// not expose via Hardware/Cache enums.
-fn build_raw(group: &mut Group, config: u64) -> std::io::Result<Counter> {
-    use perf_event_open_sys::bindings;
-    let mut b = Builder::new();
-    {
-        let attrs = b.attrs_mut();
-        attrs.type_ = bindings::PERF_TYPE_RAW;
-        attrs.config = config;
-    }
-    b.group(group).build()
-}
-
-struct PerfBracket {
-    group: Group,
-    counters: [Counter; PERF_NEVENTS],
-}
-
-impl PerfBracket {
-    fn new(event_set: PerfEventSet) -> std::io::Result<Self> {
-        let mut group = Group::new()?;
-        let cycles = Builder::new().group(&mut group).kind(Hardware::CPU_CYCLES).build()?;
-        let instructions = Builder::new().group(&mut group).kind(Hardware::INSTRUCTIONS).build()?;
-        let counters = match event_set {
-            PerfEventSet::Default => {
-                let l1i_miss = Builder::new()
-                    .group(&mut group)
-                    .kind(Cache {
-                        which: WhichCache::L1I,
-                        operation: CacheOp::READ,
-                        result: CacheResult::MISS,
-                    })
-                    .build()?;
-                let itlb_miss = Builder::new()
-                    .group(&mut group)
-                    .kind(Cache {
-                        which: WhichCache::ITLB,
-                        operation: CacheOp::READ,
-                        result: CacheResult::MISS,
-                    })
-                    .build()?;
-                let branches =
-                    Builder::new().group(&mut group).kind(Hardware::BRANCH_INSTRUCTIONS).build()?;
-                let branch_misses =
-                    Builder::new().group(&mut group).kind(Hardware::BRANCH_MISSES).build()?;
-                [cycles, instructions, l1i_miss, itlb_miss, branches, branch_misses]
-            }
-            PerfEventSet::Frontend => {
-                // Sapphire Rapids RAW configs from perf -vv:
-                let icache_data = build_raw(&mut group, 0x480)?;
-                let icache_tag = build_raw(&mut group, 0x483)?;
-                let dsb2mite = build_raw(&mut group, 0x261)?;
-                let stalls_total = build_raw(&mut group, 0x40004a3)?;
-                [cycles, instructions, icache_data, icache_tag, dsb2mite, stalls_total]
-            }
-            PerfEventSet::Backend => {
-                let stalls_total = build_raw(&mut group, 0x40004a3)?;
-                let stalls_l1d_miss = build_raw(&mut group, 0xc000ca3)?;
-                let dsb_uops = build_raw(&mut group, 0x879)?;
-                let mite_uops = build_raw(&mut group, 0x479)?;
-                [cycles, instructions, stalls_total, stalls_l1d_miss, dsb_uops, mite_uops]
-            }
-            PerfEventSet::TmaL1 => {
-                // Sapphire Rapids RAW configs from `perf list --details`.
-                // These are top-level TMA slots and form an additive partition:
-                // slots = retiring + bad_spec + backend_bound + frontend_bound.
-                let topdown_slots = build_raw(&mut group, 0x1a4)?;
-                let retired_slots = build_raw(&mut group, 0x2c2)?;
-                let bad_spec_slots = build_raw(&mut group, 0x4a4)?;
-                let backend_bound_slots = build_raw(&mut group, 0x2a4)?;
-                [
-                    cycles,
-                    instructions,
-                    topdown_slots,
-                    retired_slots,
-                    bad_spec_slots,
-                    backend_bound_slots,
-                ]
-            }
-            PerfEventSet::TmaL2Bw => {
-                // TMA L2 frontend-bandwidth children use these IDQ cycle events:
-                // tma_dsb  = (IDQ.DSB_CYCLES_ANY  - IDQ.DSB_CYCLES_OK)  / core_clks / 2
-                // tma_mite = (IDQ.MITE_CYCLES_ANY - IDQ.MITE_CYCLES_OK) / core_clks / 2
-                let dsb_cycles_any = build_raw(&mut group, 0x1000879)?;
-                let dsb_cycles_ok = build_raw(&mut group, 0x6000879)?;
-                let mite_cycles_any = build_raw(&mut group, 0x1000479)?;
-                let mite_cycles_ok = build_raw(&mut group, 0x6000479)?;
-                [
-                    cycles,
-                    instructions,
-                    dsb_cycles_any,
-                    dsb_cycles_ok,
-                    mite_cycles_any,
-                    mite_cycles_ok,
-                ]
-            }
-            PerfEventSet::TmaL3Fetch => {
-                // TMA L3/L4 frontend-latency diagnostics around instruction fetch:
-                // tma_icache_misses = ICACHE_DATA.STALLS / thread_clks;
-                // tma_code_l2_miss = OFFCORE_REQUESTS_OUTSTANDING.CYCLES_WITH_DEMAND_CODE_RD / thread_clks.
-                let icache_data = build_raw(&mut group, 0x480)?;
-                let icache_tag = build_raw(&mut group, 0x483)?;
-                let offcore_code_rd = build_raw(&mut group, 0x1000220)?;
-                let l2_code_miss = build_raw(&mut group, 0x2424)?;
-                [cycles, instructions, icache_data, icache_tag, offcore_code_rd, l2_code_miss]
-            }
-        };
-        group.enable()?;
-        Ok(Self { group, counters })
-    }
-
-    fn read(&mut self) -> [u64; PERF_NEVENTS] {
-        let c = self.group.read().expect("perf read");
-        let mut out = [0u64; PERF_NEVENTS];
-        for (i, ctr) in self.counters.iter().enumerate() {
-            out[i] = c[ctr];
-        }
-        out
-    }
-}
-
-thread_local! {
-    static PERF_BRACKET: RefCell<Option<PerfBracket>> = const { RefCell::new(None) };
-    static PERF_EVENT_SET: RefCell<PerfEventSet> = const { RefCell::new(PerfEventSet::Default) };
-}
-
-fn perf_init(event_set: PerfEventSet) {
-    PERF_EVENT_SET.with(|p| *p.borrow_mut() = event_set);
-    PERF_BRACKET.with(|p| {
-        *p.borrow_mut() = Some(
-            PerfBracket::new(event_set)
-                .expect("perf_event_open: paranoid level too high or event unsupported?"),
-        )
-    });
-}
-
-fn perf_snapshot() -> Option<[u64; PERF_NEVENTS]> {
-    PERF_BRACKET.with(|p| p.borrow_mut().as_mut().map(|b| b.read()))
-}
-
-fn perf_event_names() -> [&'static str; PERF_NEVENTS] {
-    PERF_EVENT_SET.with(|p| p.borrow().names())
-}
+#[path = "../perf_events.rs"]
+mod perf_events;
+use perf_events::{perf_event_names, perf_init, PerfEventSet, PERF_NEVENTS};
 
 #[derive(Serialize)]
 struct Config {
@@ -424,192 +206,9 @@ fn load_skeleton_so(
     Err(format!("dlsym: none of {candidates:?} found"))
 }
 
-struct TimingPerHashHandler {
-    functions: Arc<HashMap<B256, RawEvmCompilerFn>>,
-    target_hashes: Arc<HashSet<B256>>,
-    timings: HashMap<B256, Duration>,
-    perf_counts: HashMap<B256, [u64; PERF_NEVENTS + 1]>,
-}
-
-impl Handler for TimingPerHashHandler {
-    type Evm = BenchEvm;
-    type Error = BenchError;
-    type HaltReason = op_revm::OpHaltReason;
-
-    fn run_exec_loop(
-        &mut self,
-        evm: &mut Self::Evm,
-        first_frame_input: revm::interpreter::interpreter_action::FrameInit,
-    ) -> Result<FrameResult, Self::Error> {
-        let res = evm.frame_init(first_frame_input)?;
-        if let ItemOrResult::Result(frame_result) = res {
-            return Ok(frame_result);
-        }
-        loop {
-            let call_or_result = self.run_frame(evm)?;
-            let result = match call_or_result {
-                ItemOrResult::Item(init) => match evm.frame_init(init)? {
-                    ItemOrResult::Item(_) => continue,
-                    ItemOrResult::Result(result) => result,
-                },
-                ItemOrResult::Result(result) => result,
-            };
-            if let Some(result) = evm.frame_return_result(result)? {
-                return Ok(result);
-            }
-        }
-    }
-}
-
-impl TimingPerHashHandler {
-    fn run_frame(
-        &mut self,
-        evm: &mut BenchEvm,
-    ) -> Result<
-        ItemOrResult<revm::interpreter::interpreter_action::FrameInit, FrameResult>,
-        BenchError,
-    > {
-        let (ctx, frame_stack) = (&mut evm.0.ctx, &mut evm.0.frame_stack);
-        let frame = frame_stack.get();
-
-        if !bin_common::should_lookup_jit(
-            frame.data.is_create(),
-            frame.interpreter.input.bytecode_address,
-            frame.interpreter.bytecode.is_empty(),
-        ) {
-            drop((ctx, frame_stack));
-            return Ok(evm.frame_run()?);
-        }
-
-        let bytecode_hash = frame.interpreter.bytecode.get_or_calculate_hash();
-        let is_target = self.target_hashes.contains(&bytecode_hash);
-
-        if let Some(&raw_fn) = self.functions.get(&bytecode_hash) {
-            let f = EvmCompilerFn::new(raw_fn);
-            let t0 = if is_target { Some(Instant::now()) } else { None };
-            let perf_before = if is_target { perf_snapshot() } else { None };
-            let action = unsafe { f.call_with_interpreter(&mut frame.interpreter, ctx) };
-            if let Some(t0) = t0 {
-                *self.timings.entry(bytecode_hash).or_default() += t0.elapsed();
-            }
-            if let (Some(before), Some(after)) = (perf_before, perf_snapshot()) {
-                let agg = self.perf_counts.entry(bytecode_hash).or_insert([0u64; PERF_NEVENTS + 1]);
-                for i in 0..PERF_NEVENTS {
-                    agg[i] = agg[i].wrapping_add(after[i].wrapping_sub(before[i]));
-                }
-                agg[PERF_NEVENTS] += 1;
-            }
-            let result = frame.process_next_action::<_, BenchError>(ctx, action).inspect(|i| {
-                if i.is_result() {
-                    frame.set_finished(true);
-                }
-            })?;
-            Ok(result)
-        } else {
-            drop((ctx, frame_stack));
-            Ok(evm.frame_run()?)
-        }
-    }
-}
-
-struct TimingSkeletonHandler {
-    per_hash_fns: Arc<HashMap<B256, RawEvmCompilerFn>>,
-    skeleton_dispatch: Arc<HashMap<B256, (EvmCompilerFn, Vec<u8>)>>,
-    target_hashes: Arc<HashSet<B256>>,
-    timings: HashMap<B256, Duration>,
-    perf_counts: HashMap<B256, [u64; PERF_NEVENTS + 1]>,
-}
-
-impl Handler for TimingSkeletonHandler {
-    type Evm = BenchEvm;
-    type Error = BenchError;
-    type HaltReason = op_revm::OpHaltReason;
-
-    fn run_exec_loop(
-        &mut self,
-        evm: &mut Self::Evm,
-        first_frame_input: revm::interpreter::interpreter_action::FrameInit,
-    ) -> Result<FrameResult, Self::Error> {
-        let res = evm.frame_init(first_frame_input)?;
-        if let ItemOrResult::Result(frame_result) = res {
-            return Ok(frame_result);
-        }
-        loop {
-            let call_or_result = self.run_frame(evm)?;
-            let result = match call_or_result {
-                ItemOrResult::Item(init) => match evm.frame_init(init)? {
-                    ItemOrResult::Item(_) => continue,
-                    ItemOrResult::Result(result) => result,
-                },
-                ItemOrResult::Result(result) => result,
-            };
-            if let Some(result) = evm.frame_return_result(result)? {
-                return Ok(result);
-            }
-        }
-    }
-}
-
-impl TimingSkeletonHandler {
-    fn run_frame(
-        &mut self,
-        evm: &mut BenchEvm,
-    ) -> Result<
-        ItemOrResult<revm::interpreter::interpreter_action::FrameInit, FrameResult>,
-        BenchError,
-    > {
-        let (ctx, frame_stack) = (&mut evm.0.ctx, &mut evm.0.frame_stack);
-        let frame = frame_stack.get();
-
-        if !bin_common::should_lookup_jit(
-            frame.data.is_create(),
-            frame.interpreter.input.bytecode_address,
-            frame.interpreter.bytecode.is_empty(),
-        ) {
-            drop((ctx, frame_stack));
-            return Ok(evm.frame_run()?);
-        }
-
-        let bytecode_hash = frame.interpreter.bytecode.get_or_calculate_hash();
-        let is_target = self.target_hashes.contains(&bytecode_hash);
-
-        if let Some((skel_fn, data_table)) = self.skeleton_dispatch.get(&bytecode_hash) {
-            let t0 = if is_target { Some(Instant::now()) } else { None };
-            let perf_before = if is_target { perf_snapshot() } else { None };
-            let action = unsafe {
-                skel_fn.call_with_interpreter_data(&mut frame.interpreter, ctx, data_table.as_ptr())
-            };
-            if let Some(t0) = t0 {
-                *self.timings.entry(bytecode_hash).or_default() += t0.elapsed();
-            }
-            if let (Some(before), Some(after)) = (perf_before, perf_snapshot()) {
-                let agg = self.perf_counts.entry(bytecode_hash).or_insert([0u64; PERF_NEVENTS + 1]);
-                for i in 0..PERF_NEVENTS {
-                    agg[i] = agg[i].wrapping_add(after[i].wrapping_sub(before[i]));
-                }
-                agg[PERF_NEVENTS] += 1;
-            }
-            let result = frame.process_next_action::<_, BenchError>(ctx, action).inspect(|i| {
-                if i.is_result() {
-                    frame.set_finished(true);
-                }
-            })?;
-            Ok(result)
-        } else if let Some(&raw_fn) = self.per_hash_fns.get(&bytecode_hash) {
-            let f = EvmCompilerFn::new(raw_fn);
-            let action = unsafe { f.call_with_interpreter(&mut frame.interpreter, ctx) };
-            let result = frame.process_next_action::<_, BenchError>(ctx, action).inspect(|i| {
-                if i.is_result() {
-                    frame.set_finished(true);
-                }
-            })?;
-            Ok(result)
-        } else {
-            drop((ctx, frame_stack));
-            Ok(evm.frame_run()?)
-        }
-    }
-}
+#[path = "../timing_handlers.rs"]
+mod timing_handlers;
+use timing_handlers::{TimingPerHashHandler, TimingSkeletonHandler};
 
 fn execute_block_timed(
     loader: &BinLoader,
@@ -638,16 +237,7 @@ fn execute_block_timed(
 fn main() {
     let cli = Cli::parse();
     let bench_dir = Path::new(&cli.bench_dir);
-    let classify_mode = match cli.classify_mode.as_str() {
-        "auto" => ClassifyMode::Auto,
-        "force-all-variant" => ClassifyMode::ForceAllVariant,
-        other => {
-            eprintln!(
-                "ERROR: --classify-mode must be one of: auto, force-all-variant (got {other})"
-            );
-            std::process::exit(2);
-        }
-    };
+    let classify_mode = cli.classify_mode;
     let per_hash_cache = PathBuf::from(&cli.per_hash_cache);
     let skeleton_cache = PathBuf::from(&cli.skeleton_cache);
 

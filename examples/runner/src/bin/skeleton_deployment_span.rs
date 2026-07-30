@@ -312,12 +312,8 @@ fn main() {
     }
     probe_archive_rpc(chain);
 
-    let (default_dir, default_start, default_count) = match chain {
-        ChainId::Base => ("/home/ubuntu/sipeng/bench_data_base", 38_004_930u64, 9_997u64),
-        ChainId::Eth => ("/home/ubuntu/sipeng/bench_data_eth", 23_000_000, 10_000),
-        ChainId::Bsc => ("/home/ubuntu/sipeng/bench_data_bsc", 95_897_884, 10_000),
-        ChainId::Arb => ("/home/ubuntu/sipeng/bench_data_arb", 458_863_320, 10_000),
-    };
+    let (default_dir, default_start, default_count) =
+        crate::skelot_common::chain_data_defaults(chain);
     let dir = args.bench_dir.unwrap_or_else(|| default_dir.to_string());
     let bench_dir = Path::new(&dir);
     let start = args.start_block.unwrap_or(default_start);

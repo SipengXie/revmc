@@ -42,7 +42,7 @@ struct Args {
     /// "force-all-variant" (ablation: every non-skip-logic PUSH via data
     /// table). Artifacts land in a separate cache subdir per combination.
     #[arg(long, default_value = "auto")]
-    classify_mode: String,
+    classify_mode: ClassifyMode,
     #[arg(long, default_value = "block_38004930")]
     scope: String,
     #[arg(long)]
@@ -356,16 +356,7 @@ fn run_skeleton(
 
 fn main() {
     let args = Args::parse();
-    // Validate before any compilation: with --mode both a bad value here
-    // must not discard hours of completed per-hash work.
-    let classify_mode = match args.classify_mode.as_str() {
-        "auto" => ClassifyMode::Auto,
-        "force-all-variant" => ClassifyMode::ForceAllVariant,
-        other => {
-            eprintln!("ERROR: --classify-mode must be auto or force-all-variant (got {other})");
-            std::process::exit(2);
-        }
-    };
+    let classify_mode = args.classify_mode;
     let contracts =
         collect_bytecodes(Path::new(&args.bench_dir), args.start_block, args.block_count);
     eprintln!("Collected {} compilable bytecodes", contracts.len());
@@ -429,7 +420,7 @@ fn main() {
             fallback_count: run.fallback_count,
             grouping: Some(GroupingStatsOut {
                 skeleton_mode: args.skeleton_mode.as_str().to_string(),
-                classify_mode: args.classify_mode.clone(),
+                classify_mode: classify_mode.as_str().to_string(),
                 realized_families: run.realized_families,
                 per_hash_units: run.per_hash_units,
                 g1_rejected_skeletons: run.stats.g1_rejected_skeletons,
