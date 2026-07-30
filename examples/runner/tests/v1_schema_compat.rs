@@ -9,7 +9,7 @@ use std::path::Path;
 
 #[test]
 fn eth_v1_state_decodes() {
-    let path = Path::new("/home/ubuntu/sipeng/bench_data_eth_v1/states/23000000.bin");
+    let path = Path::new("/home/ubuntu/sipeng/bench_data_eth/states/23000000.bin");
     let snap = skelot_common::load_state_v1(path).expect("decode eth v1");
     assert_eq!(snap.block_number, 23_000_000);
     assert!(!snap.codes.is_empty(), "expected >=1 code in eth v1 state");
@@ -26,7 +26,7 @@ fn eth_v1_state_decodes() {
 
 #[test]
 fn bsc_v1_state_decodes() {
-    let path = Path::new("/home/ubuntu/sipeng/bench_data_bsc_v1/states/95897884.bin");
+    let path = Path::new("/home/ubuntu/sipeng/bench_data_bsc/states/95897884.bin");
     let snap = skelot_common::load_state_v1(path).expect("decode bsc v1");
     assert_eq!(snap.block_number, 95_897_884);
     assert!(!snap.codes.is_empty(), "expected >=1 code in bsc v1 state");
@@ -34,10 +34,10 @@ fn bsc_v1_state_decodes() {
 
 #[test]
 fn manifest_reports_v1_schema() {
-    let m = skelot_common::read_bench_manifest(Path::new("/home/ubuntu/sipeng/bench_data_eth_v1"))
+    let m = skelot_common::read_bench_manifest(Path::new("/home/ubuntu/sipeng/bench_data_eth"))
         .expect("eth manifest");
     assert_eq!(m.schema_version, 1);
-    let m = skelot_common::read_bench_manifest(Path::new("/home/ubuntu/sipeng/bench_data_bsc_v1"))
+    let m = skelot_common::read_bench_manifest(Path::new("/home/ubuntu/sipeng/bench_data_bsc"))
         .expect("bsc manifest");
     assert_eq!(m.schema_version, 1);
 }

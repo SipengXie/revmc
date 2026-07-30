@@ -243,6 +243,7 @@ fn main() {
         skelot_common::ChainId::Base => (38_004_930u64, 10_000u64),
         skelot_common::ChainId::Eth => (23_000_000, 1_000),
         skelot_common::ChainId::Bsc => (95_897_884, 1_000),
+        skelot_common::ChainId::Arb => (458_863_320, 10_000),
     };
     let start_block = args.start_block.unwrap_or(default_start);
     let block_count = args.block_count.unwrap_or(default_count);

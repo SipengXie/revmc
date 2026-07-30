@@ -16,11 +16,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use revm::primitives::{Address, B256};
 use serde::Serialize;
 
-use crate::skelot_common::{iter_bytecode_raw, load_state_v1, should_skip_bytes, ChainId};
+use crate::skelot_common::{
+    extract_emse_skeleton, extract_opcode_skeleton, hash_bytes, iter_bytecode_raw, load_state_v1,
+    should_skip_bytes, ChainId,
+};
 
 static RPC_URL: OnceLock<String> = OnceLock::new();
 static RATE: OnceLock<RateLimiter> = OnceLock::new();
@@ -50,8 +53,25 @@ struct Args {
     rps: f64,
     #[arg(long, default_value_t = 42u64)]
     seed: u64,
+    #[arg(long, value_enum, default_value = "current")]
+    skeleton_mode: SkeletonMode,
     #[arg(long)]
     out: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum SkeletonMode {
+    Current,
+    Emse,
+}
+
+impl SkeletonMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            SkeletonMode::Current => "current",
+            SkeletonMode::Emse => "emse",
+        }
+    }
 }
 
 fn resolve_rpc_url(chain: ChainId, override_url: Option<&str>, api_key_env: &str) -> String {
@@ -64,6 +84,7 @@ fn resolve_rpc_url(chain: ChainId, override_url: Option<&str>, api_key_env: &str
         ChainId::Eth => format!("https://eth-mainnet.g.alchemy.com/v2/{key}"),
         ChainId::Bsc if key.is_empty() => "https://bsc-dataseed.binance.org/".to_string(),
         ChainId::Bsc => format!("https://bnb-mainnet.g.alchemy.com/v2/{key}"),
+        ChainId::Arb => format!("https://arb-mainnet.g.alchemy.com/v2/{key}"),
     }
 }
 
@@ -74,6 +95,7 @@ fn classify_rpc(chain: ChainId, has_override: bool, url: &str) -> &'static str {
     match chain {
         ChainId::Base => "alchemy_base",
         ChainId::Eth => "alchemy_eth",
+        ChainId::Arb => "alchemy_arb",
         ChainId::Bsc => {
             if url.contains("bsc-dataseed") {
                 "bsc_dataseed"
@@ -128,21 +150,11 @@ impl RateLimiter {
     }
 }
 
-fn hash_skeleton(bytes: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut skeleton = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let op = bytes[i];
-        skeleton.push(op);
-        i += 1;
-        if (0x60..=0x7f).contains(&op) {
-            i += (op - 0x5f) as usize;
-        }
+fn hash_skeleton_for_mode(bytes: &[u8], mode: SkeletonMode) -> u64 {
+    match mode {
+        SkeletonMode::Current => hash_bytes(&extract_opcode_skeleton(bytes)),
+        SkeletonMode::Emse => hash_bytes(&extract_emse_skeleton(bytes)),
     }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    skeleton.hash(&mut hasher);
-    hasher.finish()
 }
 
 fn rpc_call(method: &str, params: serde_json::Value) -> serde_json::Value {
@@ -233,6 +245,7 @@ fn probe_archive_rpc(chain: ChainId) {
         ChainId::Base => ("0x4200000000000000000000000000000000000006", 1_000_000u64),
         ChainId::Eth => ("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", 14_000_000),
         ChainId::Bsc => ("0x10ED43C718714eb63d5aA57B78B54704E256024E", 8_000_000),
+        ChainId::Arb => ("0x1F98431c8aD98523631AE4a59f267346ea31F984", 100_000),
     };
     let v = rpc_call("eth_getCode", serde_json::json!([addr, format!("0x{block:x}")]));
     let code: String = serde_json::from_value(v["result"].clone()).unwrap_or_default();
@@ -276,6 +289,7 @@ struct FamilySpan {
 struct DeploymentSpansOut {
     chain: String,
     rpc_url_kind: String,
+    skeleton_mode: String,
     seed: u64,
     top_n: usize,
     sample_per_group: usize,
@@ -306,9 +320,10 @@ fn main() {
     probe_archive_rpc(chain);
 
     let (default_dir, default_start, default_count) = match chain {
-        ChainId::Base => ("/home/ubuntu/sipeng/bench_data", 38_004_930u64, 9_997u64),
-        ChainId::Eth => ("/home/ubuntu/sipeng/bench_data_eth_v1", 23_000_000, 1_000),
-        ChainId::Bsc => ("/home/ubuntu/sipeng/bench_data_bsc_v1", 95_897_884, 1_000),
+        ChainId::Base => ("/home/ubuntu/sipeng/bench_data_base", 38_004_930u64, 9_997u64),
+        ChainId::Eth => ("/home/ubuntu/sipeng/bench_data_eth", 23_000_000, 10_000),
+        ChainId::Bsc => ("/home/ubuntu/sipeng/bench_data_bsc", 95_897_884, 10_000),
+        ChainId::Arb => ("/home/ubuntu/sipeng/bench_data_arb", 458_863_320, 10_000),
     };
     let dir = args.bench_dir.unwrap_or_else(|| default_dir.to_string());
     let bench_dir = Path::new(&dir);
@@ -353,14 +368,17 @@ fn main() {
         all_codes.len(),
         code_hash_to_addr.len()
     );
+    eprintln!("[deployment_span] skeleton_mode={}", args.skeleton_mode.as_str());
 
-    // Group by skeleton
     let mut skeleton_groups: HashMap<u64, Vec<B256>> = HashMap::new();
     for (hash, bytes) in &all_codes {
         if bytes.is_empty() {
             continue;
         }
-        skeleton_groups.entry(hash_skeleton(bytes)).or_default().push(*hash);
+        skeleton_groups
+            .entry(hash_skeleton_for_mode(bytes, args.skeleton_mode))
+            .or_default()
+            .push(*hash);
     }
     let mut dup_groups: Vec<(u64, Vec<B256>)> =
         skeleton_groups.into_iter().filter(|(_, m)| m.len() >= 2).collect();
@@ -517,6 +535,7 @@ fn main() {
     let out = DeploymentSpansOut {
         chain: chain.as_lowercase().to_string(),
         rpc_url_kind: rpc_kind,
+        skeleton_mode: args.skeleton_mode.as_str().to_string(),
         seed: args.seed,
         top_n: args.top,
         sample_per_group: args.sample_per_group,

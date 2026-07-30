@@ -32,6 +32,7 @@ pub enum ChainId {
     Base,
     Eth,
     Bsc,
+    Arb,
 }
 
 impl ChainId {
@@ -40,7 +41,8 @@ impl ChainId {
             8453 => ChainId::Base,
             1 => ChainId::Eth,
             56 => ChainId::Bsc,
-            other => panic!("unsupported chain_id {other}; expected 1, 56, or 8453"),
+            42161 => ChainId::Arb,
+            other => panic!("unsupported chain_id {other}; expected 1, 56, 8453, or 42161"),
         }
     }
 
@@ -49,6 +51,7 @@ impl ChainId {
             ChainId::Base => "base",
             ChainId::Eth => "eth",
             ChainId::Bsc => "bsc",
+            ChainId::Arb => "arb",
         }
     }
 }
@@ -61,7 +64,8 @@ impl std::str::FromStr for ChainId {
             "base" => Ok(ChainId::Base),
             "eth" | "ethereum" | "mainnet" => Ok(ChainId::Eth),
             "bsc" | "bnb" => Ok(ChainId::Bsc),
-            _ => Err(format!("unknown chain '{s}', expected base|eth|bsc")),
+            "arb" | "arbitrum" => Ok(ChainId::Arb),
+            _ => Err(format!("unknown chain '{s}', expected base|eth|bsc|arb")),
         }
     }
 }
@@ -153,8 +157,7 @@ pub fn extract_opcode_skeleton_with_counts(bytes: &[u8]) -> (Vec<u8>, usize, usi
 /// while preserving bytecode length. This is intentionally not used for
 /// skeleton compilation until CODESIZE is runtime-indirect.
 pub fn extract_emse_skeleton(bytes: &[u8]) -> Vec<u8> {
-    let code = strip_solidity_cbor_metadata(bytes);
-    let code = strip_trailing_zeroes(code);
+    let code = strip_emse_suffixes(bytes);
     let mut skeleton = Vec::with_capacity(code.len());
     let mut i = 0;
     while i < code.len() {
@@ -169,6 +172,10 @@ pub fn extract_emse_skeleton(bytes: &[u8]) -> Vec<u8> {
         }
     }
     skeleton
+}
+
+pub fn strip_emse_suffixes(bytes: &[u8]) -> &[u8] {
+    strip_trailing_zeroes(strip_solidity_cbor_metadata(bytes))
 }
 
 fn strip_solidity_cbor_metadata(bytes: &[u8]) -> &[u8] {
@@ -985,6 +992,15 @@ mod stratified_tests {
     }
 
     #[test]
+    fn strip_emse_suffixes_matches_emse_skeleton_code_view() {
+        let bytecode = with_metadata(
+            vec![0x60, 0x2a, 0x01, 0x00, 0x00],
+            &[0xa1, 0x64, b's', b'o', b'l', b'c', 0x43, 0x00, 0x08, 0x11],
+        );
+        assert_eq!(strip_emse_suffixes(&bytecode), &[0x60, 0x2a, 0x01]);
+    }
+
+    #[test]
     fn emse_skeleton_groups_eip1167_minimal_proxy_variants() {
         let proxy_a = hex::decode(
             "363d3d373d3d3d363d7311111111111111111111111111111111111111115af43d82803e903d91602b57fd5bf3",
@@ -1043,6 +1059,7 @@ mod stratified_tests {
         assert_eq!(ChainId::from_chain_id(8453), ChainId::Base);
         assert_eq!(ChainId::from_chain_id(1), ChainId::Eth);
         assert_eq!(ChainId::from_chain_id(56), ChainId::Bsc);
+        assert_eq!(ChainId::from_chain_id(42161), ChainId::Arb);
     }
 
     #[test]
@@ -1052,6 +1069,8 @@ mod stratified_tests {
         assert_eq!(ChainId::from_str("base").unwrap(), ChainId::Base);
         assert_eq!(ChainId::from_str("eth").unwrap(), ChainId::Eth);
         assert_eq!(ChainId::from_str("bsc").unwrap(), ChainId::Bsc);
+        assert_eq!(ChainId::from_str("arb").unwrap(), ChainId::Arb);
+        assert_eq!(ChainId::from_str("arbitrum").unwrap(), ChainId::Arb);
         assert!(ChainId::from_str("xyz").is_err());
     }
 
@@ -1061,6 +1080,7 @@ mod stratified_tests {
         assert_eq!(spec_tag_for_chain(ChainId::Base), "base");
         assert_eq!(spec_tag_for_chain(ChainId::Eth), "eth");
         assert_eq!(spec_tag_for_chain(ChainId::Bsc), "bsc");
+        assert_eq!(spec_tag_for_chain(ChainId::Arb), "arb");
         let base = spec_tag_for_chain(ChainId::Base);
         assert!(
             !base.contains("isthmus") && !base.contains("prague"),

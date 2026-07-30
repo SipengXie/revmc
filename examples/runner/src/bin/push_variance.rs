@@ -13,10 +13,13 @@ mod skelot_common;
 
 use std::collections::HashMap;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use revm::primitives::B256;
 
-use crate::skelot_common::{iter_bytecode_raw, load_state_v1, should_skip_bytes, ChainId};
+use crate::skelot_common::{
+    extract_emse_skeleton, hash_bytes, iter_bytecode_raw, load_state_v1, should_skip_bytes,
+    strip_emse_suffixes, ChainId,
+};
 
 /// A single PUSH instruction's position and value in a bytecode.
 #[derive(Clone)]
@@ -71,6 +74,39 @@ fn hash_skeleton(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum SkeletonMode {
+    Current,
+    Emse,
+}
+
+impl SkeletonMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            SkeletonMode::Current => "current",
+            SkeletonMode::Emse => "emse",
+        }
+    }
+}
+
+fn hash_skeleton_for_mode(bytes: &[u8], mode: SkeletonMode) -> u64 {
+    match mode {
+        SkeletonMode::Current => hash_skeleton(bytes),
+        SkeletonMode::Emse => hash_bytes(&extract_emse_skeleton(bytes)),
+    }
+}
+
+fn bytecode_view_for_mode(bytes: &[u8], mode: SkeletonMode) -> &[u8] {
+    match mode {
+        SkeletonMode::Current => bytes,
+        SkeletonMode::Emse => strip_emse_suffixes(bytes),
+    }
+}
+
+fn extract_pushes_for_mode(bytes: &[u8], mode: SkeletonMode) -> Vec<PushInfo> {
+    extract_pushes(bytecode_view_for_mode(bytes, mode))
+}
+
 #[derive(Parser)]
 #[command(name = "push_variance")]
 struct Args {
@@ -82,15 +118,18 @@ struct Args {
     start_block: Option<u64>,
     #[arg(long)]
     block_count: Option<u64>,
+    #[arg(long, value_enum, default_value = "current")]
+    skeleton_mode: SkeletonMode,
 }
 
 fn main() {
     let args = Args::parse();
     let chain: ChainId = args.chain.parse().expect("invalid --chain");
     let (default_dir, default_start, default_count) = match chain {
-        ChainId::Base => ("/home/ubuntu/sipeng/bench_data", 38_004_930u64, 9_997u64),
-        ChainId::Eth => ("/home/ubuntu/sipeng/bench_data_eth_v1", 23_000_000, 1_000),
-        ChainId::Bsc => ("/home/ubuntu/sipeng/bench_data_bsc_v1", 95_897_884, 1_000),
+        ChainId::Base => ("/home/ubuntu/sipeng/bench_data_base", 38_004_930u64, 9_997u64),
+        ChainId::Eth => ("/home/ubuntu/sipeng/bench_data_eth", 23_000_000, 10_000),
+        ChainId::Bsc => ("/home/ubuntu/sipeng/bench_data_bsc", 95_897_884, 10_000),
+        ChainId::Arb => ("/home/ubuntu/sipeng/bench_data_arb", 458_863_320, 10_000),
     };
     let dir = args.bench_dir.unwrap_or_else(|| default_dir.to_string());
     let bench_dir = std::path::Path::new(&dir);
@@ -98,8 +137,9 @@ fn main() {
     let count = args.block_count.unwrap_or(default_count);
     let end = start + count;
     eprintln!(
-        "[push_variance] chain={} blocks {start}..{end} ({count} blocks)",
-        chain.as_lowercase()
+        "[push_variance] chain={} skeleton_mode={} blocks {start}..{end} ({count} blocks)",
+        chain.as_lowercase(),
+        args.skeleton_mode.as_str()
     );
 
     // Phase 1: collect unique bytecodes
@@ -130,7 +170,7 @@ fn main() {
         if bytes.is_empty() {
             continue;
         }
-        let skel_hash = hash_skeleton(bytes);
+        let skel_hash = hash_skeleton_for_mode(bytes, args.skeleton_mode);
         skeleton_groups.entry(skel_hash).or_default().push((*hash, bytes.clone()));
     }
 
@@ -165,11 +205,11 @@ fn main() {
     let detail_count = 20;
     for (rank, (skel_hash, members)) in dup_groups.iter().enumerate() {
         let n = members.len();
-        let bytecode_len = members[0].1.len();
+        let bytecode_len = bytecode_view_for_mode(&members[0].1, args.skeleton_mode).len();
 
         // Extract pushes for all members
         let all_pushes: Vec<Vec<PushInfo>> =
-            members.iter().map(|(_, b)| extract_pushes(b)).collect();
+            members.iter().map(|(_, b)| extract_pushes_for_mode(b, args.skeleton_mode)).collect();
 
         // Use first member as reference
         let ref_pushes = &all_pushes[0];
@@ -415,7 +455,7 @@ fn main() {
     for (rank, (_skel_hash, members)) in dup_groups.iter().enumerate() {
         let n = members.len();
         let all_pushes: Vec<Vec<PushInfo>> =
-            members.iter().map(|(_, b)| extract_pushes(b)).collect();
+            members.iter().map(|(_, b)| extract_pushes_for_mode(b, args.skeleton_mode)).collect();
         let ref_pushes = &all_pushes[0];
         let n_pushes = ref_pushes.len();
 
@@ -642,7 +682,7 @@ fn main() {
 
         // Track which bytecodes are outliers on any position
         let all_pushes: Vec<Vec<PushInfo>> =
-            members.iter().map(|(_, b)| extract_pushes(b)).collect();
+            members.iter().map(|(_, b)| extract_pushes_for_mode(b, args.skeleton_mode)).collect();
 
         let mut outlier_bytecodes = std::collections::HashSet::new();
 
@@ -654,8 +694,7 @@ fn main() {
                     max_outliers = v.outlier_count;
                 }
                 // Find which bytecodes are outliers at this position
-                let ref_pushes_for_pos = &all_pushes[0];
-                if let Some(ref_push) = ref_pushes_for_pos.get(v.push_idx) {
+                if all_pushes[0].get(v.push_idx).is_some() {
                     // Find majority value
                     let mut value_counts: HashMap<Vec<u8>, usize> = HashMap::new();
                     for pushes in &all_pushes {
@@ -730,4 +769,74 @@ fn main() {
             0.0
         }
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_metadata(mut code: Vec<u8>, metadata: &[u8]) -> Vec<u8> {
+        code.extend_from_slice(metadata);
+        code.extend_from_slice(&(metadata.len() as u16).to_be_bytes());
+        code
+    }
+
+    #[test]
+    fn current_mode_matches_legacy_skeleton_grouping() {
+        let a = vec![0x60, 0x11, 0x01];
+        let b = vec![0x60, 0x22, 0x01];
+        let with_suffix =
+            with_metadata(a.clone(), &[0xa1, 0x64, b's', b'o', b'l', b'c', 0x43, 0x00, 0x08, 0x11]);
+
+        assert_eq!(hash_skeleton_for_mode(&a, SkeletonMode::Current), hash_skeleton(&a));
+        assert_eq!(hash_skeleton_for_mode(&b, SkeletonMode::Current), hash_skeleton(&b));
+        assert_eq!(
+            hash_skeleton_for_mode(&a, SkeletonMode::Current),
+            hash_skeleton_for_mode(&b, SkeletonMode::Current)
+        );
+        assert_ne!(
+            hash_skeleton_for_mode(&a, SkeletonMode::Current),
+            hash_skeleton_for_mode(&with_suffix, SkeletonMode::Current)
+        );
+    }
+
+    #[test]
+    fn emse_groups_bytecodes_differing_only_in_metadata_or_trailing_zeroes() {
+        let with_metadata = with_metadata(
+            vec![0x60, 0x11, 0x01],
+            &[0xa1, 0x64, b's', b'o', b'l', b'c', 0x43, 0x00, 0x08, 0x11],
+        );
+        let with_trailing_zeroes = vec![0x60, 0x11, 0x01, 0x00, 0x00];
+
+        assert_ne!(
+            hash_skeleton_for_mode(&with_metadata, SkeletonMode::Current),
+            hash_skeleton_for_mode(&with_trailing_zeroes, SkeletonMode::Current)
+        );
+        assert_eq!(
+            hash_skeleton_for_mode(&with_metadata, SkeletonMode::Emse),
+            hash_skeleton_for_mode(&with_trailing_zeroes, SkeletonMode::Emse)
+        );
+    }
+
+    #[test]
+    fn emse_extracts_push_positions_from_stripped_code_view() {
+        let bytecode = with_metadata(
+            vec![0x60, 0xaa, 0x61, 0xbb, 0xcc, 0x01, 0x00, 0x00],
+            &[0xa1, 0x64, b's', b'o', b'l', b'c', 0x43, 0x00, 0x08, 0x11],
+        );
+
+        assert_eq!(
+            bytecode_view_for_mode(&bytecode, SkeletonMode::Emse),
+            &[0x60, 0xaa, 0x61, 0xbb, 0xcc, 0x01]
+        );
+
+        let pushes = extract_pushes_for_mode(&bytecode, SkeletonMode::Emse);
+        assert_eq!(pushes.len(), 2);
+        assert_eq!(pushes[0].opcode_index, 0);
+        assert_eq!(pushes[0].opcode, 0x60);
+        assert_eq!(pushes[0].value, vec![0xaa]);
+        assert_eq!(pushes[1].opcode_index, 1);
+        assert_eq!(pushes[1].opcode, 0x61);
+        assert_eq!(pushes[1].value, vec![0xbb, 0xcc]);
+    }
 }
