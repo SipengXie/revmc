@@ -50,6 +50,30 @@ pub enum ClassifyMode {
     ForceAllVariant,
 }
 
+impl ClassifyMode {
+    /// Stable tag used in CLI flags, logs, and cache-file names.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClassifyMode::Auto => "auto",
+            ClassifyMode::ForceAllVariant => "force-all-variant",
+        }
+    }
+}
+
+impl core::str::FromStr for ClassifyMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(ClassifyMode::Auto),
+            "force-all-variant" => Ok(ClassifyMode::ForceAllVariant),
+            other => {
+                Err(format!("unknown classify mode '{other}', expected auto|force-all-variant"))
+            }
+        }
+    }
+}
+
 /// Analyze a group of bytecodes sharing the same opcode skeleton.
 /// Compares PUSH1..PUSH32 immediates across all instances to classify each as
 /// Invariant (same value everywhere) or Variant (differs in at least one instance).
