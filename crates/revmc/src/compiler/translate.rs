@@ -794,11 +794,17 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 self.call_fallible_builtin(Builtin::CallDataCopy, &[self.ecx, sp]);
             }
             op::CODESIZE => {
-                // TODO(emse-compile): see skelot_common.rs - replace baked-in
-                // length with EvmContext.bytecode_len read so metadata-variant
-                // family members can share a compiled artifact safely.
+                // Loaded from EvmContext at runtime (not baked in at compile
+                // time) so EMSE skeleton members with differing metadata/zero
+                // suffix lengths can share one compiled artifact.
+                let bytecode_len_ptr = get_field(
+                    &mut self.bcx,
+                    self.ecx,
+                    mem::offset_of!(EvmContext<'_>, bytecode_len),
+                    "ecx.bytecode_len.addr",
+                );
                 let bytecode_len =
-                    self.bcx.uconst(self.isize_type, self.bytecode.code.len() as u64);
+                    self.bcx.load(self.isize_type, bytecode_len_ptr, "bytecode_len");
                 let size = self.call_builtin(Builtin::CodeSize, &[bytecode_len]).unwrap();
                 let size = self.bcx.zext(self.word_type, size);
                 self.push(size);
