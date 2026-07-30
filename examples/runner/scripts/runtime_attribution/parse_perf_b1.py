@@ -24,7 +24,11 @@ MODES = ["per_hash", "skeleton"]
 
 
 def parse_perf_stat(path: Path) -> dict[str, float]:
-    """Parse perf stat -x, output. Lines: count,unit,event,running,running_pct,..."""
+    """Parse perf stat -x, output.
+
+    Fields: counter value, unit, event name, run time (ns), percentage of
+    time the counter was running, optional derived metric, metric unit.
+    """
     counts: dict[str, float] = {}
     if not path.exists():
         return counts
@@ -40,18 +44,23 @@ def parse_perf_stat(path: Path) -> dict[str, float]:
             continue
         event = parts[2]
         # Track running fraction so multiplexing is visible
-        running_pct = parts[5] if len(parts) > 5 else ""
+        running_pct = parts[4] if len(parts) > 4 else ""
         counts[event] = count
         counts[f"{event}__running_pct"] = float(running_pct) if running_pct else 100.0
     return counts
 
 
 def main():
+    # perf_b1.sh writes perf_<mode>_<event_set>.<RUN_TAG>.stat; fall back to
+    # the legacy untagged name for stat files produced before RUN_TAG existed.
+    run_tag = os.environ.get("RUN_TAG", "r1")
     grid: dict[str, dict[str, dict[str, float]]] = {}
     for mode in MODES:
         grid[mode] = {}
         for es in EVENT_SETS:
-            stat = OUT / f"perf_{mode}_{es}.stat"
+            stat = OUT / f"perf_{mode}_{es}.{run_tag}.stat"
+            if not stat.exists():
+                stat = OUT / f"perf_{mode}_{es}.stat"
             grid[mode][es] = parse_perf_stat(stat)
 
     # Aggregate per-event into a single per-mode flat dict

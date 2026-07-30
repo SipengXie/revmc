@@ -47,6 +47,8 @@ run_one() {
     local fifo
     fifo=$(mktemp -u /tmp/perf_b1_fifo_XXXXXX)
     mkfifo "$fifo"
+    local perf_pid_file
+    perf_pid_file=$(mktemp /tmp/perf_b1_pid_XXXXXX)
 
     # Start bench in background; stdout to bench_log, stderr to fifo
     (
@@ -75,6 +77,7 @@ run_one() {
                     perf stat -x, -o "$stat" -e "$events" -p "$bench_pid" \
                     >> "$perf_log" 2>&1 &
                 local perf_pid=$!
+                echo "$perf_pid" > "$perf_pid_file"
                 echo "perf pid: $perf_pid" >> "$perf_log"
             fi
         done < "$fifo"
@@ -86,7 +89,16 @@ run_one() {
     echo "bench exited rc=$bench_rc" >> "$perf_log"
     # Reader will EOF when fifo writer (bench) closes; wait for it
     wait "$reader_pid" 2>/dev/null || true
-    rm -f "$fifo"
+    # perf is a grandchild (spawned inside the reader subshell) so `wait`
+    # can't reach it; poll until it has exited and flushed the stat file.
+    if [[ -s "$perf_pid_file" ]]; then
+        local perf_pid
+        perf_pid=$(cat "$perf_pid_file")
+        while kill -0 "$perf_pid" 2>/dev/null; do
+            sleep 0.1
+        done
+    fi
+    rm -f "$fifo" "$perf_pid_file"
     echo "stat written: $stat"
     cat "$stat"
 }

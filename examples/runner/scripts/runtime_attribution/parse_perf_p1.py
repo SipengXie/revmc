@@ -181,8 +181,10 @@ def main():
                 "delta_icache_tag_stalls": d_ict,
                 "delta_dsb2mite_penalty_cycles": d_dsb,
                 "delta_stalls_total_backend": d_total,
-                "delta_frontend_attributed": d_icd + d_ict - d_dsb,
-                "frontend_share_of_cyc_delta": (d_icd + d_ict - d_dsb) / delta_cyc
+                # DSB->MITE switch penalty cycles are frontend stalls too:
+                # they add into the frontend attribution, not subtract.
+                "delta_frontend_attributed": d_icd + d_ict + d_dsb,
+                "frontend_share_of_cyc_delta": (d_icd + d_ict + d_dsb) / delta_cyc
                 if delta_cyc != 0
                 else None,
                 "interpretation": (
