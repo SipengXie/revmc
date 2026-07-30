@@ -23,6 +23,7 @@ use revm::{
     primitives::{Address, B256, HashMap as RevmHashMap, U256},
     state::AccountInfo,
 };
+use revmc::emse::{bytecode_view, group_skeleton_families, SkeletonMode};
 use revmc::skeleton::{analyze_skeleton_group, build_data_table, SkeletonVariance};
 use revmc::{EvmCompiler, EvmLlvmBackend, OptimizationLevel};
 use serde::{Deserialize, Serialize};
@@ -74,27 +75,6 @@ struct RegistryGroup {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
-
-fn extract_opcode_skeleton(bytes: &[u8]) -> Vec<u8> {
-    let mut skeleton = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let op = bytes[i];
-        skeleton.push(op);
-        i += 1;
-        if op >= 0x60 && op <= 0x7f {
-            i += (op - 0x5f) as usize;
-        }
-    }
-    skeleton
-}
-
-fn hash_bytes(bytes: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
-}
 
 fn opt_tag(opt: OptimizationLevel) -> &'static str {
     match opt {
@@ -218,6 +198,13 @@ struct Args {
     /// Optimization level: 0=None, 1=Less, 2=Default, 3=Aggressive
     #[arg(long, default_value_t = 3)]
     opt_level: u8,
+
+    /// Family boundary: "current" (PUSH-immediates-only) or "emse" (also
+    /// strips CBOR metadata + trailing zeros; admission guards apply).
+    /// Use a separate --cache-dir per mode — registry and data-table file
+    /// names are shared.
+    #[arg(long, default_value = "current")]
+    skeleton_mode: SkeletonMode,
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -286,35 +273,33 @@ fn main() {
     // ── Phase 2: Group by skeleton, classify ────────────────────────────
     println!("--- Phase 2: Skeleton grouping ---");
     let t1 = Instant::now();
-    let mut skeleton_groups: HashMap<u64, Vec<(B256, Vec<u8>)>> = HashMap::new();
-    for (hash, bytes) in &all_codes {
-        let skel = extract_opcode_skeleton(bytes);
-        let skel_hash = hash_bytes(&skel);
-        skeleton_groups
-            .entry(skel_hash)
-            .or_default()
-            .push((*hash, bytes.clone()));
-    }
-
-    // Split into singletons vs groups
-    let mut singletons: Vec<(B256, Vec<u8>)> = Vec::new();
-    let mut groups: Vec<(u64, Vec<(B256, Vec<u8>)>)> = Vec::new();
-    for (skel_hash, members) in skeleton_groups {
-        if members.len() >= 2 {
-            groups.push((skel_hash, members));
-        } else {
-            singletons.push(members.into_iter().next().unwrap());
-        }
-    }
-    groups.sort_by_key(|(_, m)| std::cmp::Reverse(m.len()));
+    // Shared grouping: hash buckets are verified by full skeleton-byte
+    // equality (colliding buckets split); under EMSE the g1/g2 admission
+    // guards run here and rejected members fall back to per-hash.
+    let grouping = group_skeleton_families(&all_codes, args.skeleton_mode);
+    let singletons: Vec<(B256, Vec<u8>)> =
+        grouping.per_hash.iter().map(|h| (*h, all_codes[h].clone())).collect();
+    let groups: Vec<(u64, Vec<(B256, Vec<u8>)>)> = grouping
+        .families
+        .iter()
+        .map(|f| (f.skel_hash, f.members.iter().map(|h| (*h, all_codes[h].clone())).collect()))
+        .collect();
 
     let group_member_count: usize = groups.iter().map(|(_, m)| m.len()).sum();
     println!(
-        "  {} singletons + {} groups ({} contracts) = {} total",
+        "  {} per-hash units + {} groups ({} contracts) = {} total [mode={}]",
         singletons.len(),
         groups.len(),
         group_member_count,
         singletons.len() + group_member_count,
+        args.skeleton_mode.as_str(),
+    );
+    println!(
+        "  admission: g1 rejected {} skeletons ({} members), g2 rejected {} members, {} collision groups split",
+        grouping.stats.g1_rejected_skeletons,
+        grouping.stats.g1_rejected_members,
+        grouping.stats.g2_rejected_members,
+        grouping.stats.collision_groups_split,
     );
     for (i, (sh, m)) in groups.iter().enumerate().take(10) {
         println!("    {:016x}: {} copies", sh, m.len());
@@ -323,11 +308,12 @@ fn main() {
         }
     }
 
-    // Analyze variance for each group
+    // Analyze variance for each group over the mode's bytecode view
     let group_variances: Vec<(u64, Vec<(B256, Vec<u8>)>, SkeletonVariance)> = groups
         .into_iter()
         .map(|(skel_hash, members)| {
-            let refs: Vec<&[u8]> = members.iter().map(|(_, b)| b.as_slice()).collect();
+            let refs: Vec<&[u8]> =
+                members.iter().map(|(_, b)| bytecode_view(b, args.skeleton_mode)).collect();
             let variance = analyze_skeleton_group(&refs);
             (skel_hash, members, variance)
         })
@@ -362,7 +348,11 @@ fn main() {
         if lib.exists() {
             group_cached += 1;
         } else {
-            group_to_compile.push((*skel_hash, members[0].1.clone(), variance.clone()));
+            group_to_compile.push((
+                *skel_hash,
+                bytecode_view(&members[0].1, args.skeleton_mode).to_vec(),
+                variance.clone(),
+            ));
         }
         let variance_map: Vec<i32> = variance.pushes.iter().map(|p| {
             match p {
@@ -492,7 +482,7 @@ fn main() {
     save_registry(&cache_dir, &registry_groups);
 
     // ── Phase 5b: Save pre-serialized data tables ──────────────────────
-    save_data_tables(&cache_dir, &group_variances);
+    save_data_tables(&cache_dir, &group_variances, args.skeleton_mode);
 
     // ── Summary ─────────────────────────────────────────────────────────
     println!("\n=== Summary ===");
@@ -515,11 +505,12 @@ fn main() {
 fn save_data_tables(
     cache_dir: &Path,
     group_variances: &[(u64, Vec<(B256, Vec<u8>)>, SkeletonVariance)],
+    skeleton_mode: SkeletonMode,
 ) {
     let mut data_tables: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
     for (_skel_hash, members, variance) in group_variances {
         for (code_hash, bytecode) in members {
-            let table = build_data_table(bytecode, variance);
+            let table = build_data_table(bytecode_view(bytecode, skeleton_mode), variance);
             data_tables.insert(code_hash.0, table.data);
         }
     }

@@ -31,6 +31,7 @@ use revm::bytecode::Bytecode;
 use revm::database::EmptyDB;
 use revm::handler::{EvmTr, FrameResult, Handler, ItemOrResult};
 use revm::primitives::B256;
+use revmc::emse::{bytecode_view, group_skeleton_families, SkeletonMode};
 use revmc::skeleton::{
     analyze_skeleton_group, build_data_table, PushClassification, SkeletonVariance,
 };
@@ -54,6 +55,12 @@ struct Cli {
     alpha: f64,
     #[arg(long)]
     out: Option<String>,
+    /// Family boundary: "current" (PUSH-immediates-only) or "emse" (also
+    /// strips CBOR metadata + trailing zeros; admission guards apply).
+    /// Use a separate cache dir per mode (skeleton .so names collide only
+    /// within a mode's hash space, but the registry file name is shared).
+    #[arg(long, default_value = "current")]
+    skeleton_mode: SkeletonMode,
 }
 
 // ── JSON output schema ──────────────────────────────────────────────────────
@@ -124,27 +131,6 @@ use bin_common::{
 };
 
 const OPT: OptimizationLevel = OptimizationLevel::Aggressive;
-
-fn extract_opcode_skeleton(bytes: &[u8]) -> Vec<u8> {
-    let mut skeleton = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let op = bytes[i];
-        skeleton.push(op);
-        i += 1;
-        if op >= 0x60 && op <= 0x7f {
-            i += (op - 0x5f) as usize;
-        }
-    }
-    skeleton
-}
-
-fn hash_bytes(bytes: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
-}
 
 fn opt_tag(opt: OptimizationLevel) -> &'static str {
     match opt {
@@ -441,34 +427,43 @@ fn main() {
         .map(|(h, bc)| (*h, bc.original_byte_slice().to_vec()))
         .collect();
 
-    let mut skeleton_groups_raw: HashMap<u64, Vec<(B256, Vec<u8>)>> = HashMap::new();
-    for (hash, bytes) in &all_codes {
-        let skel = extract_opcode_skeleton(bytes);
-        let skel_hash = hash_bytes(&skel);
-        skeleton_groups_raw.entry(skel_hash).or_default().push((*hash, bytes.clone()));
-    }
+    // Shared grouping: hash buckets verified by full skeleton-byte equality;
+    // under EMSE the g1/g2 admission guards run here and rejected members
+    // stay on the per-hash path.
+    let grouping = group_skeleton_families(&all_codes, cli.skeleton_mode);
+    println!(
+        "  admission ({}): g1 rejected {} skeletons ({} members), g2 rejected {} members, {} collision groups split",
+        cli.skeleton_mode.as_str(),
+        grouping.stats.g1_rejected_skeletons,
+        grouping.stats.g1_rejected_members,
+        grouping.stats.g2_rejected_members,
+        grouping.stats.collision_groups_split,
+    );
 
-    let mut dup_groups: Vec<_> =
-        skeleton_groups_raw.into_iter().filter(|(_, members)| members.len() >= 2).collect();
-    dup_groups.sort_by_key(|(_, m)| std::cmp::Reverse(m.len()));
-
-    if dup_groups.is_empty() {
+    if grouping.families.is_empty() {
         println!("No duplicated skeletons found.");
         return;
     }
 
-    // Analyze variance for each group
+    // Analyze variance for each group over the mode's bytecode view
     struct AnalyzedGroup {
         skel_hash: u64,
         members: Vec<(B256, Vec<u8>)>,
         variance: SkeletonVariance,
     }
-    let analyzed: Vec<AnalyzedGroup> = dup_groups
+    let analyzed: Vec<AnalyzedGroup> = grouping
+        .families
         .into_iter()
-        .map(|(skel_hash, members)| {
-            let refs: Vec<&[u8]> = members.iter().map(|(_, b)| b.as_slice()).collect();
-            let variance = analyze_skeleton_group(&refs);
-            AnalyzedGroup { skel_hash, members, variance }
+        .map(|family| {
+            let views: Vec<&[u8]> = family
+                .members
+                .iter()
+                .map(|h| bytecode_view(&all_codes[h], cli.skeleton_mode))
+                .collect();
+            let variance = analyze_skeleton_group(&views);
+            let members: Vec<(B256, Vec<u8>)> =
+                family.members.into_iter().map(|h| (h, all_codes[&h].clone())).collect();
+            AnalyzedGroup { skel_hash: family.skel_hash, members, variance }
         })
         .collect();
 
@@ -568,8 +563,11 @@ fn main() {
                 let g = &analyzed[i];
                 let artifacts = skeleton_cache_artifacts(&cache_dir, g.skel_hash);
                 s.spawn(move || {
-                    let result =
-                        compile_skeleton_to_cache(&g.members[0].1, &g.variance, &artifacts);
+                    let result = compile_skeleton_to_cache(
+                        bytecode_view(&g.members[0].1, cli.skeleton_mode),
+                        &g.variance,
+                        &artifacts,
+                    );
                     (i, result)
                 })
             })
@@ -600,7 +598,7 @@ fn main() {
         let member_hashes: Vec<B256> = g.members.iter().map(|(h, _)| *h).collect();
 
         for (hash, bytes) in &g.members {
-            let table = build_data_table(bytes, &g.variance);
+            let table = build_data_table(bytecode_view(bytes, cli.skeleton_mode), &g.variance);
             skeleton_dispatch.insert(*hash, (skel_fn, table.data));
         }
 

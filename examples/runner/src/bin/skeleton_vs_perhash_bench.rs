@@ -24,6 +24,7 @@ use perf_event::{Builder, Counter, Group};
 use revm::database::EmptyDB;
 use revm::handler::{EvmTr, FrameResult, Handler, ItemOrResult};
 use revm::primitives::B256;
+use revmc::emse::{bytecode_view, group_skeleton_families, SkeletonMode};
 use revmc::skeleton::{analyze_skeleton_group_with_mode, build_data_table, ClassifyMode};
 use revmc::OptimizationLevel;
 use revmc_builtins as _;
@@ -89,6 +90,11 @@ struct Cli {
     /// data-table cost B is small in the cross-instance regime (P3).
     #[arg(long, default_value = "auto")]
     classify_mode: String,
+    /// Family boundary: "current" (PUSH-immediates-only skeleton) or "emse"
+    /// (also strips CBOR metadata + trailing zeros; admission guards apply).
+    /// Must match the mode used to compile `--skeleton-cache`.
+    #[arg(long, default_value = "current")]
+    skeleton_mode: SkeletonMode,
 }
 
 const PERF_NEVENTS: usize = 6;
@@ -876,28 +882,35 @@ fn main() {
         }
         println!("  Scanned {blocks_loaded} blocks, {} unique bytecodes", all_codes.len());
 
-        // Group by skeleton hash — store only hashes, not bytecodes (saves ~200MB cloning)
-        let mut skeleton_groups: HashMap<u64, Vec<B256>> = HashMap::new();
-        for (hash, bytes) in &all_codes {
-            if skelot_common::should_skip_bytes(bytes) {
-                continue;
-            }
-            let skel = skelot_common::extract_opcode_skeleton(bytes);
-            let skel_hash = skelot_common::hash_bytes(&skel);
-            skeleton_groups.entry(skel_hash).or_default().push(*hash);
-        }
-        let dup_groups: Vec<_> =
-            skeleton_groups.into_iter().filter(|(_, members)| members.len() >= 2).collect();
+        all_codes.retain(|_, bytes| !skelot_common::should_skip_bytes(bytes));
 
-        analyzed = dup_groups
+        // Shared grouping: in-bucket skeleton-byte verification plus (under
+        // EMSE) the g1/g2 admission guards. Must match the compile driver so
+        // guard-rejected members never get skeleton-dispatched here.
+        let grouping = group_skeleton_families(&all_codes, cli.skeleton_mode);
+        println!(
+            "  admission ({}): {} families; g1 rejected {} skeletons ({} members), g2 rejected {} members, {} collision groups split",
+            cli.skeleton_mode.as_str(),
+            grouping.families.len(),
+            grouping.stats.g1_rejected_skeletons,
+            grouping.stats.g1_rejected_members,
+            grouping.stats.g2_rejected_members,
+            grouping.stats.collision_groups_split
+        );
+
+        analyzed = grouping
+            .families
             .into_iter()
-            .map(|(skel_hash, member_hashes)| {
-                let refs: Vec<&[u8]> =
-                    member_hashes.iter().map(|h| all_codes[h].as_slice()).collect();
-                let variance = analyze_skeleton_group_with_mode(&refs, classify_mode);
+            .map(|family| {
+                let views: Vec<&[u8]> = family
+                    .members
+                    .iter()
+                    .map(|h| bytecode_view(&all_codes[h], cli.skeleton_mode))
+                    .collect();
+                let variance = analyze_skeleton_group_with_mode(&views, classify_mode);
                 let members: Vec<(B256, Vec<u8>)> =
-                    member_hashes.into_iter().map(|h| (h, all_codes[&h].clone())).collect();
-                AnalyzedGroup { skel_hash, members, variance, cached_data_tables: None }
+                    family.members.into_iter().map(|h| (h, all_codes[&h].clone())).collect();
+                AnalyzedGroup { skel_hash: family.skel_hash, members, variance, cached_data_tables: None }
             })
             .collect();
 
@@ -907,12 +920,18 @@ fn main() {
             t1.elapsed().as_secs_f64()
         );
 
-        // Save registry for fast reuse (with pre-computed data tables)
+        // Save registry for fast reuse (with pre-computed data tables).
+        // EMSE registries get their own filename: member sets and data
+        // tables are boundary-specific and must never cross modes.
+        let registry_file_name = match cli.skeleton_mode {
+            SkeletonMode::Current => "skeleton_registry_full.bin",
+            SkeletonMode::Emse => "skeleton_registry_full_emse.bin",
+        };
         let registry_save_path = cli
             .out
             .as_ref()
-            .map(|p| std::path::Path::new(p).with_file_name("skeleton_registry_full.bin"))
-            .unwrap_or_else(|| std::path::PathBuf::from("skeleton_registry_full.bin"));
+            .map(|p| std::path::Path::new(p).with_file_name(registry_file_name))
+            .unwrap_or_else(|| std::path::PathBuf::from(registry_file_name));
         let entries: Vec<RegistryEntry> = analyzed
             .iter()
             .map(|g| {
@@ -933,7 +952,10 @@ fn main() {
                     member_data_tables: g
                         .members
                         .iter()
-                        .map(|(_, bytes)| build_data_table(bytes, &g.variance).data)
+                        .map(|(_, bytes)| {
+                            build_data_table(bytecode_view(bytes, cli.skeleton_mode), &g.variance)
+                                .data
+                        })
                         .collect(),
                 }
             })
@@ -968,9 +990,9 @@ fn main() {
                         skeleton_hash_map.insert(*hash, (g.skel_hash, g.members.len()));
                     }
                 } else {
-                    // Build data tables from bytecodes
+                    // Build data tables from the mode's bytecode view
                     for (hash, bytes) in &g.members {
-                        let table = build_data_table(bytes, &g.variance);
+                        let table = build_data_table(bytecode_view(bytes, cli.skeleton_mode), &g.variance);
                         skeleton_dispatch.insert(*hash, (skel_fn, table.data));
                         skeleton_hash_map.insert(*hash, (g.skel_hash, g.members.len()));
                     }

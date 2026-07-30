@@ -16,13 +16,13 @@ use std::time::Instant;
 
 use clap::Parser;
 use revm::primitives::B256;
-use revmc::skeleton::{analyze_skeleton_group, SkeletonVariance};
+use revmc::emse::{bytecode_view, group_skeleton_families, GroupingStats, SkeletonMode};
+use revmc::skeleton::{analyze_skeleton_group_with_mode, ClassifyMode, SkeletonVariance};
 use revmc::OptimizationLevel;
 use serde::{Deserialize, Serialize};
 
 use crate::skelot_common::{
-    collect_bytecodes, compile_per_hash, compile_skeleton_group, extract_opcode_skeleton,
-    hash_bytes, per_hash_paths, skeleton_paths,
+    collect_bytecodes, compile_per_hash, compile_skeleton_group, per_hash_paths, skeleton_paths,
 };
 
 #[derive(Parser)]
@@ -36,6 +36,13 @@ struct Args {
     block_count: u64,
     #[arg(long, default_value = "both")]
     mode: String,
+    #[arg(long, default_value = "current")]
+    skeleton_mode: SkeletonMode,
+    /// PUSH classification: "auto" (cross-instance comparison) or
+    /// "force-all-variant" (ablation: every non-skip-logic PUSH via data
+    /// table). Artifacts land in a separate cache subdir per combination.
+    #[arg(long, default_value = "auto")]
+    classify_mode: String,
     #[arg(long, default_value = "block_38004930")]
     scope: String,
     #[arg(long)]
@@ -58,6 +65,19 @@ struct FamilyRecord {
 }
 
 #[derive(Serialize, Deserialize)]
+struct GroupingStatsOut {
+    skeleton_mode: String,
+    #[serde(default)]
+    classify_mode: String,
+    realized_families: usize,
+    per_hash_units: usize,
+    g1_rejected_skeletons: usize,
+    g1_rejected_members: usize,
+    g2_rejected_members: usize,
+    collision_groups_split: usize,
+}
+
+#[derive(Serialize, Deserialize)]
 struct CompileRecord {
     scope: String,
     mode: String,
@@ -70,6 +90,8 @@ struct CompileRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     per_family: Option<Vec<FamilyRecord>>,
     fallback_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grouping: Option<GroupingStatsOut>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -148,43 +170,62 @@ fn run_per_hash(
     (compiled.into_inner().unwrap(), total_dur)
 }
 
+struct SkeletonRunOutcome {
+    items: Vec<(B256, f64, u64)>,
+    families: Vec<FamilyRecord>,
+    total_seconds: f64,
+    fallback_count: usize,
+    stats: GroupingStats,
+    realized_families: usize,
+    per_hash_units: usize,
+}
+
 fn run_skeleton(
     contracts: &HashMap<B256, Vec<u8>>,
     cache_dir: &Path,
     threads: usize,
     resume: bool,
-) -> (Vec<(B256, f64, u64)>, Vec<FamilyRecord>, f64, usize) {
+    skeleton_mode: SkeletonMode,
+    classify_mode: ClassifyMode,
+) -> SkeletonRunOutcome {
     let opt = OptimizationLevel::Aggressive;
 
-    // Pass 1: group by skeleton hash using only code hashes (no bytecode clones)
-    let mut skeleton_groups: HashMap<u64, Vec<B256>> = HashMap::new();
-    for (hash, bytes) in contracts.iter() {
-        let skel = extract_opcode_skeleton(bytes);
-        let skel_hash = hash_bytes(&skel);
-        skeleton_groups.entry(skel_hash).or_default().push(*hash);
-    }
+    // Grouping with in-bucket skeleton-byte verification; under EMSE the
+    // admission guards run here and rejected members land in `per_hash`.
+    let grouping = group_skeleton_families(contracts, skeleton_mode);
+    let singletons = grouping.per_hash;
+    let stats = grouping.stats;
+    let per_hash_units = singletons.len();
 
-    let mut singletons: Vec<B256> = Vec::new();
-    let mut multi: Vec<(u64, Vec<B256>)> = Vec::new();
-    for (skel_hash, members) in skeleton_groups {
-        if members.len() >= 2 {
-            multi.push((skel_hash, members));
-        } else {
-            singletons.push(members.into_iter().next().unwrap());
-        }
-    }
+    eprintln!(
+        "  skeleton groups ({}): {} families, {} per-hash units",
+        skeleton_mode.as_str(),
+        grouping.families.len(),
+        singletons.len()
+    );
+    eprintln!(
+        "  admission: g1 rejected {} skeletons ({} members), g2 rejected {} members, {} collision groups split",
+        stats.g1_rejected_skeletons,
+        stats.g1_rejected_members,
+        stats.g2_rejected_members,
+        stats.collision_groups_split
+    );
 
-    eprintln!("  skeleton groups: {} families, {} singletons", multi.len(), singletons.len());
-
-    // Pass 2: analyze variance by borrowing bytecodes from `contracts`
-    let variances: Vec<(u64, Vec<B256>, SkeletonVariance)> = multi
+    // Analyze variance over the mode's bytecode view (EMSE: stripped).
+    let variances: Vec<(u64, Vec<B256>, SkeletonVariance)> = grouping
+        .families
         .into_iter()
-        .map(|(skel_hash, member_hashes)| {
-            let refs: Vec<&[u8]> = member_hashes.iter().map(|h| contracts[h].as_slice()).collect();
-            let variance = analyze_skeleton_group(&refs);
-            (skel_hash, member_hashes, variance)
+        .map(|family| {
+            let views: Vec<&[u8]> = family
+                .members
+                .iter()
+                .map(|h| bytecode_view(&contracts[h], skeleton_mode))
+                .collect();
+            let variance = analyze_skeleton_group_with_mode(&views, classify_mode);
+            (family.skel_hash, family.members, variance)
         })
         .collect();
+    let realized_families = variances.len();
 
     if !resume {
         for (sh, _, _) in &variances {
@@ -218,7 +259,7 @@ fn run_skeleton(
             s.spawn(move || {
                 for (skel_hash, member_hashes, variance) in chunk {
                     let a = skeleton_paths(cache_dir, skel_hash, opt);
-                    let rep_bytes = &contracts[&member_hashes[0]];
+                    let rep_bytes = bytecode_view(&contracts[&member_hashes[0]], skeleton_mode);
                     let t0 = Instant::now();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         compile_skeleton_group(
@@ -302,7 +343,15 @@ fn run_skeleton(
 
     let total_dur = total_t0.elapsed().as_secs_f64();
     let fallback_total = fallback_count.load(Ordering::Relaxed);
-    (compiled.into_inner().unwrap(), families_out.into_inner().unwrap(), total_dur, fallback_total)
+    SkeletonRunOutcome {
+        items: compiled.into_inner().unwrap(),
+        families: families_out.into_inner().unwrap(),
+        total_seconds: total_dur,
+        fallback_count: fallback_total,
+        stats,
+        realized_families,
+        per_hash_units,
+    }
 }
 
 fn main() {
@@ -333,28 +382,59 @@ fn main() {
                 .collect(),
             per_family: None,
             fallback_count: 0,
+            grouping: None,
         });
     }
     if args.mode == "skeleton" || args.mode == "both" {
-        let sk_cache = cache_dir.join("skelot");
+        let classify_mode = match args.classify_mode.as_str() {
+            "auto" => ClassifyMode::Auto,
+            "force-all-variant" => ClassifyMode::ForceAllVariant,
+            other => {
+                eprintln!("ERROR: --classify-mode must be auto or force-all-variant (got {other})");
+                std::process::exit(2);
+            }
+        };
+        let sk_cache = cache_dir.join(match (args.skeleton_mode, classify_mode) {
+            (SkeletonMode::Current, ClassifyMode::Auto) => "skelot",
+            (SkeletonMode::Emse, ClassifyMode::Auto) => "skelot_emse",
+            (SkeletonMode::Current, ClassifyMode::ForceAllVariant) => "skelot_forced",
+            (SkeletonMode::Emse, ClassifyMode::ForceAllVariant) => "skelot_emse_forced",
+        });
         fs::create_dir_all(&sk_cache).ok();
-        let (items, families, total, fb) =
-            run_skeleton(&contracts, &sk_cache, args.threads, args.resume);
-        let total_o: u64 = items.iter().map(|(_, _, s)| *s).sum();
+        let run = run_skeleton(
+            &contracts,
+            &sk_cache,
+            args.threads,
+            args.resume,
+            args.skeleton_mode,
+            classify_mode,
+        );
+        let total_o: u64 = run.items.iter().map(|(_, _, s)| *s).sum();
         records.push(CompileRecord {
             scope: args.scope.clone(),
             mode: "skelot".into(),
-            n_units: items.len(),
-            total_compile_seconds: total,
+            n_units: run.items.len(),
+            total_compile_seconds: run.total_seconds,
             total_o_bytes: total_o,
-            per_unit_ms: items.iter().map(|(_, d, _)| d * 1000.0).collect(),
-            per_unit_o_bytes: items.iter().map(|(_, _, s)| *s).collect(),
-            compile_unit_hashes: items
+            per_unit_ms: run.items.iter().map(|(_, d, _)| d * 1000.0).collect(),
+            per_unit_o_bytes: run.items.iter().map(|(_, _, s)| *s).collect(),
+            compile_unit_hashes: run
+                .items
                 .iter()
                 .map(|(h, _, _)| format!("0x{}", hex::encode(h)))
                 .collect(),
-            per_family: Some(families),
-            fallback_count: fb,
+            per_family: Some(run.families),
+            fallback_count: run.fallback_count,
+            grouping: Some(GroupingStatsOut {
+                skeleton_mode: args.skeleton_mode.as_str().to_string(),
+                classify_mode: args.classify_mode.clone(),
+                realized_families: run.realized_families,
+                per_hash_units: run.per_hash_units,
+                g1_rejected_skeletons: run.stats.g1_rejected_skeletons,
+                g1_rejected_members: run.stats.g1_rejected_members,
+                g2_rejected_members: run.stats.g2_rejected_members,
+                collision_groups_split: run.stats.collision_groups_split,
+            }),
         });
     }
 
