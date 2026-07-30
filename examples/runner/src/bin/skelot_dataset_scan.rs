@@ -13,29 +13,15 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use revm::primitives::B256;
+use revmc::emse::SkeletonMode;
 use serde::Serialize;
 
 use crate::skelot_common::{
     bucket_for_raw_len, extract_emse_skeleton, extract_opcode_skeleton_with_counts, hash_bytes,
     identify_pattern, should_skip_bytes, BUCKET_SCHEME_ID,
 };
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum SkeletonMode {
-    Current,
-    Emse,
-}
-
-impl SkeletonMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            SkeletonMode::Current => "current",
-            SkeletonMode::Emse => "emse",
-        }
-    }
-}
 
 #[derive(Parser)]
 #[command(name = "skelot_dataset_scan")]
@@ -50,7 +36,7 @@ struct Args {
     block_count: Option<u64>,
     #[arg(long, default_value_t = 1000)]
     window_size: u64,
-    #[arg(long, value_enum, default_value = "current")]
+    #[arg(long, default_value = "current")]
     skeleton_mode: SkeletonMode,
     #[arg(long)]
     out_dir: String,
@@ -252,8 +238,10 @@ fn main() {
     let out_dir = PathBuf::from(&args.out_dir);
     fs::create_dir_all(&out_dir).expect("create out dir");
 
-    let n_windows = block_count / args.window_size;
-    assert!(n_windows >= 1, "block_count must be ≥ window_size");
+    // Ceiling division: a trailing partial window scans the remainder blocks
+    // instead of silently dropping them from the corpus.
+    let n_windows = block_count.div_ceil(args.window_size);
+    assert!(n_windows >= 1, "block_count must be ≥ 1");
     eprintln!(
         "Stage A: scanning {} blocks from {} in {} windows of {} (chain={}, skeleton_mode={})",
         block_count,
@@ -272,8 +260,9 @@ fn main() {
 
     for w in 0..n_windows {
         let start = start_block + w * args.window_size;
+        let window_blocks = args.window_size.min(start_block + block_count - start);
         let before: std::collections::HashSet<B256> = ctx.codes.keys().copied().collect();
-        scan_window(&bench_dir, start, args.window_size, &mut ctx);
+        scan_window(&bench_dir, start, window_blocks, &mut ctx);
         let new_hashes: Vec<B256> =
             ctx.codes.keys().copied().filter(|h| !before.contains(h)).collect();
         eprintln!(

@@ -16,8 +16,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use revm::primitives::{Address, B256};
+use revmc::emse::SkeletonMode;
 use serde::Serialize;
 
 use crate::skelot_common::{
@@ -53,25 +54,10 @@ struct Args {
     rps: f64,
     #[arg(long, default_value_t = 42u64)]
     seed: u64,
-    #[arg(long, value_enum, default_value = "current")]
+    #[arg(long, default_value = "current")]
     skeleton_mode: SkeletonMode,
     #[arg(long)]
     out: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum SkeletonMode {
-    Current,
-    Emse,
-}
-
-impl SkeletonMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            SkeletonMode::Current => "current",
-            SkeletonMode::Emse => "emse",
-        }
-    }
 }
 
 fn resolve_rpc_url(chain: ChainId, override_url: Option<&str>, api_key_env: &str) -> String {
@@ -158,7 +144,6 @@ fn hash_skeleton_for_mode(bytes: &[u8], mode: SkeletonMode) -> u64 {
 }
 
 fn rpc_call(method: &str, params: serde_json::Value) -> serde_json::Value {
-    RATE.get().expect("RATE not initialized").acquire();
     let url = RPC_URL.get().expect("RPC_URL not initialized").as_str();
     let body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -168,6 +153,8 @@ fn rpc_call(method: &str, params: serde_json::Value) -> serde_json::Value {
     });
     let mut attempt = 0;
     loop {
+        // Inside the loop so retries are rate-limited too.
+        RATE.get().expect("RATE not initialized").acquire();
         match ureq::post(url).set("Content-Type", "application/json").send_json(&body) {
             Ok(resp) => match resp.into_json::<serde_json::Value>() {
                 Ok(v) => return v,
@@ -205,6 +192,12 @@ fn eth_get_code_len(address: &Address, block: u64) -> usize {
             format!("0x{:x}", block)
         ]),
     );
+    // A JSON-RPC error response (e.g. pruned state on a non-archive node) has
+    // no `result`; treating it as code length 0 would silently corrupt the
+    // deployment-block binary search. Fail loudly instead.
+    if let Some(err) = v.get("error") {
+        panic!("eth_getCode error at block {block} for 0x{}: {err}", hex::encode(address));
+    }
     let hex = v["result"].as_str().unwrap_or("0x").trim_start_matches("0x");
     hex.len() / 2
 }

@@ -16,10 +16,12 @@ use revm::{
     bytecode::Bytecode,
     context::{CfgEnv, TxEnv},
     context_interface::result::{EVMError, ExecutionResult},
+    context_interface::JournalTr,
     database::{CacheDB, EmptyDB},
     handler::{EvmTr, FrameResult, Handler, ItemOrResult},
     primitives::{hardfork::SpecId, Address, Bytes, HashMap as RevmHashMap, TxKind, B256, U256},
     state::AccountInfo,
+    DatabaseCommit,
 };
 use revmc::{EvmCompiler, EvmLlvmBackend, OptimizationLevel};
 use revmc_context::{EvmCompilerFn, RawEvmCompilerFn};
@@ -454,6 +456,11 @@ pub fn snapshot_before_tx(
         evm.0.ctx.tx = build_op_tx(tx_bin);
         let mut handler = NativeHandler;
         handler.run(&mut evm).map_err(|e| format!("replay tx[{i}] failed: {e:?}"))?;
+        // Handler::run leaves each tx's state changes in the journal; fold
+        // them into the backing CacheDB, otherwise the returned snapshot is
+        // just the block's initial state with all replay effects discarded.
+        let state = evm.0.ctx.journaled_state.finalize();
+        evm.0.ctx.journaled_state.database.commit(state);
     }
 
     Ok(evm.0.ctx.journaled_state.database.clone())
