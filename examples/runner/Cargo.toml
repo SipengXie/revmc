@@ -22,7 +22,7 @@ revmc-builtins = { workspace = true, default-features = false }
 revmc-context = { workspace = true, default-features = false }
 
 revm = { workspace = true, default-features = false, features = ["std", "serde"] }
-op-revm = { git = "ssh://git@github.com/Altius-Parallel-EVM/revm", branch = "jit-integration", default-features = false, features = ["std"] }
+op-revm = { git = "https://github.com/SipengXie2024/skelot-revm", rev = "46dc92ff66f8d2f4933e6c060a1968dea22944ca", default-features = false, features = ["std"] }
 
 # Used by jsonl_bench / bin_bench binaries
 revmc = { workspace = true, features = ["llvm-prefer-dynamic"] }
@@ -39,6 +39,8 @@ ureq = { version = "2", features = ["json"] }
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tempfile = "3"
+perf-event = "0.4"
+perf-event-open-sys = "6"
 
 [dev-dependencies]
 criterion = "0.5"

@@ -44,12 +44,12 @@ revmc-cranelift = { version = "0.1.0", path = "crates/revmc-cranelift", default-
 revmc-llvm = { version = "0.1.0", path = "crates/revmc-llvm", default-features = false }
 
 alloy-primitives = { version = "0.8", default-features = false }
-revm = { git = "ssh://git@github.com/Altius-Parallel-EVM/revm", branch = "jit-integration", default-features = false }
-revm-primitives = { git = "ssh://git@github.com/Altius-Parallel-EVM/revm", branch = "jit-integration", default-features = false }
-revm-interpreter = { git = "ssh://git@github.com/Altius-Parallel-EVM/revm", branch = "jit-integration", default-features = false }
-revm-bytecode = { git = "ssh://git@github.com/Altius-Parallel-EVM/revm", branch = "jit-integration", default-features = false, features = ["parse"] }
-revm-context-interface = { git = "ssh://git@github.com/Altius-Parallel-EVM/revm", branch = "jit-integration", default-features = false }
-revm-state = { git = "ssh://git@github.com/Altius-Parallel-EVM/revm", branch = "jit-integration", default-features = false }
+revm = { git = "https://github.com/SipengXie2024/skelot-revm", rev = "46dc92ff66f8d2f4933e6c060a1968dea22944ca", default-features = false }
+revm-primitives = { git = "https://github.com/SipengXie2024/skelot-revm", rev = "46dc92ff66f8d2f4933e6c060a1968dea22944ca", default-features = false }
+revm-interpreter = { git = "https://github.com/SipengXie2024/skelot-revm", rev = "46dc92ff66f8d2f4933e6c060a1968dea22944ca", default-features = false }
+revm-bytecode = { git = "https://github.com/SipengXie2024/skelot-revm", rev = "46dc92ff66f8d2f4933e6c060a1968dea22944ca", default-features = false, features = ["parse"] }
+revm-context-interface = { git = "https://github.com/SipengXie2024/skelot-revm", rev = "46dc92ff66f8d2f4933e6c060a1968dea22944ca", default-features = false }
+revm-state = { git = "https://github.com/SipengXie2024/skelot-revm", rev = "46dc92ff66f8d2f4933e6c060a1968dea22944ca", default-features = false }
 ruint = { version = "1.12", default-features = false }
 
 color-eyre = "0.6"
