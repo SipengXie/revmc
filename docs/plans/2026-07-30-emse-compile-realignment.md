@@ -614,3 +614,22 @@ the per-arm ledgers if a reviewer asks.
 region at a vanilla-legal JUMPDEST (the both-mode count of 4 = 1 tx × 4
 replays — consistent). Attribution run in progress (untimed single-thread
 pass, take_masked_jump_hits per tx); result appended below.
+
+### [JUMP-HIT] attribution (untimed pass, 2026-07-31)
+The single event: **block 38013100, tx_index 351, caller
+0x2e76eb850ea488b13dab713e1893716610c826a9, a CREATE (deployment) tx**
+(calldata opens with the standard Solidity constructor prologue). Reading:
+- **Zero hits on deployed (runtime) code across all 10K blocks** — the
+  hardened jump semantics change nothing for regular contract calls.
+- The one hit is inside INITCODE execution: initcode tails embed the future
+  runtime's CBOR trailer, so the boundary detector fires on the nested
+  structure and this constructor happens to jump there. Deployment frames
+  never participate in shared compilation (create frames run the
+  interpreter in every arm), so this event is orthogonal to the SkelOT
+  correctness claim and identical across arms.
+- For the upstream-hardening pitch: note an initcode exemption (or scope
+  the mask to runtime code) in the EIP-direction discussion.
+Tool: `jump_hit_attribution` (untimed, single-threaded, per-tx
+take_masked_jump_hits). Rerun: `target/release/jump_hit_attribution
+--bench-dir /home/ubuntu/sipeng/bench_data_base --start-block 38004930
+--block-count 10000`.
