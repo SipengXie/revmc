@@ -633,3 +633,24 @@ Tool: `jump_hit_attribution` (untimed, single-threaded, per-tx
 take_masked_jump_hits). Rerun: `target/release/jump_hit_attribution
 --bench-dir /home/ubuntu/sipeng/bench_data_base --start-block 38004930
 --block-count 10000`.
+
+## [HO-COV] Step 0 — tool audit (in progress, 2026-07-31)
+
+**Timing semantics answer (code-read, files cited):** `batch_frame_speedup`
+times every frame with `FrameTimingInspector`
+(revm-trace-jit `bin_ssa_replay/inspectors.rs`): call/create hooks push
+`Instant::now()`, call_end/create_end record `start.elapsed()` — the
+recorded duration is **INCLUSIVE** (a frame's time contains its
+sub-calls). No child-time subtraction exists in this inspector (a separate
+`CodeHashFrameTimingInspector` supports Exclusive but is not used by this
+binary). **Same tool, same file name, same inclusive semantics as the RQ4
+weight file** `bench_data_base/ssa_cache/entrypoint_timing.bin` (the
+binary's usage header names exactly that export; the April stage_d log
+references the same path). H1/H2 will therefore be mutually consistent AND
+consistent with RQ4 — the brief's requirement. Caveat recorded: inclusive
+weights double-count nested same-family time; fine for ranking stability
+analysis (both halves share the convention).
+
+Family map for aggregation: `data/family_map_emse_base.tsv` (19,130 rows;
+818-family grouping, per-hash contracts as solo_* units; the stale
+`ssa_cache/skeleton_mapping.tsv` was NOT used).
