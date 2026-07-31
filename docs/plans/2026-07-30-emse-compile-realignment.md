@@ -492,3 +492,31 @@ identical skeleton, different logic. Exactly the class the static-jump
 pre-check must degrade to per-member compilation; the compile run confirmed
 1 family / 3 members, and §6.2 can cite this family as the concrete instance
 (with the defense-in-depth note: the apply_variance assert stood behind it).
+
+## Addendum 5 (revmc session, 2026-07-31): Step 2 COMPLETE — Base 10K dual-mode compile results
+
+Run: attempt 2 (post-INCIDENT-1 fix), cold cache, 16 threads, binary at
+f51f0306 lineage (fork rev db2ea675). Log:
+`skelot-paper/data/logs/stage_b_emse_base_20260731T003143Z.log`; JSON:
+`skelot-paper/data/compile_bench_emse_base.json` (both arms + grouping block).
+
+| placeholder | value | provenance |
+|---|---|---|
+| [B-EMSE-UNITS] | 10,037 (817 families + 9,220 per-hash) | JSON skelot.n_units / grouping |
+| [B-EMSE-RED] | 47.5% (19,130 → 10,037) | derived |
+| [B-EMSE-SIZE] | 2.151 GB (Naive 5.050 GB) | total_o_bytes |
+| [B-EMSE-SIZE-RED] | **57.4%** | derived |
+| [B-EMSE-TIME] | 13,483.4 s (3.75 h) | skelot.total_compile_seconds |
+| [B-EMSE-ABS] | 27,860.4 s (7.74 h) Naive all-19,130 | per_hash.total_compile_seconds |
+| [B-EMSE-SPEEDUP] | **2.07×** cold-compile | derived |
+| [FAM-ANALYSIS-S] | 0.305 s variance analysis (+0.78 s grouping, +0.234 s tables/9,910) | grouping_stats --time-analysis (standalone rerun of the same deterministic code; Auto mode; table cost is exec-side registry build, not compile) |
+| [FAM-ANALYSIS-PCT] | 0.0023% of pure compile | derived |
+
+Anchor checks: size reduction 57.4% vs ~55% reference — PASS (mildly
+better); speedup 2.07× vs ~2.25× reference, band [1.8, 3.5] — PASS
+(slightly under reference; known conservative bias: skeleton-arm singletons
+are compiled in random order, worse tail packing than the size-sorted Naive
+arm — recorded, per-unit detail in JSON allows an unbiased offline check).
+Naive side compiled all 19,130 units, fallback 0; degradations exactly the
+pre-announced 1 family / 3 members (static-jump); g1 7/17, g2 0, collisions 0.
+Naive total 5.050 GB closely matches the old-boundary measurement (5.03 GB).
