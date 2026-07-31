@@ -975,3 +975,23 @@ interpreter; (2) full build is our experimental control, not a deployment
 recipe; (3) RQ4 shows the deployable policy, under which the compile bill
 drops ~19× and break-even drops from 161 windows to 9 — and SkelOT reaches
 that point ~3× sooner than Naive at every budget level.
+
+### Two draft-number corrections (user, 2026-07-31)
+
+**(1) Grouping cost: 1.16 s → 0.78 s.** The 1.16 s in
+`.planning/findings.md:364` was measured while g2 was still ENFORCED — that
+version scans the stripped suffix of every member of every multi-member
+group (~9,900 scans). The final grouping has g2 off (interpreter alignment
+instead), skipping that loop entirely. Both support "negligible", but the
+paper must quote the number matching the final grouping it reports:
+**0.78 s** (same run as the 818/9,913/9,217 anchors). Remove 1.16 s from
+the "do not touch" list.
+
+**(2) [FAM-ANALYSIS] with its proportion.** Family construction over the
+full corpus = grouping **0.78 s** + constant classification **0.305 s** =
+**1.085 s**, against a SkelOT compile of **13,483.4 s** — i.e. **0.008% of
+compile time, a factor of ~12,400**. (Data-table construction, 0.234 s for
+9,910 tables, belongs to the exec-side registry build, not the compile
+driver — report it separately if at all.) Suggested phrasing: "家族构建的
+全部成本(分组 0.78 秒 + 常量分类 0.305 秒 = 1.085 秒)不到编译时间的万分之一
+(1/12,400),即使全部计入也不改变任何结论。"
