@@ -1084,3 +1084,42 @@ law is a new positive result (benefit grows with template-deployment
 density) and simultaneously explains Arb's 1.083% honestly; (3) pair the
 end-to-end 1.02× with the 26.4% decomposition, which turns a weak-looking
 number into evidence that we are not overstating.
+
+### Paper-ready framing: what E2E time AOT can and cannot touch (user, 2026-07-31)
+
+The three-arm ledger, all directly measured over 10,000 blocks:
+
+| arm | exec wall | family-member frames | everything else |
+|---|---|---|---|
+| interpreter | 534.4 s | 141.6 s (26.5%) | 392.9 s |
+| Naive | 459.1 s | 93.8 s (20.4%) | **365.2 s** |
+| SkelOT | 450.6 s | 84.8 s (18.8%) | **365.8 s** |
+
+Naive and SkelOT agree on "everything else" to 0.16% — the claim that the
+two arms differ ONLY on family frames is now MEASURED, not assumed. Both
+deltas close exactly: interpreter→Naive = 47.8 s (family) + 27.7 s (solos
+now compiled) = 75.5 s vs 75.3 s measured; Naive→SkelOT = 9.0 s vs 8.5 s
+measured.
+
+**What AOT can touch at all: contract frames = 57.4% of wall** (family
+26.4% + solo 31.0%, from the all-corpus interpreter instrumentation).
+**What no code generator can remove: the 42.6% residual**, namely
+(a) per-frame setup/teardown across **50.3 M frames** — callee code load,
+gas metering, stack/memory init, refund accounting, journal checkpoints;
+(b) transaction-level work — assembly, caller/nonce checks, gas payment and
+refund, beneficiary reward, per-tx state commit; (c) frames never compiled
+by design — CREATE/initcode, precompiles (already native), 0xEF delegations.
+
+**Honest bound:** our replay serves state from in-memory snapshots (a slot
+read is a hash-map lookup). A production node reads state through disk and
+a trie, which is both far more expensive AND equally untouchable by
+compilation — so 57.4% is an UPPER bound on the compilable share for real
+deployments; in practice it is smaller.
+
+**Position this licenses:** end-to-end gains are structurally capped for
+ANY AOT approach, which is precisely why the contribution to defend is the
+compile-side bill (−47.5% units, −57.4% size, 2.07× wall) delivered at zero
+execution cost — not a few percent of runtime. The 42.6% residual (and the
+larger state-access cost in real nodes) is an orthogonal, composable line
+of work for blockchain systems: frame pooling, journal/state-commit
+optimization, precompile acceleration, parallel execution.
