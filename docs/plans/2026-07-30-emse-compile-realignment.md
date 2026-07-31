@@ -445,3 +445,29 @@ Accepted findings and dispositions:
    hard assert. Fork follow-ups (comment truth + 2 missing tests: mask
    neutrality over trailing zeros, end-to-end InvalidJump+counter) queued
    for the next fork-touch window.
+
+### Cross-chain corpus composition (rebuttal ammo, 2026-07-31)
+
+Why does the Arb 10K corpus hold only 2,895 unique bytecodes vs Base's
+19,130? Measured, not guessed — 200 random blocks per chain parsed straight
+from `txs/{bn}.bin` (bincode TxBin layout; parser self-validated against the
+known Base anchor of 351.0 tx/block from the full 10K replay — sample gave
+351.8):
+
+| | Base 10K | Arb 10K |
+|---|---|---|
+| tx per block (sampled) | 351.8 | 3.7 |
+| pure transfers (empty calldata) | 2.4% | 8.5% |
+| contract calls | 97.3% | 91.5% |
+| approx. total txs in corpus | ~3.5 M | ~37 K |
+| wall-clock span of 10K blocks | ~5.6 h (2 s/block) | ~42 min (~0.25 s/block) |
+
+Reading: the "mostly transfers" hypothesis is ruled out — both chains are
+>91% contract calls. The gap is sample-size, not ecosystem: an Arb block
+carries ~95× fewer txs and 10K blocks span ~8× less wall time, so the
+corpus contains ~2 orders of magnitude fewer transactions and correspondingly
+fewer touched contracts. Useful for: (a) footnoting the cross-chain corpus
+calibration; (b) explaining Arb's low family density / modest compile
+speedup as a sampling-window property, not a method failure.
+Method: inline Python parser over bincode TxBin (fields per
+examples/runner/src/bin_common.rs TxBin), seed 7, 200 blocks/chain.
