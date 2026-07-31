@@ -197,3 +197,7 @@ path = "src/bin/jump_hit_attribution.rs"
 [[bin]]
 name = "addr_code_hash"
 path = "src/bin/addr_code_hash.rs"
+
+[[bin]]
+name = "frame_tx_index"
+path = "src/bin/frame_tx_index.rs"

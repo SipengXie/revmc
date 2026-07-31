@@ -81,6 +81,13 @@ struct Args {
     /// all-variant modes are a single compile per family and ignore this.
     #[arg(long, default_value_t = 8)]
     compile_threads: usize,
+    /// Representative-transaction index built from executed FRAMES
+    /// (`frame_tx_index`) instead of the default `tx.to` scan. The default
+    /// index only sees contracts a transaction addresses directly, so
+    /// families reached solely through internal calls get no representative
+    /// and are skipped in the exec phase.
+    #[arg(long)]
+    tx_index: Option<PathBuf>,
 }
 
 /// Sidecar JSONL path derived from the final output path.
@@ -466,7 +473,16 @@ fn main() -> anyhow::Result<()> {
         // capped set has a rep whenever the family has any observed txs.
         let resolved_per_family: Vec<Vec<(String, B256, Vec<u8>)>> =
             sampled.iter().map(|fam| resolve_family_members(&all_codes, fam)).collect();
-        let tx_index = build_tx_index_cached(&args.bench_dir, args.start_block, args.block_count);
+        let tx_index = match &args.tx_index {
+            Some(p) => {
+                let data = std::fs::read(p).expect("read --tx-index");
+                let map: HashMap<B256, (u64, usize)> =
+                    bincode::deserialize(&data).expect("deserialize --tx-index");
+                eprintln!("[tx-index] loaded {} frame-level entries from {}", map.len(), p.display());
+                map
+            }
+            None => build_tx_index_cached(&args.bench_dir, args.start_block, args.block_count),
+        };
 
         resolved_per_family
             .into_iter()
