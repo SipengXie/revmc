@@ -92,6 +92,15 @@ struct Cli {
     /// Must match the mode used to compile `--skeleton-cache`.
     #[arg(long, default_value = "current")]
     skeleton_mode: SkeletonMode,
+    /// Include per-(block,round) raw samples in per_contract records. Off by
+    /// default: at --sample-every 1 the raw list dominates output size.
+    #[arg(long, default_value_t = false)]
+    emit_raw_samples: bool,
+    /// Proceed even when some skeleton .so files fail to load. Default is a
+    /// hard abort: a silently missing artifact would fall back to the
+    /// per-hash function, biasing the skeleton arm.
+    #[arg(long, default_value_t = false)]
+    allow_missing_skeletons: bool,
 }
 
 #[path = "../perf_events.rs"]
@@ -104,7 +113,8 @@ mod vs_perhash_report;
 mod vs_perhash_families;
 use vs_perhash_families::{load_or_build_families, AnalyzedGroup};
 use vs_perhash_report::{
-    cohens_d, BlockSummary, Config, ContractRecord, FamilyAggregate, Output, RawSample, Summary,
+    cohens_d, BlockSummary, Config, ContractRecord, FamilyAggregate, ModeReport, Output,
+    RawSample, Summary, TargetAggregate,
 };
 
 fn load_skeleton_so(
@@ -129,13 +139,13 @@ fn load_skeleton_so(
 
 #[path = "../timing_handlers.rs"]
 mod timing_handlers;
-use timing_handlers::{TimingPerHashHandler, TimingSkeletonHandler};
+use timing_handlers::{TimingInterpreterHandler, TimingPerHashHandler, TimingSkeletonHandler};
 
 fn execute_block_timed(
     loader: &BinLoader,
     chain_id: Option<u64>,
     mut run_tx: impl FnMut(&mut BenchEvm) -> (bool, u64),
-) -> Vec<(bool, u64)> {
+) -> (Vec<(bool, u64)>, std::time::Duration) {
     let cfg = build_op_cfg(chain_id);
     let dummy_tx = OpTransaction::builder().build_fill();
     let mut evm: BenchEvm = {
@@ -144,6 +154,8 @@ fn execute_block_timed(
         op_revm::OpEvm::new(ctx, ())
     };
     let mut results = Vec::with_capacity(loader.tx_count());
+    // Exec wall: tx loop only — loader IO and CacheDB construction excluded.
+    let exec_t0 = Instant::now();
     for tx_bin in loader.raw_txs() {
         if tx_bin.tx_type == 0x7e {
             results.push((true, 0));
@@ -152,7 +164,7 @@ fn execute_block_timed(
         evm.0.ctx.tx = build_op_tx(tx_bin);
         results.push(run_tx(&mut evm));
     }
-    results
+    (results, exec_t0.elapsed())
 }
 
 fn main() {
@@ -163,9 +175,22 @@ fn main() {
     let skeleton_cache = PathBuf::from(&cli.skeleton_cache);
 
     let block_numbers: Vec<u64> = (0..cli.block_count)
-        .step_by(cli.sample_every as usize)
+        .step_by((cli.sample_every as usize).max(1))
         .map(|i| cli.start_block + i)
         .collect();
+
+    // Mode gating up front: the interpreter arm needs neither artifact set,
+    // so skip both dlopen phases (loading 19K .so files costs minutes and GBs).
+    let mode_per_hash = matches!(cli.only_mode.as_str(), "both" | "per_hash");
+    let mode_skeleton = matches!(cli.only_mode.as_str(), "both" | "skeleton");
+    let mode_interpreter = cli.only_mode.as_str() == "interpreter";
+    if !mode_per_hash && !mode_skeleton && !mode_interpreter {
+        eprintln!(
+            "ERROR: --only-mode must be one of: both, per_hash, skeleton, interpreter (got {})",
+            cli.only_mode
+        );
+        std::process::exit(2);
+    }
 
     println!("=== Skeleton vs Per-Hash Frame-Level Benchmark ===");
     println!(
@@ -177,17 +202,24 @@ fn main() {
     );
     println!("Rounds: {} measured, {} warmup\n", cli.rounds, cli.warmup);
 
-    // Phase 1: Load all per-hash .so files
+    // Phase 1: Load all per-hash .so files (the skeleton handler also needs
+    // them for its non-family fallback dispatch).
+    let need_per_hash_fns = mode_per_hash || mode_skeleton;
     println!("--- Phase 1: Loading per-hash .so files ---");
     let t0 = Instant::now();
     let mut per_hash_fns: HashMap<B256, RawEvmCompilerFn> = HashMap::new();
     let mut per_hash_libs: Vec<libloading::Library> = Vec::new();
 
-    let per_hash_entries: Vec<_> = std::fs::read_dir(&per_hash_cache)
-        .expect("read per-hash cache dir")
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "so" || ext == "dylib"))
-        .collect();
+    let per_hash_entries: Vec<_> = if need_per_hash_fns {
+        std::fs::read_dir(&per_hash_cache)
+            .expect("read per-hash cache dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "so" || ext == "dylib"))
+            .collect()
+    } else {
+        println!("  (skipped — interpreter mode)");
+        Vec::new()
+    };
 
     for entry in &per_hash_entries {
         let path = entry.path();
@@ -237,32 +269,51 @@ fn main() {
     let mut skeleton_dispatch: HashMap<B256, (EvmCompilerFn, Vec<u8>)> = HashMap::new();
     let mut skeleton_libs: Vec<libloading::Library> = Vec::new();
     let mut skeleton_hash_map: HashMap<B256, (u64, usize)> = HashMap::new();
+    let mut skeleton_load_failures = 0usize;
 
-    for g in &analyzed {
-        let arts = skelot_common::skeleton_paths(&skeleton_cache, g.skel_hash, OPT);
-        match load_skeleton_so(&arts.library, &arts.symbol) {
-            Ok((raw_fn, lib)) => {
-                skeleton_libs.push(lib);
-                let skel_fn = EvmCompilerFn::new(raw_fn);
-                if let Some(ref cached_tables) = g.cached_data_tables {
-                    // Use pre-computed data tables from registry
-                    for (hash, dt) in cached_tables {
-                        skeleton_dispatch.insert(*hash, (skel_fn, dt.clone()));
-                        skeleton_hash_map.insert(*hash, (g.skel_hash, g.members.len()));
-                    }
-                } else {
-                    // Build data tables from the mode's bytecode view
-                    for (hash, bytes) in &g.members {
-                        let table = build_data_table(bytecode_view(bytes, cli.skeleton_mode), &g.variance);
-                        skeleton_dispatch.insert(*hash, (skel_fn, table.data));
-                        skeleton_hash_map.insert(*hash, (g.skel_hash, g.members.len()));
+    if mode_skeleton {
+        for g in &analyzed {
+            let arts = skelot_common::skeleton_paths(&skeleton_cache, g.skel_hash, OPT);
+            match load_skeleton_so(&arts.library, &arts.symbol) {
+                Ok((raw_fn, lib)) => {
+                    skeleton_libs.push(lib);
+                    let skel_fn = EvmCompilerFn::new(raw_fn);
+                    if let Some(ref cached_tables) = g.cached_data_tables {
+                        // Use pre-computed data tables from registry
+                        for (hash, dt) in cached_tables {
+                            skeleton_dispatch.insert(*hash, (skel_fn, dt.clone()));
+                            skeleton_hash_map.insert(*hash, (g.skel_hash, g.members.len()));
+                        }
+                    } else {
+                        // Build data tables from the mode's bytecode view
+                        for (hash, bytes) in &g.members {
+                            let table = build_data_table(bytecode_view(bytes, cli.skeleton_mode), &g.variance);
+                            skeleton_dispatch.insert(*hash, (skel_fn, table.data));
+                            skeleton_hash_map.insert(*hash, (g.skel_hash, g.members.len()));
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                eprintln!("  WARN: skeleton {:016x} load failed: {e}", g.skel_hash);
+                Err(e) => {
+                    skeleton_load_failures += 1;
+                    eprintln!("  WARN: skeleton {:016x} load failed: {e}", g.skel_hash);
+                }
             }
         }
+        // A missing artifact silently falls back to the per-hash function in
+        // the skeleton handler — untimed, uncounted, and biased in the
+        // skeleton arm's favour. Account for every family or refuse to run.
+        if skeleton_load_failures > 0 {
+            eprintln!(
+                "  ERROR: {skeleton_load_failures}/{} skeleton artifacts failed to load",
+                analyzed.len()
+            );
+            if !cli.allow_missing_skeletons {
+                eprintln!("  aborting (pass --allow-missing-skeletons to override)");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("  (skipped — mode {})", cli.only_mode);
     }
 
     println!(
@@ -271,14 +322,22 @@ fn main() {
         t2.elapsed().as_secs_f64()
     );
 
-    // Phase 4: Identify treatment group
-    let target_hashes: HashSet<B256> =
-        skeleton_dispatch.keys().filter(|h| per_hash_fns.contains_key(*h)).copied().collect();
+    // Phase 4: Identify treatment group — the same family-member universe in
+    // every arm, intersected with whichever artifact sets the arm dispatches.
+    let target_hashes: HashSet<B256> = if mode_interpreter {
+        analyzed.iter().flat_map(|g| g.members.iter().map(|(h, _)| *h)).collect()
+    } else if mode_skeleton {
+        skeleton_dispatch.keys().filter(|h| per_hash_fns.contains_key(*h)).copied().collect()
+    } else {
+        // per_hash-only: family members with a per-hash artifact.
+        analyzed
+            .iter()
+            .flat_map(|g| g.members.iter().map(|(h, _)| *h))
+            .filter(|h| per_hash_fns.contains_key(h))
+            .collect()
+    };
 
-    println!(
-        "\n--- Treatment group: {} contracts (in both per-hash and skeleton) ---",
-        target_hashes.len()
-    );
+    println!("\n--- Treatment group: {} contracts ---", target_hashes.len());
 
     if target_hashes.is_empty() {
         eprintln!("No contracts in treatment group. Nothing to compare.");
@@ -290,15 +349,6 @@ fn main() {
     let target_hashes = Arc::new(target_hashes);
 
     // Phase 5: Run blocks with timing
-    let mode_per_hash = matches!(cli.only_mode.as_str(), "both" | "per_hash");
-    let mode_skeleton = matches!(cli.only_mode.as_str(), "both" | "skeleton");
-    if !mode_per_hash && !mode_skeleton {
-        eprintln!(
-            "ERROR: --only_mode must be one of: both, per_hash, skeleton (got {})",
-            cli.only_mode
-        );
-        std::process::exit(2);
-    }
     println!(
         "\n--- Phase 5: Measuring {} blocks (only_mode={}) ---",
         block_numbers.len(),
@@ -326,16 +376,39 @@ fn main() {
 
     let mut per_hash_samples: HashMap<B256, Vec<(u64, usize, f64)>> = HashMap::new();
     let mut skeleton_samples: HashMap<B256, Vec<(u64, usize, f64)>> = HashMap::new();
+    let mut interpreter_samples: HashMap<B256, Vec<(u64, usize, f64)>> = HashMap::new();
     let mut per_hash_perf: HashMap<B256, [u64; PERF_NEVENTS + 1]> = HashMap::new();
     let mut skeleton_perf: HashMap<B256, [u64; PERF_NEVENTS + 1]> = HashMap::new();
     let mut per_hash_wall_ns: HashMap<B256, u128> = HashMap::new();
     let mut skeleton_wall_ns: HashMap<B256, u128> = HashMap::new();
     let mut blocks_measured = 0usize;
+    let mut blocks_skipped = 0usize;
+
+    #[derive(Default)]
+    struct ArmStats {
+        exec_wall_s: f64,
+        tx_count: u64,
+        success_count: u64,
+        total_gas: u64,
+    }
+    impl ArmStats {
+        fn absorb_round0(&mut self, results: &[(bool, u64)]) {
+            self.tx_count += results.len() as u64;
+            self.success_count += results.iter().filter(|(ok, _)| *ok).count() as u64;
+            self.total_gas += results.iter().map(|(_, g)| *g).sum::<u64>();
+        }
+    }
+    let mut ph_arm = ArmStats::default();
+    let mut sk_arm = ArmStats::default();
+    let mut int_arm = ArmStats::default();
 
     for (bi, &block) in block_numbers.iter().enumerate() {
         let loader = match BinLoader::new(bench_dir, block) {
             Ok(l) => l,
-            Err(_) => continue,
+            Err(_) => {
+                blocks_skipped += 1;
+                continue;
+            }
         };
         let chain_id = loader.raw_txs().first().and_then(|tx| tx.chain_id);
 
@@ -349,7 +422,7 @@ fn main() {
                 timings: HashMap::new(),
                 perf_counts: HashMap::new(),
             };
-            let ph_results =
+            let (ph_results, _) =
                 execute_block_timed(&loader, chain_id, |evm| match ph_check.run(evm) {
                     Ok(rr) => extract_gas(&rr),
                     Err(_) => (false, 0),
@@ -361,7 +434,7 @@ fn main() {
                 timings: HashMap::new(),
                 perf_counts: HashMap::new(),
             };
-            let sk_results =
+            let (sk_results, _) =
                 execute_block_timed(&loader, chain_id, |evm| match sk_check.run(evm) {
                     Ok(rr) => extract_gas(&rr),
                     Err(_) => (false, 0),
@@ -407,10 +480,15 @@ fn main() {
                     timings: HashMap::new(),
                     perf_counts: HashMap::new(),
                 };
-                execute_block_timed(&loader, chain_id, |evm| match handler.run(evm) {
-                    Ok(rr) => extract_gas(&rr),
-                    Err(_) => (false, 0),
-                });
+                let (results, exec_dur) =
+                    execute_block_timed(&loader, chain_id, |evm| match handler.run(evm) {
+                        Ok(rr) => extract_gas(&rr),
+                        Err(_) => (false, 0),
+                    });
+                ph_arm.exec_wall_s += exec_dur.as_secs_f64();
+                if round_idx == 0 {
+                    ph_arm.absorb_round0(&results);
+                }
                 for (hash, dur) in &handler.timings {
                     per_hash_samples.entry(*hash).or_default().push((
                         block,
@@ -459,10 +537,15 @@ fn main() {
                     timings: HashMap::new(),
                     perf_counts: HashMap::new(),
                 };
-                execute_block_timed(&loader, chain_id, |evm| match handler.run(evm) {
-                    Ok(rr) => extract_gas(&rr),
-                    Err(_) => (false, 0),
-                });
+                let (results, exec_dur) =
+                    execute_block_timed(&loader, chain_id, |evm| match handler.run(evm) {
+                        Ok(rr) => extract_gas(&rr),
+                        Err(_) => (false, 0),
+                    });
+                sk_arm.exec_wall_s += exec_dur.as_secs_f64();
+                if round_idx == 0 {
+                    sk_arm.absorb_round0(&results);
+                }
                 for (hash, dur) in &handler.timings {
                     skeleton_samples.entry(*hash).or_default().push((
                         block,
@@ -484,13 +567,64 @@ fn main() {
             }
         }
 
+        if mode_interpreter {
+            for _ in 0..cli.warmup {
+                execute_block_timed(&loader, chain_id, |evm| {
+                    let mut h = TimingInterpreterHandler {
+                        target_hashes: target_hashes.clone(),
+                        timings: HashMap::new(),
+                        perf_counts: HashMap::new(),
+                    };
+                    match h.run(evm) {
+                        Ok(rr) => extract_gas(&rr),
+                        Err(_) => (false, 0),
+                    }
+                });
+            }
+
+            for round_idx in 0..cli.rounds {
+                let mut handler = TimingInterpreterHandler {
+                    target_hashes: target_hashes.clone(),
+                    timings: HashMap::new(),
+                    perf_counts: HashMap::new(),
+                };
+                let (results, exec_dur) =
+                    execute_block_timed(&loader, chain_id, |evm| match handler.run(evm) {
+                        Ok(rr) => extract_gas(&rr),
+                        Err(_) => (false, 0),
+                    });
+                int_arm.exec_wall_s += exec_dur.as_secs_f64();
+                if round_idx == 0 {
+                    int_arm.absorb_round0(&results);
+                }
+                for (hash, dur) in &handler.timings {
+                    interpreter_samples.entry(*hash).or_default().push((
+                        block,
+                        round_idx,
+                        dur.as_nanos() as f64 / 1000.0,
+                    ));
+                }
+            }
+        }
+
         blocks_measured += 1;
         if (bi + 1) % 10 == 0 || bi + 1 == block_numbers.len() {
             println!("  [{}/{}] block {} done", bi + 1, block_numbers.len(), block);
         }
     }
 
-    println!("\n  {blocks_measured} blocks measured");
+    eprintln!("MEASUREMENT_PHASE_END only_mode={}", cli.only_mode);
+    println!("\n  {blocks_measured} blocks measured, {blocks_skipped} skipped (unreadable)");
+
+    // [JUMP-HIT]: jumps the metadata mask rejected that vanilla semantics
+    // would have accepted. Only interpreter-executed frames consult the
+    // legacy jump table, so the count is meaningful ONLY in the interpreter
+    // arm — JIT arms structurally under-count and must not cite it.
+    let jump_hits = revm::interpreter::emse_jump_audit::masked_jump_hits();
+    println!(
+        "  [JUMP-HIT] masked_jump_hits = {jump_hits}{}",
+        if mode_interpreter { "" } else { " (non-interpreter arm: not meaningful)" }
+    );
 
     // Phase 6: Aggregate and statistical testing
     println!("\n--- Phase 6: Aggregation ---");
@@ -504,6 +638,7 @@ fn main() {
 
     let all_measured: HashSet<B256> =
         per_hash_samples.keys().filter(|h| skeleton_samples.contains_key(*h)).copied().collect();
+    let mut block_data: HashMap<u64, Vec<f64>> = HashMap::new();
 
     for hash in &all_measured {
         let ph = &per_hash_samples[hash];
@@ -536,9 +671,13 @@ fn main() {
 
         let (skel_hash, family_size) = skeleton_hash_map.get(hash).copied().unwrap_or((0, 0));
 
+        // Indexed join: at --sample-every 1 the former linear scan per
+        // element was O(n²) per hash and dominated Phase 6.
+        let sk_index: HashMap<(u64, usize), f64> =
+            sk.iter().map(|&(b, r, us)| ((b, r), us)).collect();
         let mut raw: Vec<RawSample> = Vec::new();
         for &(blk, rnd, ph_us) in ph {
-            if let Some(&(_, _, sk_us)) = sk.iter().find(|(b, r, _)| *b == blk && *r == rnd) {
+            if let Some(&sk_us) = sk_index.get(&(blk, rnd)) {
                 raw.push(RawSample {
                     block: blk,
                     round: rnd,
@@ -550,6 +689,14 @@ fn main() {
 
         all_ratios.push(ratio);
         all_deltas.push(delta);
+
+        // Per-block ratios accumulate here so the per_block summary survives
+        // even when raw samples are not emitted into the JSON.
+        for s in &raw {
+            if s.skeleton_us > 0.0 {
+                block_data.entry(s.block).or_default().push(s.per_hash_us / s.skeleton_us);
+            }
+        }
 
         records.push(ContractRecord {
             code_hash: format!("0x{}", hex::encode(hash)),
@@ -563,7 +710,7 @@ fn main() {
             welch_p: p,
             cohens_d: d,
             verdict: verdict.to_string(),
-            raw_samples: raw,
+            raw_samples: if cli.emit_raw_samples { raw } else { Vec::new() },
         });
     }
 
@@ -606,15 +753,7 @@ fn main() {
         .collect();
     per_family.sort_by(|a, b| b.members_measured.cmp(&a.members_measured));
 
-    // Per-block breakdown
-    let mut block_data: HashMap<u64, Vec<f64>> = HashMap::new();
-    for rec in &records {
-        for s in &rec.raw_samples {
-            if s.skeleton_us > 0.0 {
-                block_data.entry(s.block).or_default().push(s.per_hash_us / s.skeleton_us);
-            }
-        }
-    }
+    // Per-block breakdown (accumulated during the per-hash loop above)
     let mut per_block: Vec<BlockSummary> = block_data
         .into_iter()
         .map(|(block, mut ratios)| {
@@ -657,6 +796,66 @@ fn main() {
     println!("  P95 delta (us):       {p95_delta:.2}");
     println!("  Families: {}  Blocks: {}", per_family.len(), per_block.len());
 
+    // Per-mode reports: unconditional, so single-arm runs keep their wall
+    // clock, replay totals, and per-target aggregates even though the paired
+    // per_contract analysis above is empty.
+    let build_mode_report = |mode: &str,
+                             arm: &ArmStats,
+                             samples: &HashMap<B256, Vec<(u64, usize, f64)>>,
+                             jump: Option<u64>| {
+        let mut per_target: Vec<TargetAggregate> = samples
+            .iter()
+            .map(|(h, v)| TargetAggregate {
+                code_hash: format!("0x{}", hex::encode(h)),
+                samples: v.len(),
+                total_us: v.iter().map(|(_, _, us)| *us).sum(),
+            })
+            .collect();
+        per_target.sort_by(|a, b| {
+            b.total_us.partial_cmp(&a.total_us).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        ModeReport {
+            mode: mode.to_string(),
+            exec_wall_seconds: arm.exec_wall_s,
+            blocks_replayed: blocks_measured,
+            blocks_skipped_unreadable: blocks_skipped,
+            tx_count: arm.tx_count,
+            success_count: arm.success_count,
+            total_gas: arm.total_gas,
+            samples_total: samples.values().map(|v| v.len()).sum(),
+            targets_hit: samples.len(),
+            masked_jump_hits: jump,
+            per_target,
+        }
+    };
+    let mut mode_reports: Vec<ModeReport> = Vec::new();
+    if mode_per_hash {
+        mode_reports.push(build_mode_report("per_hash", &ph_arm, &per_hash_samples, None));
+    }
+    if mode_skeleton {
+        mode_reports.push(build_mode_report("skelot", &sk_arm, &skeleton_samples, None));
+    }
+    if mode_interpreter {
+        mode_reports.push(build_mode_report(
+            "interpreter",
+            &int_arm,
+            &interpreter_samples,
+            Some(jump_hits),
+        ));
+    }
+    for mr in &mode_reports {
+        println!(
+            "  mode {}: exec_wall {:.1}s, {} txs ({} ok, gas {}), {} targets, {} samples",
+            mr.mode,
+            mr.exec_wall_seconds,
+            mr.tx_count,
+            mr.success_count,
+            mr.total_gas,
+            mr.targets_hit,
+            mr.samples_total
+        );
+    }
+
     if let Some(ref out_path) = cli.out {
         let output = Output {
             config: Config {
@@ -674,6 +873,7 @@ fn main() {
                 mean_delta_us: mean_delta,
                 p95_delta_us: p95_delta,
             },
+            mode_reports,
             per_family,
             per_block,
             per_contract: records,

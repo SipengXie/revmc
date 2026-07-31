@@ -71,6 +71,46 @@ fn main() {
                 conflicts.len(),
                 &conflicts[..conflicts.len().min(8)]
             );
+            // Forensics: who are the members, where exactly do they differ,
+            // and what are the diverging jump targets?
+            for h in &family.members {
+                let full = &contracts[h];
+                let stripped = revmc::emse::strip_emse_suffixes(full);
+                println!(
+                    "  member 0x{} raw_len={} stripped_len={}",
+                    hex::encode(h),
+                    full.len(),
+                    stripped.len()
+                );
+            }
+            let rep_len =
+                revmc::emse::strip_emse_suffixes(&contracts[&family.members[0]]).len();
+            let stripped_views: Vec<&[u8]> = family
+                .members
+                .iter()
+                .map(|h| &revmc::emse::strip_emse_suffixes(&contracts[h])[..rep_len])
+                .collect();
+            let mut diff_offsets: Vec<usize> = Vec::new();
+            for i in 0..rep_len {
+                if stripped_views.iter().any(|v| v[i] != stripped_views[0][i]) {
+                    diff_offsets.push(i);
+                }
+            }
+            println!(
+                "  in-region diff bytes: {} at offsets {:?}{}",
+                diff_offsets.len(),
+                &diff_offsets[..diff_offsets.len().min(30)],
+                if diff_offsets.len() > 30 { " ..." } else { "" }
+            );
+            let imms: Vec<Vec<(usize, &[u8])>> = stripped_views
+                .iter()
+                .map(|v| revmc::skeleton::extract_push_immediates(v))
+                .collect();
+            for &ord in conflicts.iter() {
+                let vals: Vec<String> =
+                    imms.iter().map(|m| hex::encode(m[ord].1)).collect();
+                println!("    conflict push #{ord}: member values {vals:?}");
+            }
         }
     }
     println!("---");

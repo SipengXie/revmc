@@ -277,7 +277,7 @@ pub fn extract_opcode_skeleton(bytecode: &[u8]) -> Vec<u8> {
 /// opcode order. `bytes` is shorter than `declared_len` only for a PUSH
 /// truncated by the physical end of code. Skips PUSH0 (no immediate bytes,
 /// always zero).
-pub(crate) fn extract_push_immediates(bytecode: &[u8]) -> Vec<(usize, &[u8])> {
+pub fn extract_push_immediates(bytecode: &[u8]) -> Vec<(usize, &[u8])> {
     let mut result = Vec::new();
     let mut i = 0;
     while i < bytecode.len() {

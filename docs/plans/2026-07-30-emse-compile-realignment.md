@@ -471,3 +471,24 @@ calibration; (b) explaining Arb's low family density / modest compile
 speedup as a sampling-window property, not a method failure.
 Method: inline Python parser over bincode TxBin (fields per
 examples/runner/src/bin_common.rs TxBin), seed 7, 200 blocks/chain.
+
+### Family 0ec92b5d forensics (task done before Arb launch, 2026-07-31)
+Members (Base 10K), all raw_len=11,224 / stripped_len=11,171 (53-byte CBOR):
+- 0x01da7045… (member A), 0x0e1168d0… (B), 0xf6ac0a06… (C)
+Byte-level facts (skip_logic_conflicts forensic dump):
+- 196 differing bytes inside the stripped region — by construction all in
+  PUSH immediates (identical skeleton ⇒ opcode bytes identical), plus the
+  53-byte metadata each.
+- All 14 conflicting static-jump PUSHes are PUSH2; **B and C agree on every
+  one of them — the divergence is entirely A vs (B,C)**, with regular target
+  displacements (e.g. 0x26f1 vs 0x2711 = +0x20; 0x26b1 vs 0x2731 = +0x80),
+  and each value lands on a JUMPDEST valid in all three (same skeleton ⇒
+  same JUMPDEST set).
+Reading: B and C are two deployments of the same variant (differing in other
+immediates + metadata); A is a variant with genuinely different control-flow
+entry points — same template, different compile-time configuration steering
+several branches to different targets. A "structural false twin": byte-wise
+identical skeleton, different logic. Exactly the class the static-jump
+pre-check must degrade to per-member compilation; the compile run confirmed
+1 family / 3 members, and §6.2 can cite this family as the concrete instance
+(with the defense-in-depth note: the apply_variance assert stood behind it).

@@ -5,15 +5,12 @@
 //! used at compile time — a different member set produces wrong data-table
 //! slot assignments and silent correctness bugs.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
 use revm::primitives::B256;
 use revmc::emse::{bytecode_view, group_skeleton_families, SkeletonMode};
 use revmc::skeleton::{analyze_skeleton_group_with_mode, build_data_table, ClassifyMode};
-
-use crate::bin_common::BinLoader;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct RegistryEntry {
@@ -28,6 +25,13 @@ pub struct RegistryEntry {
     /// false) may still contain such families and must be rebuilt.
     #[serde(default)]
     pub static_jump_checked: bool,
+    /// Boundary/classify fingerprint the registry was built under. Loading a
+    /// registry into a run with different flags would hand mismatched data
+    /// tables to the compiled artifacts (wrong immediates, no crash).
+    #[serde(default)]
+    pub skeleton_mode: String,
+    #[serde(default)]
+    pub classify_mode: String,
 }
 
 pub struct AnalyzedGroup {
@@ -85,6 +89,20 @@ pub fn load_or_build_families(
                 registry_path
             );
         }
+        // Fingerprint check: a registry built under different flags carries
+        // data tables whose slot layout does not match this run's artifacts.
+        if let Some(e) = entries.iter().find(|e| {
+            e.skeleton_mode != skeleton_mode.as_str() || e.classify_mode != classify_mode.as_str()
+        }) {
+            panic!(
+                "registry {} was built for skeleton_mode={} classify_mode={}, but this run uses {}/{} — rebuild without --registry",
+                registry_path,
+                e.skeleton_mode,
+                e.classify_mode,
+                skeleton_mode.as_str(),
+                classify_mode.as_str()
+            );
+        }
 
         let has_cached_tables = entries.first().map_or(false, |e| !e.member_data_tables.is_empty());
 
@@ -122,26 +140,17 @@ pub fn load_or_build_families(
                 })
                 .collect();
         } else {
-            // Registry without cached tables — fall back to bytecode scan
+            // Registry without cached tables — fall back to bytecode scan.
+            // Same collector as the compile driver: a corpus differing by
+            // even one member reassigns table indices and silently corrupts
+            // every data table in that family.
             println!("  Registry lacks cached data tables, scanning bytecodes...");
-            let mut all_codes: HashMap<B256, Vec<u8>> = HashMap::new();
-            let mut blocks_loaded = 0usize;
-            for bn in start_block..start_block + block_count {
-                if let Ok(loader) = BinLoader::new(bench_dir, bn) {
-                    for (h, bc) in loader.code_values() {
-                        if !bc.is_empty() {
-                            all_codes
-                                .entry(*h)
-                                .or_insert_with(|| bc.original_byte_slice().to_vec());
-                        }
-                    }
-                    blocks_loaded += 1;
-                    if blocks_loaded % 1000 == 0 {
-                        eprint!("  [{blocks_loaded}] {} unique bytecodes\r", all_codes.len());
-                    }
-                }
-            }
-            println!("  Scanned {blocks_loaded} blocks, {} unique bytecodes", all_codes.len());
+            let all_codes = crate::skelot_common::collect_bytecodes(
+                bench_dir,
+                start_block,
+                block_count,
+            );
+            println!("  Collected {} unique bytecodes (states-only scan)", all_codes.len());
 
             analyzed = entries
                 .into_iter()
@@ -181,24 +190,11 @@ pub fn load_or_build_families(
             block_count
         );
 
-        let mut all_codes: HashMap<B256, Vec<u8>> = HashMap::new();
-        let mut blocks_loaded = 0usize;
-        for bn in start_block..start_block + block_count {
-            if let Ok(loader) = BinLoader::new(bench_dir, bn) {
-                for (h, bc) in loader.code_values() {
-                    if !bc.is_empty() {
-                        all_codes.entry(*h).or_insert_with(|| bc.original_byte_slice().to_vec());
-                    }
-                }
-                blocks_loaded += 1;
-                if blocks_loaded % 1000 == 0 {
-                    eprint!("  [{blocks_loaded}] {} unique bytecodes\r", all_codes.len());
-                }
-            }
-        }
-        println!("  Scanned {blocks_loaded} blocks, {} unique bytecodes", all_codes.len());
-
-        all_codes.retain(|_, bytes| !crate::skelot_common::should_skip_bytes(bytes));
+        // Same collector as the compile driver (states-only scan with the
+        // shared skip filter) so the member universe cannot drift.
+        let all_codes =
+            crate::skelot_common::collect_bytecodes(bench_dir, start_block, block_count);
+        println!("  Collected {} unique bytecodes (states-only scan)", all_codes.len());
 
         // Shared grouping: in-bucket skeleton-byte verification plus (under
         // EMSE) the g1/g2 admission guards. Must match the compile driver so
@@ -290,6 +286,8 @@ pub fn load_or_build_families(
                         })
                         .collect(),
                     static_jump_checked: true,
+                    skeleton_mode: skeleton_mode.as_str().to_string(),
+                    classify_mode: classify_mode.as_str().to_string(),
                 }
             })
             .collect();

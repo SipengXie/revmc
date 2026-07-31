@@ -119,22 +119,43 @@ pub fn collect_bytecodes(
     block_count: u64,
 ) -> std::collections::HashMap<B256, Vec<u8>> {
     let mut all: std::collections::HashMap<B256, Vec<u8>> = std::collections::HashMap::new();
+    let (mut unreadable, mut undecodable, mut skipped_codes) = (0u64, 0u64, 0u64);
     for bn in start_block..start_block + block_count {
         let path = bench_dir.join(format!("states/{bn}.bin"));
-        let Ok(data) = std::fs::read(&path) else { continue };
+        let Ok(data) = std::fs::read(&path) else {
+            unreadable += 1;
+            continue;
+        };
         let Ok(mut snapshot): Result<CacheSnapshot, _> = bincode::deserialize(&data) else {
+            undecodable += 1;
             continue;
         };
         let codes = std::mem::take(&mut snapshot.codes);
         drop(snapshot);
         for (hash, bytecode) in codes {
-            let raw = bytecode.original_byte_slice().to_vec();
+            // Clamp like iter_bytecode_raw: serde fills the analyzed fields
+            // directly (no constructor assert), so a corrupt original_len
+            // must not become an out-of-bounds slice under panic=abort.
+            let raw = match &bytecode {
+                Bytecode::LegacyAnalyzed(a) => {
+                    let b = a.bytecode();
+                    b[..a.original_len().min(b.len())].to_vec()
+                }
+                other => other.original_byte_slice().to_vec(),
+            };
             if should_skip_bytes(&raw) {
+                skipped_codes += 1;
                 continue;
             }
             all.entry(hash).or_insert(raw);
         }
     }
+    if unreadable + undecodable > 0 {
+        eprintln!(
+            "  WARN: corpus scan skipped {unreadable} unreadable + {undecodable} undecodable state files (of {block_count})"
+        );
+    }
+    eprintln!("  corpus filter: {skipped_codes} code entries excluded (0xEF prefix / empty)");
     all
 }
 
@@ -148,7 +169,14 @@ pub fn collect_bytecodes_cached(
     block_count: u64,
 ) -> std::collections::HashMap<B256, Vec<u8>> {
     let cache_dir = index_cache_dir();
-    let cache_path = cache_dir.join(format!("bytecodes_{start_block}_{block_count}.bin"));
+    // Key includes the corpus directory name: two chains (or corpus
+    // versions) over the same block window must never share a cache file.
+    let corpus_tag = bench_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "corpus".into());
+    let cache_path =
+        cache_dir.join(format!("bytecodes_{corpus_tag}_{start_block}_{block_count}.bin"));
     if let Ok(data) = std::fs::read(&cache_path) {
         match bincode::deserialize::<std::collections::HashMap<B256, Vec<u8>>>(&data) {
             Ok(map) => {

@@ -111,6 +111,7 @@ fn run_per_hash(
     cache_dir: &Path,
     threads: usize,
     resume: bool,
+    sidecar: &UnitSidecar,
 ) -> (Vec<(B256, f64, u64)>, f64) {
     let opt = OptimizationLevel::Aggressive;
     let mut jobs: Vec<(B256, Vec<u8>)> = contracts.iter().map(|(h, b)| (*h, b.clone())).collect();
@@ -131,17 +132,20 @@ fn run_per_hash(
         assignments[i % threads].push(item);
     }
     let counter = AtomicUsize::new(0);
+    let resumed = AtomicUsize::new(0);
 
     std::thread::scope(|s| {
         for chunk in assignments {
             let compiled_ref = &compiled;
             let counter_ref = &counter;
+            let resumed_ref = &resumed;
             s.spawn(move || {
                 for (hash, bytes) in chunk {
                     let artifacts = per_hash_paths(cache_dir, &hash, opt);
                     if resume && artifacts.library.exists() {
-                        let size = fs::metadata(&artifacts.object).map(|m| m.len()).unwrap_or(0);
-                        compiled_ref.lock().unwrap().push((hash, 0.0, size));
+                        // Skipped units carry no timing: recording 0.0 ms
+                        // would silently fabricate a fast arm on resume.
+                        resumed_ref.fetch_add(1, Ordering::Relaxed);
                         counter_ref.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
@@ -158,6 +162,12 @@ fn run_per_hash(
                             let size =
                                 fs::metadata(&artifacts.object).map(|m| m.len()).unwrap_or(0);
                             compiled_ref.lock().unwrap().push((hash, dur, size));
+                            sidecar.record(
+                                "per_hash",
+                                &format!("0x{}", hex::encode(hash)),
+                                dur * 1000.0,
+                                size,
+                            );
                             let done = counter_ref.fetch_add(1, Ordering::Relaxed) + 1;
                             if done % 50 == 0 {
                                 eprintln!(
@@ -173,8 +183,72 @@ fn run_per_hash(
         }
     });
 
+    let resumed_total = resumed.load(Ordering::Relaxed);
+    if resumed_total > 0 {
+        eprintln!(
+            "  WARN: resume skipped {resumed_total} pre-existing units — they are EXCLUDED from timing records; totals are not a cold-compile measurement"
+        );
+    }
     let total_dur = total_t0.elapsed().as_secs_f64();
     (compiled.into_inner().unwrap(), total_dur)
+}
+
+/// Per-unit JSONL sidecar (`{out}.units.jsonl`): one appended line per
+/// finished compile unit, so a crash can no longer erase an arm's timing
+/// detail (INCIDENT 1). One buffered write per unit (<100 B) against
+/// 100ms-scale unit compiles; symmetric across arms.
+struct UnitSidecar(Option<std::sync::Mutex<fs::File>>);
+
+impl UnitSidecar {
+    fn open(out: &str) -> Self {
+        let path = format!("{out}.units.jsonl");
+        if let Some(parent) = Path::new(&path).parent() {
+            fs::create_dir_all(parent).ok();
+        }
+        match fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => Self(Some(std::sync::Mutex::new(f))),
+            Err(e) => {
+                eprintln!("  WARN: cannot open unit sidecar {path}: {e}; detail persists only in the final JSON");
+                Self(None)
+            }
+        }
+    }
+
+    fn record(&self, mode: &str, unit: &str, ms: f64, o_bytes: u64) {
+        if let Some(f) = &self.0 {
+            use std::io::Write;
+            let line = format!("{{\"mode\":\"{mode}\",\"unit\":\"{unit}\",\"ms\":{ms:.3},\"o_bytes\":{o_bytes}}}\n");
+            if let Ok(mut g) = f.lock() {
+                let _ = g.write_all(line.as_bytes());
+            }
+        }
+    }
+}
+
+/// Persist one arm's record immediately (arm-level durability): merge into
+/// the existing output file, refusing duplicate (scope, mode) pairs so a
+/// rerun cannot silently stack stale records for downstream consumers.
+fn append_record_now(out: &str, record: CompileRecord) {
+    let out_path = PathBuf::from(out);
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent).ok();
+    }
+    let mut all: CompileBenchOut = if out_path.exists() {
+        serde_json::from_slice(&fs::read(&out_path).expect("read out"))
+            .expect("parse existing out")
+    } else {
+        CompileBenchOut { records: Vec::new() }
+    };
+    if all.records.iter().any(|r| r.scope == record.scope && r.mode == record.mode) {
+        panic!(
+            "{out} already holds a record for scope={} mode={}; refusing to append a duplicate — use a fresh --out or remove the stale record",
+            record.scope, record.mode
+        );
+    }
+    all.records.push(record);
+    fs::write(&out_path, serde_json::to_vec_pretty(&all).expect("serialize"))
+        .expect("write compile_bench.json");
+    eprintln!("  wrote {} ({} records)", out_path.display(), all.records.len());
 }
 
 struct SkeletonRunOutcome {
@@ -196,6 +270,7 @@ fn run_skeleton(
     resume: bool,
     skeleton_mode: SkeletonMode,
     classify_mode: ClassifyMode,
+    sidecar: &UnitSidecar,
 ) -> SkeletonRunOutcome {
     let opt = OptimizationLevel::Aggressive;
 
@@ -274,6 +349,7 @@ fn run_skeleton(
     let compiled = std::sync::Mutex::new(Vec::<(B256, f64, u64)>::new());
     let families_out = std::sync::Mutex::new(Vec::<FamilyRecord>::new());
     let fallback_count = AtomicUsize::new(0);
+    let fam_done = AtomicUsize::new(0);
     let total_t0 = Instant::now();
 
     let mut assignments: Vec<Vec<(u64, Vec<B256>, SkeletonVariance)>> =
@@ -287,6 +363,7 @@ fn run_skeleton(
             let compiled_ref = &compiled;
             let families_ref = &families_out;
             let fb_ref = &fallback_count;
+            let fam_done_ref = &fam_done;
             s.spawn(move || {
                 for (skel_hash, member_hashes, variance) in chunk {
                     let a = skeleton_paths(cache_dir, skel_hash, opt);
@@ -297,11 +374,24 @@ fn run_skeleton(
                             rep_bytes, &variance, &a.symbol, &a.object, &a.library, opt,
                         )
                     }));
+                    let done = fam_done_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % 50 == 0 {
+                        eprintln!(
+                            "  [skelot family {done}] {:.1}s",
+                            total_t0.elapsed().as_secs_f64()
+                        );
+                    }
                     match result {
                         Ok(Ok(())) => {
                             let dur = t0.elapsed().as_secs_f64();
                             let o_size = fs::metadata(&a.object).map(|m| m.len()).unwrap_or(0);
                             compiled_ref.lock().unwrap().push((member_hashes[0], dur, o_size));
+                            sidecar.record(
+                                "skelot",
+                                &format!("skel_{skel_hash:016x}"),
+                                dur * 1000.0,
+                                o_size,
+                            );
                             families_ref.lock().unwrap().push(FamilyRecord {
                                 skeleton_hash: format!("{:016x}", skel_hash),
                                 members: member_hashes.len(),
@@ -333,6 +423,12 @@ fn run_skeleton(
                                 let dur = t1.elapsed().as_secs_f64();
                                 let o_size = fs::metadata(&a.object).map(|m| m.len()).unwrap_or(0);
                                 compiled_ref.lock().unwrap().push((*hash, dur, o_size));
+                                sidecar.record(
+                                    "skelot",
+                                    &format!("0x{}", hex::encode(hash)),
+                                    dur * 1000.0,
+                                    o_size,
+                                );
                             }
                             families_ref.lock().unwrap().push(FamilyRecord {
                                 skeleton_hash: format!("{:016x}", skel_hash),
@@ -352,9 +448,11 @@ fn run_skeleton(
     for (i, hash) in singletons.into_iter().enumerate() {
         singleton_assignments[i % threads].push(hash);
     }
+    let single_done = AtomicUsize::new(0);
     std::thread::scope(|s| {
         for chunk in singleton_assignments {
             let compiled_ref = &compiled;
+            let single_done_ref = &single_done;
             s.spawn(move || {
                 for hash in chunk {
                     let bytes = &contracts[&hash];
@@ -367,6 +465,14 @@ fn run_skeleton(
                     let dur = t0.elapsed().as_secs_f64();
                     let o_size = fs::metadata(&a.object).map(|m| m.len()).unwrap_or(0);
                     compiled_ref.lock().unwrap().push((hash, dur, o_size));
+                    sidecar.record("skelot", &format!("0x{}", hex::encode(hash)), dur * 1000.0, o_size);
+                    let done = single_done_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % 500 == 0 {
+                        eprintln!(
+                            "  [skelot singleton {done}] {:.1}s",
+                            total_t0.elapsed().as_secs_f64()
+                        );
+                    }
                 }
             });
         }
@@ -395,14 +501,15 @@ fn main() {
     eprintln!("Collected {} compilable bytecodes", contracts.len());
     let cache_dir = PathBuf::from(&args.cache_dir);
     fs::create_dir_all(&cache_dir).expect("mk cache");
-    let mut records: Vec<CompileRecord> = Vec::new();
+    let sidecar = UnitSidecar::open(&args.out);
 
     if args.mode == "per-hash" || args.mode == "both" {
         let ph_cache = cache_dir.join("per_hash");
         fs::create_dir_all(&ph_cache).ok();
-        let (items, total) = run_per_hash(&contracts, &ph_cache, args.threads, args.resume);
+        let (items, total) =
+            run_per_hash(&contracts, &ph_cache, args.threads, args.resume, &sidecar);
         let total_o: u64 = items.iter().map(|(_, _, s)| *s).sum();
-        records.push(CompileRecord {
+        append_record_now(&args.out, CompileRecord {
             scope: args.scope.clone(),
             mode: "per_hash".into(),
             n_units: items.len(),
@@ -434,9 +541,10 @@ fn main() {
             args.resume,
             args.skeleton_mode,
             classify_mode,
+            &sidecar,
         );
         let total_o: u64 = run.items.iter().map(|(_, _, s)| *s).sum();
-        records.push(CompileRecord {
+        append_record_now(&args.out, CompileRecord {
             scope: args.scope.clone(),
             mode: "skelot".into(),
             n_units: run.items.len(),
@@ -465,23 +573,4 @@ fn main() {
             }),
         });
     }
-
-    let out = CompileBenchOut { records };
-    let out_path = PathBuf::from(&args.out);
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent).ok();
-    }
-    let merged = if out_path.exists() {
-        let existing: CompileBenchOut =
-            serde_json::from_slice(&fs::read(&out_path).expect("read out"))
-                .expect("parse existing out");
-        let mut all = existing.records;
-        all.extend(out.records);
-        CompileBenchOut { records: all }
-    } else {
-        out
-    };
-    fs::write(&out_path, serde_json::to_vec_pretty(&merged).expect("serialize"))
-        .expect("write compile_bench.json");
-    eprintln!("wrote {}", out_path.display());
 }
