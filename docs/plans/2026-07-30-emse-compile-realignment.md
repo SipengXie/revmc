@@ -654,3 +654,18 @@ analysis (both halves share the convention).
 Family map for aggregation: `data/family_map_emse_base.tsv` (19,130 rows;
 818-family grouping, per-hash contracts as solo_* units; the stale
 `ssa_cache/skeleton_mapping.tsv` was NOT used).
+
+### [HO-COV] Step 0 verdict: TOOL QUALIFIED (2026-07-31)
+Same 500 blocks (38004930..+500), identical args, two full runs:
+- Family-rank agreement between the two runs: top-10 100%, **top-50 98%**
+  (qualification bar ≥90% — PASS), top-100 100%; rank correlation 0.9998.
+  The 98% top-50 figure is the measurement ceiling against which the real
+  H1-vs-H2 overlap must be read.
+- Skips: 500/500 blocks processed, 0 skipped (<1% bar); unmatched-to-corpus
+  time 0.0% in both runs.
+- Timing: ~66 s per 500-block run → est. ~11 min per 5,000-block half.
+- Scheduling decision: all compiles are done and the machine is quiet —
+  running both halves now (the "before the 20h compile" option is moot).
+- Parser provenance: bincode layout (length-prefixed 32-byte U256s)
+  verified by full-byte-consumption asserts; per-entrypoint totals summed
+  by code_hash then mapped via family_map_emse_base.tsv.
