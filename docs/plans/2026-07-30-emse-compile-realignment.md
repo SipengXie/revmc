@@ -557,3 +557,23 @@ upper end; guards single-digit (g1 2/4, g2 0, degradations 0, collisions 0,
 fallback 0); speedup far below Base's 2.07× as pre-declared (lowest family
 density — see the tx-composition note: the 10K-block Arb window holds ~37 K
 txs vs Base's ~3.5 M).
+
+## Addendum 7 (revmc session, 2026-07-31): exec_sanity over the FINAL grouping — 0 mismatches
+
+Full-corpus paired run (`skeleton_vs_perhash_bench --only-mode both
+--sample-every 1 --rounds 1 --warmup 0`, single-threaded, ~4.2 h), log
+`exec_sanity_emse_base_20260731T171340Z.log`, JSON `exec_sanity_emse_base.json`.
+- **Correctness anchor PASS: 0 MISMATCH lines over 10,000 blocks** (0 skipped);
+  per-arm replay totals identical to the digit: 3,520,323 txs, 2,511,307
+  successes, total gas 458,309,813,705 in BOTH arms.
+- Paired per-frame timing (bonus): 6,486 members with enough samples —
+  median speedup **1.2424×** (reference 1.17×, band [1.0, 1.5] — PASS);
+  2,999 SKELETON_FASTER / 3,420 EQUIVALENT / 67 SKELETON_SLOWER.
+- **[JUMP-HIT] observation: count = 4 in this (JIT-armed) run** — flagged
+  not-meaningful for this arm (JIT frames bypass the table; each block is
+  replayed 4×, so 4 counts may be ONE unique tx). The authoritative number
+  comes from the step-4 interpreter arm (1 replay/block); if non-zero there,
+  a separate untimed pass will attribute exact tx hashes per the brief
+  ("non-zero is a finding, not a failure").
+- Registry with fingerprints written: `data/skeleton_registry_full_emse.bin`
+  (reused by the three-arm replay).
