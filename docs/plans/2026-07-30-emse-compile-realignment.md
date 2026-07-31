@@ -855,3 +855,25 @@ runtime code.
    adjudication; correct-caliber recomputation delivered alongside.
 
 ALL EXPERIMENTS DONE 2026-07-31T19:38:21Z
+
+### Old paper curve vs new: the SkelOT column is stable, the NAIVE baseline was flattered
+Side-by-side with `data/coverage_budget.json` (old: inclusive caliber, old
+grouping, universe 24,037 hashes / 11,120 skeletons vs new 19,130 / 10,037
+— note the universes differ, so this is a shape comparison):
+
+| coverage | OLD Naive | NEW Naive | OLD SkelOT | NEW SkelOT |
+|---|---|---|---|---|
+| 75% | 63 u / 18.8 MB | 67 / 25.2 | 53 / 16.7 | **35 / 12.1** |
+| 90% | 238 / 65.4 | **348 / 125.3** | 184 / 50.7 | 144 / 48.9 |
+| 95% | 535 / 145.7 | **851 / 289.7** | 372 / **101.0** | 341 / **100.3** |
+| 99% | 2,128 / 592.2 | **3,034 / 1,024.6** | 1,254 / **320.2** | 1,229 / **328.8** |
+
+Two findings: (1) the SkelOT column barely moves across BOTH a caliber
+change and a grouping change (95%: 101.0 → 100.3 MB; 99%: 320.2 → 328.8 MB)
+— a strong robustness signal worth stating in the rebuttal; (2) the Naive
+column grows substantially under the correct caliber, because inclusive
+timing parked the workload's time on a handful of router/entry contracts,
+making "compile a few big contracts" look sufficient — i.e. the old caliber
+FLATTERED the Naive baseline. Net effect of the correction is in our
+favour: at 95% coverage the unit saving goes from 30% (372/535) to **60%**
+(341/851).
