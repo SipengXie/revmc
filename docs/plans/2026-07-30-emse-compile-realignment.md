@@ -529,3 +529,10 @@ they did not stop it either. Partial cache and sidecar were discarded;
 attempt 2 relaunched cold at 14:54 UTC (anchor line `Collected 2895` hit
 again). Only cost: ~35 min. Watch item: if attempt 2 is terminated the
 same way, stop and escalate instead of relaunching.
+
+### NOTE FOR PAPER SESSION (user, 2026-07-31): absolute numbers in prose
+When citing compile results in the paper/rebuttal, always pair the ratio
+with the absolute figures (e.g. "2.07× — 27,860 s vs 13,483 s wall;
+57.4% — 5.050 GB vs 2.151 GB; 19,130 vs 10,037 units"), so reviewers
+cannot object that only percentages are reported. All absolutes are in the
+Addendum 5 table and in `compile_bench_emse_base.json`.
