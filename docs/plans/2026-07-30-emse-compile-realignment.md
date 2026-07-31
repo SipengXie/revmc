@@ -1251,3 +1251,32 @@ published data archived as `ablation_allvariant.{families.published-44of85
 re-measured with the current compiler and the frame-level index, so the
 whole table — compile AND runtime columns — shares one caliber with the
 rest of the revision.
+
+### Rebuild RESULT (2026-07-31): 77/85 runtime coverage, published claims hold
+
+Full cold rebuild of all 85 families with the current compiler and the
+frame-level representative index completed cleanly (exit 0, ~50 min,
+16 compile threads). Log `stage_e_full_rebuild_20260731T210810Z.log`;
+outputs `ablation_allvariant.{json,families.jsonl}`; published data
+preserved as `*.published-44of85.jsonl` / `*.published.json`.
+
+| metric | published | rebuild |
+|---|---|---|
+| families with runtime data | 44/85 | **77/85** |
+| all-variant vs split, artifact size | +29.6% | **+29.4%** |
+| all-variant vs split, compile time | <2% | **−0.5%** |
+| all-variant vs split, exec median | ~1.15× | **1.075×** |
+
+Per-family median frame duration over the 77 measured families:
+Naive per-hash 1,407 ns, SkelOT split 1,346 ns, all-variant 1,556 ns.
+Whole-table compile/size: per-hash 27,258.8 s / 266.1 MB, split 1,223.3 s /
+15.8 MB, all-variant 1,217.3 s / 20.4 MB.
+
+Reading: the two structural claims reproduce almost exactly (+29.4% size,
+compile-time parity) on a 75% larger sample and under the current compiler.
+The execution penalty of all-variant comes out **smaller** than published
+(1.075× vs ~1.15×) — expected direction, since the 33 newly measured
+families are internal-call-only contracts that were systematically absent
+before, and they are not the data-table-heavy hot paths that drove the old
+number. The 8 remaining gaps are families whose members never execute
+anywhere in the 10K window (corpus limit, not a tooling limit).
