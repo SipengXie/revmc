@@ -344,3 +344,47 @@ This section accumulates per-step numbers, anchor checks, and any deviations.
   from original bytes (load phase, all arms symmetric). Recorded here because
   it is a runner-side change beyond the fork — without it the stored
   (unmasked) tables would silently bypass the hardened semantics.
+
+### INCIDENT 1 (2026-07-30 23:47 UTC): SkelOT arm abort at launch — diagnosed, fixed, relaunching
+- What happened: the Base `--mode both` run finished the ENTIRE Naive arm
+  (19,130 units, ~27,600 s ≈ 7.7 h wall) and then aborted (SIGABRT) at the
+  very start of the SkelOT arm: `apply_variance` assert "PUSH at index 398
+  is both SKIP_LOGIC and Variant". Grouping stats printed by the run still
+  matched every anchor (818 / 9,217 / g1 7-17 / g2 0 / 0 splits). The
+  per-hash timing detail died with the process (JSON is written at the end),
+  so the Naive numbers of this attempt exist only as log progress lines.
+- Root cause (two layers):
+  1. One EMSE family (skel 0ec92b5d1a2b3c7b, 3 members) has 14 PUSHes whose
+     values differ across members (Auto ⇒ Variant) AND feed an adjacent
+     JUMP/JUMPI (backend folds them to compile-time static jumps). Members
+     genuinely jump to different targets — one shared artifact cannot fold
+     those jumps; the assert is correct. Old-boundary runs never saw this:
+     such families only group under the EMSE boundary (metadata-differing
+     variants). Diagnosed with the new `skip_logic_conflicts` bin: exactly
+     1 family / 3 members / 14 PUSHes affected out of 818 families.
+  2. The driver ALREADY had a per-family fallback (catch_unwind →
+     per-member compilation, `fallback` counter), but the workspace builds
+     with `panic = "abort"` — catch_unwind can never fire, so the intended
+     degradation path was dead code and the assert killed the process.
+     (A "green light that cannot turn red": the fallback had never been
+     exercised under the release profile.)
+- Fix (minimal, semantics-preserving, timing path untouched):
+  `revmc::skeleton::variance_conflicts_static_jumps` (reference bytes +
+  variance → bool) + PRE-CHECK during the untimed analysis phase in all four
+  skeleton consumers (skelot_compile_bench, vs_perhash slow path,
+  skeleton_bench, skeleton_precompile; skelot_ablation_bench skips such
+  families). Conflicting families degrade to per-hash exactly like the
+  existing `fallback` semantics; counts are logged and exported in the JSON
+  `grouping` block (`static_jump_degraded_families/members`). The compiler
+  assert stays (now a guarded invariant). g1/g2 logic untouched.
+- Expected effect on anchors: grouping-level numbers unchanged (818 families
+  etc. are pre-degradation); compile-level realized families 818 → 817,
+  SkelOT units 10,035 → 10,037 (+3 members −1 family). Well inside the
+  "degradations" allowance already noted in Addendum 3 (static ceiling
+  10,025 vs 10,035).
+- Verification: `cargo test -p revmc skeleton` 29/29 green (incl. new
+  detection test); 10K smoke of the skeleton arm confirms the degradation
+  fires in the analysis phase and compilation proceeds past it.
+- Action: Base `--mode both` relaunched from scratch into a FRESH cache dir
+  (cold start, both arms in one run for provenance); the aborted attempt's
+  partial cache was discarded.
