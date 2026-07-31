@@ -37,6 +37,12 @@ struct Args {
     /// stripped-suffix content (all-zero vs contains-metadata).
     #[arg(long, default_value_t = 0)]
     dump_g1: usize,
+    /// Export a TSV mapping every contract code hash to its compile-unit id:
+    /// family members map to `fam_<skel_hash>`, per-hash contracts to
+    /// `solo_<code_hash[..16]>`. Covers the whole corpus so downstream
+    /// aggregation needs no special-casing.
+    #[arg(long)]
+    export_family_map: Option<String>,
     /// Time the [FAM-ANALYSIS] phases over all admitted families: PUSH
     /// variance classification (+static-jump pre-check) and per-member data
     /// table construction. The compile driver runs the same code but does
@@ -76,6 +82,23 @@ fn main() {
     println!("g1_rejected_members: {}", s.g1_rejected_members);
     println!("g2_rejected_members: {}", s.g2_rejected_members);
     println!("collision_groups_split: {}", s.collision_groups_split);
+
+    if let Some(path) = &args.export_family_map {
+        use std::io::Write;
+        let mut out = String::with_capacity(contracts.len() * 90);
+        for family in &grouping.families {
+            for h in &family.members {
+                out.push_str(&format!("0x{}\tfam_{:016x}\n", hex::encode(h), family.skel_hash));
+            }
+        }
+        for h in &grouping.per_hash {
+            let hh = hex::encode(h);
+            out.push_str(&format!("0x{hh}\tsolo_{}\n", &hh[..16]));
+        }
+        let mut f = std::fs::File::create(path).expect("create family map");
+        f.write_all(out.as_bytes()).expect("write family map");
+        println!("family_map_exported: {path} ({} rows)", contracts.len());
+    }
 
     if args.time_analysis {
         use revmc::emse::bytecode_view;
