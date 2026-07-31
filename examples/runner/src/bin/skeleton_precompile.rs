@@ -277,7 +277,7 @@ fn main() {
     // equality (colliding buckets split); under EMSE the g1/g2 admission
     // guards run here and rejected members fall back to per-hash.
     let grouping = group_skeleton_families(&all_codes, args.skeleton_mode);
-    let singletons: Vec<(B256, Vec<u8>)> =
+    let mut singletons: Vec<(B256, Vec<u8>)> =
         grouping.per_hash.iter().map(|h| (*h, all_codes[h].clone())).collect();
     let groups: Vec<(u64, Vec<(B256, Vec<u8>)>)> = grouping
         .families
@@ -308,14 +308,24 @@ fn main() {
         }
     }
 
-    // Analyze variance for each group over the mode's bytecode view
+    // Analyze variance for each group over the mode's bytecode view.
+    // Static-jump-conflicting families are degraded to per-hash, mirroring
+    // the compile driver (their members compile as singletons instead).
     let group_variances: Vec<(u64, Vec<(B256, Vec<u8>)>, SkeletonVariance)> = groups
         .into_iter()
-        .map(|(skel_hash, members)| {
+        .filter_map(|(skel_hash, members)| {
             let refs: Vec<&[u8]> =
                 members.iter().map(|(_, b)| bytecode_view(b, args.skeleton_mode)).collect();
             let variance = analyze_skeleton_group(&refs);
-            (skel_hash, members, variance)
+            if revmc::skeleton::variance_conflicts_static_jumps(refs[0], &variance) {
+                println!(
+                    "  skel {skel_hash:016x}: {} members degraded to per-hash (variant PUSH feeds a static jump)",
+                    members.len()
+                );
+                singletons.extend(members);
+                return None;
+            }
+            Some((skel_hash, members, variance))
         })
         .collect();
 

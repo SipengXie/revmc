@@ -17,7 +17,10 @@ use std::time::Instant;
 use clap::Parser;
 use revm::primitives::B256;
 use revmc::emse::{bytecode_view, group_skeleton_families, GroupingStats, SkeletonMode};
-use revmc::skeleton::{analyze_skeleton_group_with_mode, ClassifyMode, SkeletonVariance};
+use revmc::skeleton::{
+    analyze_skeleton_group_with_mode, variance_conflicts_static_jumps, ClassifyMode,
+    SkeletonVariance,
+};
 use revmc::OptimizationLevel;
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +78,10 @@ struct GroupingStatsOut {
     g1_rejected_members: usize,
     g2_rejected_members: usize,
     collision_groups_split: usize,
+    #[serde(default)]
+    static_jump_degraded_families: usize,
+    #[serde(default)]
+    static_jump_degraded_members: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -178,6 +185,8 @@ struct SkeletonRunOutcome {
     stats: GroupingStats,
     realized_families: usize,
     per_hash_units: usize,
+    static_jump_degraded_families: usize,
+    static_jump_degraded_members: usize,
 }
 
 fn run_skeleton(
@@ -193,9 +202,8 @@ fn run_skeleton(
     // Grouping with in-bucket skeleton-byte verification; under EMSE the
     // admission guards run here and rejected members land in `per_hash`.
     let grouping = group_skeleton_families(contracts, skeleton_mode);
-    let singletons = grouping.per_hash;
+    let mut singletons = grouping.per_hash;
     let stats = grouping.stats;
-    let per_hash_units = singletons.len();
 
     eprintln!(
         "  skeleton groups ({}): {} families, {} per-hash units",
@@ -212,20 +220,43 @@ fn run_skeleton(
     );
 
     // Analyze variance over the mode's bytecode view (EMSE: stripped).
+    // Families whose members jump to different static targets cannot share
+    // one artifact (the backend folds those jumps at compile time) — degrade
+    // them to per-hash up front instead of panicking in apply_variance.
+    let mut static_jump_degraded_families = 0usize;
+    let mut static_jump_degraded_members = 0usize;
     let variances: Vec<(u64, Vec<B256>, SkeletonVariance)> = grouping
         .families
         .into_iter()
-        .map(|family| {
+        .filter_map(|family| {
             let views: Vec<&[u8]> = family
                 .members
                 .iter()
                 .map(|h| bytecode_view(&contracts[h], skeleton_mode))
                 .collect();
             let variance = analyze_skeleton_group_with_mode(&views, classify_mode);
-            (family.skel_hash, family.members, variance)
+            if variance_conflicts_static_jumps(views[0], &variance) {
+                eprintln!(
+                    "  skel {:016x}: {} members degraded to per-hash (variant PUSH feeds a static jump)",
+                    family.skel_hash,
+                    family.members.len()
+                );
+                static_jump_degraded_families += 1;
+                static_jump_degraded_members += family.members.len();
+                singletons.extend(family.members);
+                return None;
+            }
+            Some((family.skel_hash, family.members, variance))
         })
         .collect();
+    let per_hash_units = singletons.len();
     let realized_families = variances.len();
+    if static_jump_degraded_families > 0 {
+        eprintln!(
+            "  static-jump degradations: {} families ({} members) -> per-hash",
+            static_jump_degraded_families, static_jump_degraded_members
+        );
+    }
 
     if !resume {
         for (sh, _, _) in &variances {
@@ -351,6 +382,8 @@ fn run_skeleton(
         stats,
         realized_families,
         per_hash_units,
+        static_jump_degraded_families,
+        static_jump_degraded_members,
     }
 }
 
@@ -427,6 +460,8 @@ fn main() {
                 g1_rejected_members: run.stats.g1_rejected_members,
                 g2_rejected_members: run.stats.g2_rejected_members,
                 collision_groups_split: run.stats.collision_groups_split,
+                static_jump_degraded_families: run.static_jump_degraded_families,
+                static_jump_degraded_members: run.static_jump_degraded_members,
             }),
         });
     }

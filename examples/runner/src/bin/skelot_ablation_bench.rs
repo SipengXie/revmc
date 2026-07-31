@@ -490,6 +490,19 @@ fn main() -> anyhow::Result<()> {
             eprintln!("[skip] family {}: no bytecodes resolved from corpus", fam.skeleton_id);
             continue;
         }
+        {
+            // Static-jump-conflicting families are degraded to per-hash by the
+            // compile drivers and never skeleton-dispatched; skip them here.
+            let refs: Vec<&[u8]> = members.iter().map(|(_, v)| v.as_slice()).collect();
+            let v = analyze_skeleton_group_with_mode(&refs, ClassifyMode::Auto);
+            if revmc::skeleton::variance_conflicts_static_jumps(refs[0], &v) {
+                eprintln!(
+                    "[skip] family {}: variant PUSH feeds a static jump (degraded family)",
+                    fam.skeleton_id
+                );
+                continue;
+            }
+        }
         // Persistent `.so` cache dir — survives across runs. Cache keyed by
         // cap to auto-invalidate when `--compile-members-cap` changes.
         let fam_cache = family_cache_dir(&fam.skeleton_id, args.compile_members_cap);

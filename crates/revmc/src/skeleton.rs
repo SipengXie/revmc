@@ -188,7 +188,7 @@ pub(crate) fn normalize_push_immediate(imm: &[u8], declared_len: usize) -> [u8; 
 /// skipped). A `true` entry means the PUSH's value is consumed by an adjacent
 /// `JUMP` or `JUMPI` to a valid JUMPDEST, so classifying it as Variant would
 /// invalidate the static-jump folding done by the backend.
-pub(crate) fn skip_logic_push_mask(bytecode: &[u8]) -> Vec<bool> {
+pub fn skip_logic_push_mask(bytecode: &[u8]) -> Vec<bool> {
     // Pass 1: collect valid JUMPDEST PCs (JUMPDEST opcodes not inside a PUSH imm).
     let mut jumpdests = std::collections::HashSet::new();
     let mut i = 0usize;
@@ -237,6 +237,22 @@ pub(crate) fn skip_logic_push_mask(bytecode: &[u8]) -> Vec<bool> {
         }
     }
     mask
+}
+
+/// `true` if any Variant-classified PUSH feeds an adjacent static JUMP/JUMPI
+/// (`skip_logic_push_mask`): the backend folds such jumps to compile-time
+/// targets, which is incompatible with a runtime table lookup —
+/// `apply_variance` asserts on the combination. Families where members
+/// genuinely jump to different targets must be degraded to per-member
+/// compilation by the caller.
+pub fn variance_conflicts_static_jumps(reference: &[u8], variance: &SkeletonVariance) -> bool {
+    let skip = skip_logic_push_mask(reference);
+    debug_assert_eq!(skip.len(), variance.pushes.len());
+    variance
+        .pushes
+        .iter()
+        .zip(skip.iter())
+        .any(|(p, s)| *s && matches!(p, PushClassification::Variant { .. }))
 }
 
 /// Extract the opcode skeleton: all opcodes kept, PUSH1..PUSH32 immediate
@@ -423,6 +439,30 @@ mod tests {
         assert_eq!(v2.pushes[0], PushClassification::Invariant);
         assert_eq!(v2.pushes[1], PushClassification::Variant { table_index: 0 });
         assert_eq!(v2.num_variant, 1);
+    }
+
+    #[test]
+    fn test_variance_conflicts_static_jumps_detection() {
+        // Members whose static-jump PUSH targets differ: PUSH1 <t>, JUMP,
+        // JUMPDEST@3, JUMPDEST@4, STOP. Both 3 and 4 are valid JUMPDESTs, so
+        // both members fold to static jumps, but Auto classifies the PUSH as
+        // Variant — exactly the combination apply_variance asserts on.
+        let a: &[u8] = &[0x60, 0x03, 0x56, 0x5b, 0x5b, 0x00];
+        let b: &[u8] = &[0x60, 0x04, 0x56, 0x5b, 0x5b, 0x00];
+        let variance = analyze_skeleton_group_with_mode(&[a, b], ClassifyMode::Auto);
+        assert_eq!(variance.num_variant, 1);
+        assert!(variance_conflicts_static_jumps(a, &variance));
+
+        // Same shape but identical targets: PUSH stays Invariant, no conflict.
+        let v_same = analyze_skeleton_group_with_mode(&[a, a], ClassifyMode::Auto);
+        assert!(!variance_conflicts_static_jumps(a, &v_same));
+
+        // Variant PUSH that does NOT feed a jump: no conflict.
+        let c: &[u8] = &[0x60, 0x41, 0x00];
+        let d: &[u8] = &[0x60, 0x42, 0x00];
+        let v_plain = analyze_skeleton_group_with_mode(&[c, d], ClassifyMode::Auto);
+        assert_eq!(v_plain.num_variant, 1);
+        assert!(!variance_conflicts_static_jumps(c, &v_plain));
     }
 
     #[test]

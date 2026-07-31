@@ -291,16 +291,26 @@ fn main() {
     let analyzed: Vec<AnalyzedGroup> = grouping
         .families
         .into_iter()
-        .map(|family| {
+        .filter_map(|family| {
             let views: Vec<&[u8]> = family
                 .members
                 .iter()
                 .map(|h| bytecode_view(&all_codes[h], cli.skeleton_mode))
                 .collect();
             let variance = analyze_skeleton_group(&views);
+            // Mirror the compile driver: static-jump-conflicting families are
+            // degraded to per-hash, never skeleton-dispatched.
+            if revmc::skeleton::variance_conflicts_static_jumps(views[0], &variance) {
+                println!(
+                    "  skel {:016x}: {} members degraded (variant PUSH feeds a static jump), excluded",
+                    family.skel_hash,
+                    family.members.len()
+                );
+                return None;
+            }
             let members: Vec<(B256, Vec<u8>)> =
                 family.members.into_iter().map(|h| (h, all_codes[&h].clone())).collect();
-            AnalyzedGroup { skel_hash: family.skel_hash, members, variance }
+            Some(AnalyzedGroup { skel_hash: family.skel_hash, members, variance })
         })
         .collect();
 
