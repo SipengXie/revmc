@@ -949,3 +949,29 @@ at the measured parallel factors 15.4/13.5):
 Recommendation to the paper session: answer C-Q2 with the summed table AND
 the break-even line, cross-referencing RQ4 — listing the five raw numbers
 alone concedes the strongest part of the answer.
+
+### C-Q2 framing correction (user, 2026-07-31): the full build is OUR worst-case choice, not a requirement
+Lead the answer with this, before any number: the end-to-end experiment
+compiles EVERY unit in the window (Naive 19,130, SkelOT 10,037). That is a
+deliberately worst-case setup chosen so the two arms differ in nothing but
+the sharing mechanism — it is NOT what a node would do, and the 26×/53×
+one-window figures are artifacts of that choice, not properties of AOT
+compilation.
+
+**RQ4 is precisely the answer to "you don't have to compile everything."**
+Execution time is extremely head-concentrated: 9 units (0.09% of the build)
+cover 50% of it, 341 units (3.4%) cover 95%. A node compiles the head and
+interprets the tail. Under that policy the same measurements give:
+
+| policy | SkelOT compile | break-even vs interpreter |
+|---|---|---|
+| compile everything (our experiment) | 13,483 s | 161 windows (~38 days) |
+| **RQ4 policy: cover 95%** | **713 s** | **9 windows (~2 days)** |
+| RQ4 policy: cover 75% | 89 s | ~2 windows |
+
+So the honest three-sentence answer to C-Q2 is: (1) here are the summed
+totals under our full-build setup, and yes, one cold window favours the
+interpreter; (2) full build is our experimental control, not a deployment
+recipe; (3) RQ4 shows the deployable policy, under which the compile bill
+drops ~19× and break-even drops from 161 windows to 9 — and SkelOT reaches
+that point ~3× sooner than Naive at every budget level.
