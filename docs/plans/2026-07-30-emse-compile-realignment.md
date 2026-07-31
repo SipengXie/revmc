@@ -669,3 +669,23 @@ Same 500 blocks (38004930..+500), identical args, two full runs:
 - Parser provenance: bincode layout (length-prefixed 32-byte U256s)
   verified by full-byte-consumption asserts; per-entrypoint totals summed
   by code_hash then mapped via family_map_emse_base.tsv.
+
+### MAJOR FINDING (user-driven, 2026-07-31): the RQ4 weight file is INCLUSIVE-timed, and hot-list selection is caliber-sensitive
+User challenged the timing semantics; empirical proof from the tool's own
+totals over 500 blocks: frame-time sum = 113.6 s vs native tx-time = 28.2 s
+— **4.04× overcount**, i.e. every nested nanosecond is counted at each
+ancestor level. `entrypoint_timing.bin` (RQ4 weights) is therefore
+INCLUSIVE, by construction of `FrameTimingInspector` (intentional in code,
+but if the paper text reads these as per-contract own-time, the wording
+needs correction — PAPER SESSION TO ADJUDICATE).
+Caliber sensitivity (fair comparison, 737 family units present in both
+universes; inclusive = old 10K RQ4 weights, exclusive = interpreter-arm
+per-frame own-time from the three-arm replay): top-10 overlap 70%,
+top-50 54%, top-100 60%. Selection is NOT caliber-robust; an
+inclusive-picked hot list contains ~half non-hot families by own-time.
+(A first naive comparison of 18-20% was DISCARDED — universe mismatch:
+the exclusive list only covers family members, solos were absent.)
+Decision (user): produce the held-out analysis on EXCLUSIVE weights using
+our audited per-frame timing (interpreter arm over each half, full-corpus
+targets); the inclusive-caliber H1/H2 stay as the RQ4-consistent
+companion. Both go to the paper session.
