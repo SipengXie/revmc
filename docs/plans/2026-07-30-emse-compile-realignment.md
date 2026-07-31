@@ -1211,3 +1211,43 @@ tiny 10 + huge 15 taken whole). So the revision can keep the rule and the
 count, but the sentence "tiny and huge hold only 10 and 15" must be
 restated. (The rebuttal's E1/E2 answer describes the PUBLISHED table and
 remains correct as written.)
+
+## Addendum 14 (revmc session, 2026-07-31): Table 4 rebuild — frame-level index works; artifact cache was stale
+
+### The fix works (evaluation confirmed empirically)
+`frame_tx_index` (commit 701f04fa) replays interpreted and records the first
+`(block, tx_index)` where each code hash appears in ANY frame — 16,634
+hashes indexed over 10K blocks, 788 s, emitting the same bincode format so
+`skelot_ablation_bench --tx-index <path>` consumes it directly.
+Partial re-run result before the abort: **34 of the 41 previously
+representative-less families got a representative**; runtime coverage rose
+44 → 59 of 85 and was on track for ~78. The remaining 7 families have no
+member that executes anywhere in the window — an irreducible limit of the
+corpus, not of the indexing.
+
+### Why the cheap path was abandoned (STALE-ARTIFACT HAZARD)
+The run aborted with SIGILL at family 57. Diagnosis found a deeper problem
+that invalidates the incremental approach regardless of the crash: the
+persistent `.so` cache (1,693 artifacts, 747 MB) dates from 2026-04-16, i.e.
+BEFORE two codegen-changing commits —
+`d12b2136` (CODESIZE loads EvmContext.bytecode_len at runtime) and
+`0567ef1d` (truncated PUSH immediates zero-extend right). Executing
+April-generated machine code under today's runtime is unsound (and the
+prime suspect for the SIGILL); even without a crash, filling in only the
+missing rows would produce a table whose 44 published rows were measured
+with April's compiler and the rest with today's — the same caliber-mixing
+error as the inclusive/exclusive weight issue.
+
+**Lesson for the gotchas list: a persistent artifact cache must be
+invalidated on ANY compiler change. `cache_hit()` only checks file
+existence and non-zero size; it carries no compiler fingerprint.**
+Suggested hardening (not done, timed paths untouched): stamp the cache
+directory with the revmc git SHA and refuse mismatched artifacts.
+
+### Decision (user, 2026-07-31): full rebuild
+Old artifacts moved aside to `stage_e_so_cache.april-stale` (not deleted);
+published data archived as `ablation_allvariant.{families.published-44of85
+.jsonl,published.json}`. All 85 families are being recompiled and
+re-measured with the current compiler and the frame-level index, so the
+whole table — compile AND runtime columns — shares one caliber with the
+rest of the revision.
