@@ -777,3 +777,28 @@ across halves (rank-corr ≈ 0 in both calibers) while the two-run ceiling is
 0.9998 — i.e. the shuffling is genuine workload drift, not measurement
 noise. Budget allocation needs the SET, and the set transfers; per-unit
 rank does not, and the paper should not claim it does.
+
+### CORRECTION + head-to-head budget table (exclusive caliber, full 10K, no held-out)
+The Addendum-10 curve table mixed units: subset compile cost was a SUM of
+per-unit times (CPU-seconds under 16-way parallelism) while the FULL row was
+wall-clock — hence the impossible "99% coverage costs more than the whole
+build". Corrected, both arms, consistent CPU-seconds:
+
+| coverage | NAIVE units | NAIVE CPU-s | NAIVE MB | SKELOT units | SKELOT CPU-s | SKELOT MB | unit− | time− | size− |
+|---|---|---|---|---|---|---|---|---|---|
+| 50% | 14 | 653 | 5.1 | **9** | 264 | 3.6 | 36% | 60% | 30% |
+| 75% | 67 | 2,779 | 25.2 | **35** | 1,204 | 12.1 | 48% | 57% | 52% |
+| 90% | 348 | 12,358 | 125.3 | **144** | 5,312 | 48.9 | 59% | 57% | 61% |
+| 95% | 851 | 28,519 | 289.7 | **341** | 9,623 | 100.3 | 60% | 66% | 65% |
+| 99% | 3,034 | 92,600 | 1,024.6 | **1,229** | 33,515 | 328.8 | 60% | 64% | 68% |
+| FULL | 19,130 | 430,143 | 5,049.5 | 10,037 | 182,545 | 2,151.0 | 47.5% | 57.6% | 57.4% |
+
+(Wall-clock at 16 threads: Naive 27,860 s vs SkelOT 13,483 s = 2.07×.)
+Notes: (a) SkelOT's edge GROWS with the coverage target (36% → 60% fewer
+units) — the head is dominated by family-less solo contracts, families live
+in the mid/long tail where the budget curve climbs; (b) vs the FULL Naive
+build, covering 95% of execution time needs 341 units / 100 MB = **56×
+fewer units, 50× less size** (the "77.7×"-style figure lives in this family
+— match it to the paper's own definition); (c) independent confirmation of
+the known conservative bias: CPU-s/wall = 15.4 for Naive but 13.5 for
+SkelOT, i.e. the skeleton arm's worse tail packing understates its 2.07×.
