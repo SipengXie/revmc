@@ -536,3 +536,24 @@ with the absolute figures (e.g. "2.07× — 27,860 s vs 13,483 s wall;
 57.4% — 5.050 GB vs 2.151 GB; 19,130 vs 10,037 units"), so reviewers
 cannot object that only percentages are reported. All absolutes are in the
 Addendum 5 table and in `compile_bench_emse_base.json`.
+
+## Addendum 6 (revmc session, 2026-07-31): Step 3 COMPLETE — Arb 10K dual-mode compile results
+
+Attempt 2 (attempt 1 lost to INCIDENT 2), cold cache, 16 threads, binary
+with durability patches (arm flush + sidecar; timing semantics unchanged).
+Log: `stage_b_emse_arb_20260731T145430Z.log`; JSON:
+`compile_bench_emse_arb.json` (+ .units.jsonl sidecar).
+
+| placeholder | value | provenance |
+|---|---|---|
+| [ARB-RED] | **23.1%** (2,895 → 2,227 units; 171 families + 2,056 per-hash) | JSON grouping |
+| [ARB-SIZE-RED] | **26.2%** (646.0 MB → 476.9 MB) | total_o_bytes |
+| [ARB-SPEEDUP] | **1.29×** cold (4,660.3 s → 3,612.0 s) | total_compile_seconds |
+
+Anchor checks — ALL PASS: 2,895 bytecodes exact; units 2,227 inside
+[2,225, 2,378] and only +2 off the static ceiling (exactly g1's 2 rejected
+skeletons / 4 members re-compiled individually); reduction at the band's
+upper end; guards single-digit (g1 2/4, g2 0, degradations 0, collisions 0,
+fallback 0); speedup far below Base's 2.07× as pre-declared (lowest family
+density — see the tx-composition note: the 10K-block Arb window holds ~37 K
+txs vs Base's ~3.5 M).
