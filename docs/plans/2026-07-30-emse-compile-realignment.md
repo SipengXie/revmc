@@ -400,3 +400,13 @@ This section accumulates per-step numbers, anchor checks, and any deviations.
   family 0ec92b5d1a2b3c7b to pin down the real-world origin of
   "same skeleton, different jump targets" (template-patched deploys vs
   parameterized branches). Record findings here.
+- **CORRECTION FOR §6.2 (user caught, 2026-07-31): the static-jump
+  degradation count is NOT zero.** Any paper text saying "members disagreeing
+  on compile-time-fixed positions (e.g. static jump targets): measured zero"
+  must be updated to: **1 family / 3 members (14 conflicting static-jump
+  PUSHes), Base 10K, EMSE boundary** — family 0ec92b5d1a2b3c7b, the same one
+  behind INCIDENT 1. The authoritative numbers land in
+  `compile_bench_emse_base.json` → `grouping.static_jump_degraded_families
+  / _members` when the relaunched run completes. §6.2 should report it
+  alongside g1's 7 skeletons / 17 members. ("Zero" was true under the old
+  boundary, where such variants never grouped in the first place.)
