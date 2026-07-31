@@ -388,3 +388,15 @@ This section accumulates per-step numbers, anchor checks, and any deviations.
 - Action: Base `--mode both` relaunched from scratch into a FRESH cache dir
   (cold start, both arms in one run for provenance); the aborted attempt's
   partial cache was discarded.
+- DEFENSE-IN-DEPTH NOTE (user, 2026-07-31): the `apply_variance` assert is a
+  defense that WORKED. Without it, this family would have compiled into a
+  shared artifact with the reference member's jump targets baked in — the
+  other two members would silently take wrong branches at runtime (a
+  correctness bug far worse than a crash). The assert turned "wrong artifact"
+  into "loud stop". Keep it; the pre-check makes it unreachable, the assert
+  stays as the last line.
+- POST-RUN INSPECTION (user request): after THIS compile run finishes and
+  BEFORE launching the Arb step, disassemble and diff the 3 members of
+  family 0ec92b5d1a2b3c7b to pin down the real-world origin of
+  "same skeleton, different jump targets" (template-patched deploys vs
+  parameterized branches). Record findings here.
