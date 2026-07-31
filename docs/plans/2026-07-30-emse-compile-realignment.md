@@ -710,3 +710,70 @@ of 501 measurable members). JSON: `exec_sanity_emse_arb_FULL.json`.
 - Caveat unchanged: the underlying engine is the OP-stack EVM, not ArbOS;
   these numbers validate shared-artifact CONSISTENCY on Arb traffic, not
   chain-faithful semantics. (Same caveat applies to both arms equally.)
+
+## Addendum 10 (revmc session, 2026-07-31): [HO-COV] + RQ4 recomputed, BOTH calibers
+
+### Data assets (new, reusable)
+- `data/exclusive_per_block_base10k.tsv` — 2,847,717 rows of
+  (arm, block, code_hash, microseconds) EXCLUSIVE per-frame own-time over
+  all 19,130 corpus contracts, 10K blocks, interpreter arm. Any window
+  split (halves, quartiles, sliding) is now offline work — no re-runs.
+  Produced by `skeleton_vs_perhash_bench --only-mode interpreter
+  --all-corpus-targets --per-block-out` (instrumentation on 19,130 targets
+  costs 551.4 s vs 534.4 s family-only: +3.2%, weighting-only use).
+- `data/entrypoint_timing_h1.bin` / `_h2.bin` — INCLUSIVE caliber halves
+  (old tool, unmodified, RQ4-consistent).
+- `data/family_map_emse_base.tsv` — 19,130 rows, final 818-family grouping.
+
+### RQ4 budget-coverage curve, new grouping, both calibers
+Compile cost/size per unit from `compile_bench_emse_base.json`; full SkelOT
+build = 10,037 units / 13,483.4 s / 2,151 MB.
+
+| coverage | EXCL units | EXCL compile s | EXCL MB | EXCL vs full | INCL units | INCL compile s | INCL MB | INCL vs full |
+|---|---|---|---|---|---|---|---|---|
+| 50% | **9** | 263.5 | 3.6 | **51.2×** | 17 | 509.2 | 6.4 | 26.5× |
+| 75% | **35** | 1,203.9 | 12.1 | **11.2×** | 51 | 1,302.0 | 16.3 | 10.4× |
+| 90% | 144 | 5,311.6 | 48.9 | 2.5× | 174 | 5,353.7 | 49.3 | 2.5× |
+| 95% | 341 | 9,623.4 | 100.3 | 1.4× | 344 | 9,092.0 | 94.2 | 1.5× |
+
+Head effect survives the caliber change and is STRONGER under the correct
+caliber at the head (9 units = 0.09% of the build covers half the execution
+time). The two curves converge from 90% up. (The paper's "77.7×" line must
+be re-derived against its own definition — the numbers above are the
+raw material; PAPER SESSION to confirm which cell it refers to.)
+
+### Caliber impact on hot-list composition (full universe, 10K)
+top-10 overlap **10%**, top-50 46%, top-100 49%, top-200 55%. The inclusive
+top-10 is dominated by `solo_` router-style entry contracts whose OWN time
+is negligible: e.g. incl #1 (8.69% of inclusive time) ranks **36th** by
+own-time (0.43%); incl #9 ranks **391st** (0.01%). Mechanism: inclusive
+timing credits each ancestor with all descendant time, so entry points
+absorb the whole call tree. Consequence: an inclusive-picked "hot list"
+spends budget on contracts that execute almost nothing themselves.
+
+### [HO-COV] held-out (first 5,000 blocks pick → last 5,000 blocks verify)
+Measurement ceiling from the qualification step (same data twice): top-50
+overlap 98%, rank-corr 0.9998.
+
+| | EXCLUSIVE (correct) | INCLUSIVE (RQ4-consistent) |
+|---|---|---|
+| top-10 overlap | 80% | 40% |
+| top-50 overlap | **88%** (ceiling 98%) | 92% |
+| top-100 overlap | 85% | 88% |
+| top-10 coverage retention | 94.2% | 63.7% |
+| top-50 coverage retention | **99.2%** | 92.4% |
+| top-100 coverage retention | 99.1% | 99.0% |
+
+Retention = (H2 time covered by the H1-picked list) / (H2 time covered by
+the hindsight-optimal H2 list of the same size).
+
+**Answer to the reviewer's "picked the hot list with the answers in hand"
+objection:** selecting the compile set from the FIRST half and evaluating
+it on the UNSEEN second half retains **99.2%** of hindsight-optimal
+coverage at top-50 (99.1% at top-100). Hot-set identity is a stable
+property of the workload, not an artifact of self-selection. Honest nuance
+(reported, not hidden): the exact ORDERING inside the hot set is NOT stable
+across halves (rank-corr ≈ 0 in both calibers) while the two-run ceiling is
+0.9998 — i.e. the shuffling is genuine workload drift, not measurement
+noise. Budget allocation needs the SET, and the set transfers; per-unit
+rank does not, and the paper should not claim it does.
