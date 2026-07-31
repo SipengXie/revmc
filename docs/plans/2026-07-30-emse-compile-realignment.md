@@ -1028,3 +1028,59 @@ window attains 99.2% of the coverage attainable with full foreknowledge.
 Companion statement (curve-level, stronger and simpler to state): a compile
 set sized on W₁ to reach a target coverage c attains c ± 0.3pp on W₂ for
 c ∈ {90%, 95%, 99%} (measured: 90.0%, 94.7%, 98.7%).
+
+## Addendum 12: why per-frame 1.24× becomes end-to-end 1.02× (user exploration, 2026-07-31)
+
+Two multiplicative attenuations, both measured; the first one uncovers a
+positive mechanism result worth putting in the paper.
+
+**The three ratios are consistent, not contradictory** — they answer
+different questions: per-contract median (unweighted) **1.2424×**;
+time-weighted over family frames **1.1069×** (93.8 s → 84.8 s, −9.1 s);
+end-to-end **1.0188×** (459.1 s → 450.6 s, −8.5 s). Sanity: propagating the
+9.1 s family-frame saving to the whole replay predicts 1.0201× vs 1.0188×
+measured.
+
+**Attenuation A (1.24× → 1.11×): speedup is inversely correlated with weight.**
+
+| band by weight | share of family-frame time | time-weighted speedup |
+|---|---|---|
+| heaviest 10 contracts | **61.4%** | **1.020×** |
+| heaviest 100 | 83.6% | 1.071× |
+| rank 100-1000 | 13.1% | 1.310× |
+| tail | 3.3% | 1.451× |
+
+**Mechanism (two independent tests, same answer): the gain is an
+instruction-locality effect that scales with family size.**
+
+| family size | median speedup | | per-frame cost | median speedup |
+|---|---|---|---|---|
+| 2-10 members | 1.022× | | heaviest 50 (403 µs/frame) | 1.036× |
+| 11-100 | 1.054× | | mid (64 µs/frame) | 1.369× |
+| 101-1000 | 1.354× | | rest (24 µs/frame) | 1.253× |
+| **1000+** | **1.790×** | | | |
+
+Reading: collapsing 19,130 artifacts into 10,037 makes one shared artifact
+serve up to 3,323 members (e.g. the Uniswap V3 pool family), so that code
+stays i-cache resident across calls that would each hit a cold private copy
+under Naive. The benefit therefore lands on SHORT frames in LARGE families;
+the heaviest contracts run ~400 µs/frame (thousands of instructions, code
+hot anyway, time dominated by compute and state access) and gain almost
+nothing. **Cross-chain confirmation:** Arb has only 171 mostly-small
+families and its per-frame median is 1.083× — exactly what the family-size
+law predicts.
+
+**Attenuation B (1.11× → 1.02×): Amdahl.** Interpreter-arm decomposition of
+551.4 s (all-corpus instrumented run): non-frame time (state access, tx
+assembly, precompiles) **234.9 s = 42.6%**, solo-contract frames
+**170.8 s = 31.0%** (identical artifacts in both arms), family-member
+frames **145.7 s = 26.4%** — only the last can differ. **73.6% of
+end-to-end time is structurally untouchable**; even infinite speedup on
+family frames caps end-to-end at ~1.26×.
+
+**Paper guidance:** (1) always report the three ratios with their scope —
+never let 1.24× stand alone as "the speedup"; (2) the family-size scaling
+law is a new positive result (benefit grows with template-deployment
+density) and simultaneously explains Arb's 1.083% honestly; (3) pair the
+end-to-end 1.02× with the 26.4% decomposition, which turns a weak-looking
+number into evidence that we are not overstating.
