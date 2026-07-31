@@ -22,7 +22,7 @@ revmc-builtins = { workspace = true, default-features = false }
 revmc-context = { workspace = true, default-features = false }
 
 revm = { workspace = true, default-features = false, features = ["std", "serde"] }
-op-revm = { git = "https://github.com/SipengXie2024/skelot-revm", rev = "46dc92ff66f8d2f4933e6c060a1968dea22944ca", default-features = false, features = ["std"] }
+op-revm = { git = "https://github.com/SipengXie2024/skelot-revm", rev = "db2ea6755d1d1b235843b7e9894160a0022f949b", default-features = false, features = ["std"] }
 
 # Used by jsonl_bench / bin_bench binaries
 revmc = { workspace = true, features = ["llvm-prefer-dynamic"] }
@@ -185,3 +185,7 @@ path = "src/bin/nested_family_count.rs"
 [[bin]]
 name = "grouping_stats"
 path = "src/bin/grouping_stats.rs"
+
+[[bin]]
+name = "skip_logic_conflicts"
+path = "src/bin/skip_logic_conflicts.rs"
