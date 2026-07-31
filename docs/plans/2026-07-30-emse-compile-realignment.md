@@ -520,3 +520,12 @@ arm — recorded, per-unit detail in JSON allows an unbiased offline check).
 Naive side compiled all 19,130 units, fallback 0; degradations exactly the
 pre-announced 1 family / 3 members (static-jump); g1 7/17, g2 0, collisions 0.
 Naive total 5.050 GB closely matches the old-boundary measurement (5.03 GB).
+
+### INCIDENT 2 (2026-07-31 ~14:52 UTC): Arb attempt 1 externally terminated — cause unknown
+First Arb launch (14:16 UTC) ran healthily to 400/2,895 units (~35 min),
+then the whole task was killed by a task-level stop signal — not a crash
+(no error, no OOM record), not initiated by this session; user confirms
+they did not stop it either. Partial cache and sidecar were discarded;
+attempt 2 relaunched cold at 14:54 UTC (anchor line `Collected 2895` hit
+again). Only cost: ~35 min. Watch item: if attempt 2 is terminated the
+same way, stop and escalate instead of relaunching.
