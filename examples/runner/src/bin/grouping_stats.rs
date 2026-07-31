@@ -37,6 +37,13 @@ struct Args {
     /// stripped-suffix content (all-zero vs contains-metadata).
     #[arg(long, default_value_t = 0)]
     dump_g1: usize,
+    /// Time the [FAM-ANALYSIS] phases over all admitted families: PUSH
+    /// variance classification (+static-jump pre-check) and per-member data
+    /// table construction. The compile driver runs the same code but does
+    /// not log its duration; this reproduces it standalone (deterministic
+    /// pure computation, same inputs).
+    #[arg(long, default_value_t = false)]
+    time_analysis: bool,
 }
 
 fn main() {
@@ -69,6 +76,51 @@ fn main() {
     println!("g1_rejected_members: {}", s.g1_rejected_members);
     println!("g2_rejected_members: {}", s.g2_rejected_members);
     println!("collision_groups_split: {}", s.collision_groups_split);
+
+    if args.time_analysis {
+        use revmc::emse::bytecode_view;
+        use revmc::skeleton::{
+            analyze_skeleton_group_with_mode, build_data_table, variance_conflicts_static_jumps,
+            ClassifyMode,
+        };
+
+        let t = Instant::now();
+        let mut analyzed = Vec::with_capacity(grouping.families.len());
+        for family in &grouping.families {
+            let views: Vec<&[u8]> = family
+                .members
+                .iter()
+                .map(|h| bytecode_view(&contracts[h], args.skeleton_mode))
+                .collect();
+            let variance = analyze_skeleton_group_with_mode(&views, ClassifyMode::Auto);
+            let degraded = variance_conflicts_static_jumps(views[0], &variance);
+            analyzed.push((family, variance, degraded));
+        }
+        let variance_s = t.elapsed().as_secs_f64();
+
+        let t = Instant::now();
+        let mut tables = 0usize;
+        let mut table_bytes = 0usize;
+        for (family, variance, degraded) in &analyzed {
+            if *degraded {
+                continue;
+            }
+            for h in &family.members {
+                let table =
+                    build_data_table(bytecode_view(&contracts[h], args.skeleton_mode), variance);
+                table_bytes += table.data.len();
+                tables += 1;
+                std::hint::black_box(&table);
+            }
+        }
+        let tables_s = t.elapsed().as_secs_f64();
+
+        println!("variance_analysis_seconds: {variance_s:.3}");
+        println!("data_table_seconds: {tables_s:.3}");
+        println!("data_tables_built: {tables}");
+        println!("data_table_bytes_total: {table_bytes}");
+        println!("fam_analysis_total_seconds: {:.3}", variance_s + tables_s);
+    }
 
     if args.dump_g1 > 0 {
         let mut groups: HashMap<Vec<u8>, Vec<&revm::primitives::B256>> = HashMap::new();
