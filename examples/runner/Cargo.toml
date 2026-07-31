@@ -189,3 +189,7 @@ path = "src/bin/grouping_stats.rs"
 [[bin]]
 name = "skip_logic_conflicts"
 path = "src/bin/skip_logic_conflicts.rs"
+
+[[bin]]
+name = "jump_hit_attribution"
+path = "src/bin/jump_hit_attribution.rs"

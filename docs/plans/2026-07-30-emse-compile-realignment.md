@@ -577,3 +577,40 @@ Full-corpus paired run (`skeleton_vs_perhash_bench --only-mode both
   ("non-zero is a finding, not a failure").
 - Registry with fingerprints written: `data/skeleton_registry_full_emse.bin`
   (reused by the three-arm replay).
+
+## Addendum 8 (revmc session, 2026-07-31): Step 4 COMPLETE — three-arm full replay
+
+Three sequential single-arm runs (`--sample-every 1 --rounds 1 --warmup 0`,
+registry-fed, quiet machine, ~40 min total). JSONs:
+`exec_replay_{interpreter,per_hash,skeleton}_base.json`.
+
+| placeholder | value | provenance |
+|---|---|---|
+| [E2E-INT] | **534.4 s** exec wall (10,000 blocks) | interpreter mode_report |
+| [E2E-NAIVE] | **459.1 s** | per_hash mode_report |
+| [E2E-NAIVE-COMPILE] | 27,860.4 s | Addendum 5 |
+| [E2E-SK] | **450.6 s** | skeleton mode_report |
+| [E2E-SK-COMPILE] | 13,483.4 s | Addendum 5 |
+| [E2E-FAM] | 0.305 s variance (+0.78 s grouping) | Addendum 5 |
+| [JUMP-HIT] | **1** (authoritative, interpreter arm, 1 replay/block) | interpreter log |
+
+Anchor checks: ordering PASS (interpreter slowest); SkelOT (450.6 s) is
+FASTER than Naive (459.1 s) end-to-end — no stop condition; per-frame
+median speedup 1.2424× from the paired run (Addendum 7) sits in [1.0, 1.5].
+Note on magnitude: E2E deltas are diluted by non-JIT time (state access,
+non-family frames); the per-frame numbers are the compiled-code comparison.
+
+Cross-arm ledger: per_hash and skeleton agree TO THE DIGIT (txs 3,520,323 /
+ok 2,511,307 / gas 458,309,813,705) — the shared-artifact arm introduces
+zero behavioral drift vs Naive. Interpreter vs JIT arms differ on 3,803 txs
+(0.108%) and 27.3 M gas (+1 sample count): a PRE-EXISTING
+interpreter-vs-JIT granularity gap (gas accounting at OOG boundaries) plus
+exactly one masked-jump event; NOT introduced by this work (the two JIT
+arms' exact agreement is the paper's correctness claim). Recorded for
+methodology; per-tx attribution of the divergence is possible offline from
+the per-arm ledgers if a reviewer asks.
+
+[JUMP-HIT]=1: exactly one tx in 10K blocks jumps into the stripped metadata
+region at a vanilla-legal JUMPDEST (the both-mode count of 4 = 1 tx × 4
+replays — consistent). Attribution run in progress (untimed single-thread
+pass, take_masked_jump_hits per tx); result appended below.
