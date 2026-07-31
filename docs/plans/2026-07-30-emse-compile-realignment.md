@@ -1131,3 +1131,83 @@ execution cost — not a few percent of runtime. The 42.6% residual (and the
 larger state-access cost in real nodes) is an orthogonal, composable line
 of work for blockchain systems: frame pooling, journal/state-commit
 optimization, precompile acceleration, parallel execution.
+
+## Addendum 13 (revmc session, 2026-07-31): Table 4 runtime-column gap — EVALUATION ONLY
+
+Scope: assessment for the REVISION, requested by the paper session. Nothing
+was launched, no g1/g2 logic touched, rebuttal text unaffected.
+
+### Q1. Is the replay's per_target timing frame-level (not tx.to-gated)? — YES
+
+Code: all three handlers in `timing_handlers.rs` key on
+`frame.interpreter.bytecode.get_or_calculate_hash()` for EVERY frame the exec
+loop yields, gated only by `should_lookup_jit` (create / empty code / no
+bytecode address). Neither the handlers nor `execute_block_timed` reference
+`tx.to`; frames spawned by CALL / DELEGATECALL / STATICCALL are timed
+identically to top-level ones.
+
+Empirical confirmation (all-corpus interpreter run, 10K blocks):
+- 16,309 of 19,130 corpus contracts got timed frames (85.3%); the 2,821
+  misses are contracts never executed in the window at all.
+- Of the 818 EMSE families, **738 (90.2%)** have ≥1 executed member.
+- Of the **top-85 families by execution weight, 85/85** are frame-reachable
+  — versus **44/85** under the `tx.to` index. Root cause and the systematic
+  bias (internal-call-only contracts) are confirmed; frame-level indexing
+  closes the gap completely for any weight-ranked selection.
+
+### Q2. Are per-sample frame durations available? — the ablation ALREADY has them
+
+`ablation_exec.rs` collects `frame_ns: Vec<u64>` and pushes one entry per
+timed frame (lines 44, 99-103, 178-184); Table 4's per-family median comes
+from these. **No change is needed for the metric itself — the broken part
+was only representative-transaction SELECTION, not timing.**
+
+The big replay is different: `timings: HashMap<B256, Duration>` accumulates
+per contract per (block, round), so individual frame durations are summed
+away; `per_target` exposes only total_us plus the (block,round) sample
+count. If the replay must ALSO supply per-frame quantiles, the change is
+~20-40 lines (push each `t0.elapsed()`, or a per-hash log-scale histogram).
+Volume argues for the histogram: family-member frames total 33.4 M, so raw
+u32 samples would be ~130 MB. Not required under the recommended plan.
+
+### Q3. Effort to fill the column — ~120 lines plus one 6-minute run
+
+(a) **Family list under the EMSE grouping (~25 lines).** The ablation's
+`--families` input is exactly `FamilySummary{skeleton_id, skeleton_raw_len,
+member_count, member_hashes}`; emitting that JSON from
+`group_skeleton_families` in `grouping_stats` needs no driver change at all.
+
+(b) **EMSE-mode wiring in skelot_ablation_bench (~10 lines).** Add
+`--skeleton-mode` and wrap the two byte-consuming sites with
+`bytecode_view`: `analyze_skeleton_group_with_mode` (:368) and
+`compile_skeleton_group` (:377). The static-jump degradation skip is already
+in place.
+
+(c) **Frame-level representative-tx index (~80 lines + ~6 min).** Feasible
+and confirmed: the replay proves every weight-ranked family has executed
+frames; the only missing datum is the tx POSITION within the block (the
+per-block TSV already carries the block). A standalone untimed replay
+modelled on `jump_hit_attribution` / `nested_family_count` that records the
+first `(block, tx_index)` at which each code_hash appears in ANY frame
+covers it; the ablation then swaps `build_tx_index_cached` for the new index
+(~5 lines). Runtime ≈ `nested_family_count`'s 371 s.
+
+### Q4. Weight source for re-selecting the ablation families — usable, but it CHANGES the published rule
+
+`per_target` gives exclusive own-time per code_hash over the full window;
+aggregating by `family_map_emse_base.tsv` is exactly the RQ4 recomputation
+path, so it works as a weight source.
+
+**Decision needed from the paper session.** The published Table 4 selection
+is NOT execution-weighted: E-Q2's answer states the deterministic rule
+"five size buckets, top 20 by member count". Switching to execution heat
+changes that rule and the paper's own explanation of it. Both are
+defensible; mixing them is not.
+
+Also measured: under the new 818-family grouping the SAME published rule
+still yields exactly **85** families — but with different composition
+(tiny 5, small/medium/large/huge all capped at 20; published composition was
+tiny 10 + huge 15 taken whole). So the revision can keep the rule and the
+count, but the sentence "tiny and huge hold only 10 and 15" must be
+restated. (The rebuttal's E1/E2 answer describes the PUBLISHED table and
+remains correct as written.)
