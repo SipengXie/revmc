@@ -101,6 +101,17 @@ struct Cli {
     /// per-hash function, biasing the skeleton arm.
     #[arg(long, default_value_t = false)]
     allow_missing_skeletons: bool,
+    /// interpreter mode only: time EVERY corpus contract (family members AND
+    /// per-hash solos) instead of family members only. Used to weigh
+    /// compile units by exclusive own-time over a block window ([HO-COV]).
+    #[arg(long, default_value_t = false)]
+    all_corpus_targets: bool,
+    /// Dump per-(block, code_hash) exclusive-time samples as TSV
+    /// (block \t hash \t microseconds), written AFTER the timed loop.
+    /// Preserves the block axis the aggregated JSON folds away, so any
+    /// window split (halves, quartiles, sliding) becomes offline work.
+    #[arg(long)]
+    per_block_out: Option<String>,
 }
 
 #[path = "../perf_events.rs"]
@@ -325,7 +336,14 @@ fn main() {
     // Phase 4: Identify treatment group — the same family-member universe in
     // every arm, intersected with whichever artifact sets the arm dispatches.
     let target_hashes: HashSet<B256> = if mode_interpreter {
-        analyzed.iter().flat_map(|g| g.members.iter().map(|(h, _)| *h)).collect()
+        if cli.all_corpus_targets {
+            skelot_common::collect_bytecodes_cached(bench_dir, cli.start_block, cli.block_count)
+                .keys()
+                .copied()
+                .collect()
+        } else {
+            analyzed.iter().flat_map(|g| g.members.iter().map(|(h, _)| *h)).collect()
+        }
     } else if mode_skeleton {
         skeleton_dispatch.keys().filter(|h| per_hash_fns.contains_key(*h)).copied().collect()
     } else {
@@ -795,6 +813,28 @@ fn main() {
     println!("  Mean delta (us):      {mean_delta:.2}");
     println!("  P95 delta (us):       {p95_delta:.2}");
     println!("  Families: {}  Blocks: {}", per_family.len(), per_block.len());
+
+    if let Some(pb_path) = &cli.per_block_out {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(
+            std::fs::File::create(pb_path).expect("create per-block out"),
+        );
+        let mut rows = 0usize;
+        for (label, samples) in [
+            ("per_hash", &per_hash_samples),
+            ("skelot", &skeleton_samples),
+            ("interpreter", &interpreter_samples),
+        ] {
+            for (hash, v) in samples {
+                for (block, _round, us) in v {
+                    writeln!(f, "{label}\t{block}\t0x{}\t{us:.3}", hex::encode(hash))
+                        .expect("write per-block row");
+                    rows += 1;
+                }
+            }
+        }
+        println!("  per-block samples written: {rows} rows -> {pb_path}");
+    }
 
     // Per-mode reports: unconditional, so single-arm runs keep their wall
     // clock, replay totals, and per-target aggregates even though the paired

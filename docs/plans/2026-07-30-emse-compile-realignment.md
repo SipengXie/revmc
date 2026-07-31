@@ -689,3 +689,24 @@ Decision (user): produce the held-out analysis on EXCLUSIVE weights using
 our audited per-frame timing (interpreter arm over each half, full-corpus
 targets); the inclusive-caliber H1/H2 stay as the RQ4-consistent
 companion. Both go to the paper session.
+
+## Addendum 9 (revmc session, 2026-07-31): Arb EXECUTION side — 0 mismatches (bonus, beyond the brief)
+
+Full-corpus paired run over Arb 10K (458863320..+10000, both arms, 1
+replay/block ×4 passes): **0 MISMATCH over 10,000 blocks**; per-arm ledgers
+identical to the digit (35,888 txs, 18,881 ok, gas 11,636,052,561). Paired
+per-frame median speedup **1.083×** (60 faster / 439 equivalent / 2 slower
+of 501 measurable members). JSON: `exec_sanity_emse_arb_FULL.json`.
+- FALSE ALARM RETRACTED: an earlier 400-block smoke showed 29 mismatches —
+  root cause was the smoke's own parameters: a 400-block corpus window fed
+  the on-the-fly grouping while the artifacts were compiled from the 10K
+  corpus; different member sets shift variance table slots, so the shared
+  arm read wrong immediates. A live demonstration of the reviewed
+  "member-set drift ⇒ silent table corruption" hazard — caught immediately
+  by the correctness gate (the gate's green CAN turn red).
+- Hardening note (future): slow-path grouping carries no corpus-window
+  fingerprint to check against the artifact cache; encode (start, count)
+  into the registry/cache handshake to make window mismatches loud.
+- Caveat unchanged: the underlying engine is the OP-stack EVM, not ArbOS;
+  these numbers validate shared-artifact CONSISTENCY on Arb traffic, not
+  chain-faithful semantics. (Same caveat applies to both arms equally.)

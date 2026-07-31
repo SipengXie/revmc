@@ -193,3 +193,7 @@ path = "src/bin/skip_logic_conflicts.rs"
 [[bin]]
 name = "jump_hit_attribution"
 path = "src/bin/jump_hit_attribution.rs"
+
+[[bin]]
+name = "addr_code_hash"
+path = "src/bin/addr_code_hash.rs"
