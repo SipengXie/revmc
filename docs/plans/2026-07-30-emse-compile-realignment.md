@@ -1087,13 +1087,21 @@ number into evidence that we are not overstating.
 
 ### Paper-ready framing: what E2E time AOT can and cannot touch (user, 2026-07-31)
 
-The three-arm ledger, all directly measured over 10,000 blocks:
+The three-arm ledger, all directly measured over 10,000 blocks. The
+interpreter row serves only as the no-compilation reference point; its
+internal split is a different question (see "AOT-touchable share" below)
+and is deliberately omitted here so the isolation of the delta stands out:
 
 | arm | exec wall | family-member frames | everything else |
 |---|---|---|---|
-| interpreter | 534.4 s | 141.6 s (26.5%) | 392.9 s |
-| Naive | 459.1 s | 93.8 s (20.4%) | **365.2 s** |
-| SkelOT | 450.6 s | 84.8 s (18.8%) | **365.8 s** |
+| interpreter (no compilation) | 534.4 s | — | — |
+| Naive (per-contract AOT) | 459.1 s | 93.8 s | 365.2 s |
+| SkelOT (family sharing) | 450.6 s | **84.8 s** | **365.8 s** |
+
+Read in one line: compilation itself is worth 75 s (534.4 → 459.1); family
+sharing adds 8.5 s on top, and every bit of it comes from the family-frame
+column (93.8 → 84.8) while everything else is unchanged (365.2 → 365.8,
+0.16%). The difference is fully isolated — no side effects elsewhere.
 
 Naive and SkelOT agree on "everything else" to 0.16% — the claim that the
 two arms differ ONLY on family frames is now MEASURED, not assumed. Both
