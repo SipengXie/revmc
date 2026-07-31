@@ -802,3 +802,56 @@ fewer units, 50× less size** (the "77.7×"-style figure lives in this family
 — match it to the paper's own definition); (c) independent confirmation of
 the known conservative bias: CPU-s/wall = 15.4 for Naive but 13.5 for
 SkelOT, i.e. the skeleton arm's worse tail packing understates its 2.07×.
+
+## FINAL DELIVERY — placeholder table, anchor checks, incidents
+
+### Placeholder → value → provenance (all under `skelot-paper/`)
+| placeholder | value | file |
+|---|---|---|
+| [B-EMSE-UNITS] | 10,037 (817 fam + 9,220 per-hash) | data/compile_bench_emse_base.json |
+| [B-EMSE-RED] | 47.5% (19,130 → 10,037) | same |
+| [B-EMSE-SIZE] | 2.151 GB (Naive 5.050 GB) | same |
+| [B-EMSE-SIZE-RED] | 57.4% | same |
+| [B-EMSE-TIME] | 13,483.4 s | same |
+| [B-EMSE-ABS] | 27,860.4 s (Naive, all 19,130) | same |
+| [B-EMSE-SPEEDUP] | 2.07× (conservative; see tail-packing note) | same |
+| [FAM-ANALYSIS-S] | 0.305 s variance analysis (+0.78 s grouping) | grouping_stats --time-analysis |
+| [FAM-ANALYSIS-PCT] | 0.0023% of pure compile | derived |
+| [ARB-RED] | 23.1% (2,895 → 2,227) | data/compile_bench_emse_arb.json |
+| [ARB-SIZE-RED] | 26.2% (646.0 → 476.9 MB) | same |
+| [ARB-SPEEDUP] | 1.29× (4,660.3 → 3,612.0 s) | same |
+| [E2E-INT] | 534.4 s | data/exec_replay_interpreter_base.json |
+| [E2E-NAIVE] | 459.1 s | data/exec_replay_per_hash_base.json |
+| [E2E-NAIVE-COMPILE] | 27,860.4 s | compile_bench_emse_base.json |
+| [E2E-SK] | 450.6 s | data/exec_replay_skeleton_base.json |
+| [E2E-SK-COMPILE] | 13,483.4 s | same |
+| [E2E-FAM] | 0.305 s | grouping_stats |
+| [JUMP-HIT] | **1** (a CREATE/initcode tx, block 38013100 tx 351; **0 on runtime code**) | exec_replay_interpreter log + jump_hit_attribution |
+| [HO-COV] | top-50 overlap 88% (ceiling 98%), **coverage retention 99.2%**; top-100 85% / 99.1% | Addendum 10 |
+
+Bonus beyond the brief: exec_sanity 0 mismatches on BOTH chains; paired
+per-frame median speedup 1.2424× (Base) / 1.083× (Arb); C1 nested-call
+count 3,061,778; dual-caliber RQ4 budget table; cross-chain tx composition.
+
+### Anchor checks — ALL PASS
+grouping (19,130 / 818 fam / 9,913 members / 9,217 per-hash / 10,035 units /
+g1 7-17 / g2 0 / 0 collisions) exact; Base size-red 57.4% ≥ 40% and speedup
+2.07× inside [1.8, 3.5]; Naive compiled all 19,130; Arb 2,895 exact, units
+2,227 inside [2,225, 2,378], guards single-digit; exec_sanity 0 mismatches;
+three-arm ordering correct and SkelOT faster than Naive end-to-end;
+per-frame median 1.2424× inside [1.0, 1.5]; [JUMP-HIT] non-zero (=1) —
+reported as a finding per the brief, attributed to initcode, zero on
+runtime code.
+
+### Incidents
+1. SkelOT-arm abort (static-jump family + dead catch_unwind under
+   panic=abort) — diagnosed, pre-check added, Base relaunched cold.
+2. Arb attempt 1 externally terminated at 400/2,895, cause unknown — cold
+   relaunch, ~35 min lost.
+3. Arb 400-block smoke "29 mismatches" — FALSE ALARM from a corpus-window
+   mismatch in the smoke's own parameters; full-window run is clean.
+4. RQ4 weight caliber: the old `entrypoint_timing.bin` is INCLUSIVE
+   (5.86× overcount vs measured wall) — flagged for paper-session
+   adjudication; correct-caliber recomputation delivered alongside.
+
+ALL EXPERIMENTS DONE 2026-07-31T19:38:21Z
