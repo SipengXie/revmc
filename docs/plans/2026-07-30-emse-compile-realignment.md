@@ -896,3 +896,56 @@ lands within 0.6pp of the hindsight-optimal set of the same size. The curve
 is a property of the workload, not an artifact of selecting and reporting
 on the same data. (Both arms are stable; SkelOT is consistently closer to
 its target than Naive at equal targets, while needing ~60% fewer units.)
+
+## Addendum 11 (revmc session, 2026-07-31): two rebuttal-draft numbers refreshed
+
+### C nested-call numbers RECOMPUTED under the FINAL grouping (818 families)
+The published 3.06M/135/10.4% were computed on 2026-07-30 under the OLD
+grouping (594 families: pre-g1-upgrade, g2 still enforced). Re-run with the
+final grouping (`nested_family_count_emse_base10k_FINAL.json`, 371 s):
+
+| metric | OLD (594 fam) | **FINAL (818 fam)** |
+|---|---|---|
+| family-member frames | 29,428,441 | **33,419,632** |
+| same-family ancestor/descendant | 3,061,778 | **3,395,783** |
+| share of family frames | 10.4% | **10.2%** |
+| same-family DIRECT parent-child | 440 | **29,901** |
+| families exhibiting nesting | 135 | **198** |
+
+Draft replacement: "306 万 / 135 / 10.4%" → "**340 万 / 198 / 10.2%**". Note
+the direct parent-child case (a family member calling another member of the
+SAME family one level down — the sharpest form of the reviewer's scenario)
+grew 68× to 29,901 occurrences, driven mainly by family 20bcb5b00c82a839
+(25,957). The per-call-context design is exercised far more heavily than
+the old figure suggested.
+
+### C-Q2 needs a TOTAL, not five separate numbers
+The reviewer asked for per-mode end-to-end totals INCLUDING cold compile
+and family construction. Presented as a sum (single 10K-block window, cold):
+
+| mode | execution | compile | family build | TOTAL |
+|---|---|---|---|---|
+| interpreter | 534.4 s | — | — | **534.4 s** |
+| Naive | 459.1 s | 27,860.4 s | — | **28,319.5 s** (53× interpreter) |
+| SkelOT | 450.6 s | 13,483.4 s | 1.1 s | **13,935.1 s** (26× interpreter) |
+
+Honest reading: for ONE window, cold, both compiled modes lose badly to the
+interpreter — state this openly. The meaningful metric is amortization:
+
+| | saving per window | break-even | chain time |
+|---|---|---|---|
+| Naive | 75.3 s | 370 windows | ~86 days |
+| SkelOT | 83.8 s | **161 windows** | ~38 days | (2.3× sooner) |
+
+And combined with RQ4 (compile only the units covering 95% of execution
+time, rest interpreted; 16-thread wall estimated from per-unit CPU-seconds
+at the measured parallel factors 15.4/13.5):
+
+| | compile | break-even |
+|---|---|---|
+| Naive | 1,851.9 s | 26 windows |
+| SkelOT | **712.8 s** | **9 windows** (~2 days of chain traffic) |
+
+Recommendation to the paper session: answer C-Q2 with the summed table AND
+the break-even line, cross-referencing RQ4 — listing the five raw numbers
+alone concedes the strongest part of the answer.
