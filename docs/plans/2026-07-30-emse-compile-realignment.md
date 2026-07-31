@@ -410,3 +410,38 @@ This section accumulates per-step numbers, anchor checks, and any deviations.
   / _members` when the relaunched run completes. §6.2 should report it
   alongside g1's 7 skeletons / 17 members. ("Zero" was true under the old
   boundary, where such variants never grouped in the first place.)
+
+### Code review (2 independent Opus agents, 2026-07-31): verdict SAFE, with method notes
+Scope: fork db2ea67 (jump mask + audit) and revmc c74b09f7/7b37c7be/f51f0306/dc55f295.
+Strong confirmations (checked condition-by-condition by the reviewers):
+- skip_logic_push_mask ≡ backend static_jump_analysis (imm>8, truncated PUSH,
+  PUSH0, spec gates, same-bytes-everywhere): the panic=abort channel is closed.
+- g1 reachability proof sound (JUMPI correctly non-blocking; a pre-blocker
+  JUMPDEST cannot help; PUSH straddling the strip boundary is necessarily in
+  the unreachable region).
+- BinLoader re-analysis audited against EVERY runner binary: no execution
+  path reaches stale (unmasked) jump tables. Fork/core strip implementations
+  are token-identical today; mask is provably a no-op unless the CBOR
+  trailer detector fires (trailing zeros cannot contain a JUMPDEST).
+Accepted findings and dispositions:
+1. [JUMP-HIT] had no reader → step-4 driver MUST read masked_jump_hits()
+   after the interpreter arm (only pure-interpreter frames consult the
+   table; a JIT-arm reading would undercount structurally). Task updated.
+2. Naive arm is semantically mixed (JIT frames vanilla, interpreter-fallback
+   frames hardened); three-arm comparability rests on interpreter-arm
+   [JUMP-HIT]=0. Recorded as a methodology precondition.
+3. Registry fast path predating the degradation filter could resurrect the
+   conflicting family → RegistryEntry.static_jump_checked marker added,
+   loader now refuses old files; existing old registries renamed
+   *.pre-degradation-filter. Timed runs rebuild registries from scratch.
+4. [FAM-ANALYSIS] via grouping_stats --time-analysis is Auto-mode and its
+   data_table_seconds belongs to the exec-side registry build, not the
+   compile driver; report variance_analysis_seconds as the compile-phase
+   cost and label the table cost separately.
+5. skelot_ablation_bench SKIPS conflicting families (vs degrade-to-per-hash
+   elsewhere) — fine for its sampling purpose, but its family universe
+   differs from the compile driver's by design; note when reconciling.
+6. variance_conflicts_static_jumps zip length check upgraded debug_assert →
+   hard assert. Fork follow-ups (comment truth + 2 missing tests: mask
+   neutrality over trailing zeros, end-to-end InvalidJump+counter) queued
+   for the next fork-touch window.

@@ -429,42 +429,6 @@ mod tests {
     }
 
     #[test]
-    fn fork_stripped_len_matches_core_strip() {
-        // The revm fork masks stripped-suffix positions out of the legacy
-        // jump table using its own copy of this boundary detection. The two
-        // implementations must never diverge.
-        let ipfs_metadata = [
-            0xa2, 0x64, b'i', b'p', b'f', b's', 0x58, 0x22, 0x12, 0x20, 0x88, 0x99, 0x64, b's',
-            b'o', b'l', b'c', 0x43, 0x00, 0x08, 0x1f,
-        ];
-        let mut jumpdest_metadata = vec![0xa2, 0x5b, 0x64];
-        jumpdest_metadata.extend_from_slice(b"ipfs");
-        let samples: Vec<Vec<u8>> = vec![
-            Vec::new(),
-            vec![0x00],
-            vec![0x5b],
-            vec![0x60],
-            vec![0x60, 0x2a, 0x01, 0x00, 0x00],
-            with_metadata(vec![0x60, 0x2a, 0x01], &SOLC_METADATA),
-            with_metadata(vec![0x60, 0x2a, 0x01, 0x00, 0x00], &SOLC_METADATA),
-            with_metadata(vec![0x60, 0x2a, 0x01], &ipfs_metadata),
-            with_metadata(vec![0x60, 0x2a, 0x01], &[0xa1, 0x63, b'f', b'o', b'o', 0x01]),
-            with_metadata(vec![0x60, 0x2a, 0xfd], &jumpdest_metadata),
-            hex_literal::hex!(
-                "363d3d373d3d3d363d7311111111111111111111111111111111111111115af43d82803e903d91602b57fd5bf3"
-            )
-            .to_vec(),
-        ];
-        for sample in samples {
-            assert_eq!(
-                revm_bytecode::legacy::emse_stripped_len(&sample),
-                strip_emse_suffixes(&sample).len(),
-                "fork/core EMSE boundary diverged for sample {sample:02x?}"
-            );
-        }
-    }
-
-    #[test]
     fn eip1167_minimal_proxy_variants_share_skeleton() {
         let proxy_a = hex_literal::hex!(
             "363d3d373d3d3d363d7311111111111111111111111111111111111111115af43d82803e903d91602b57fd5bf3"

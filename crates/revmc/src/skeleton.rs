@@ -247,7 +247,9 @@ pub fn skip_logic_push_mask(bytecode: &[u8]) -> Vec<bool> {
 /// compilation by the caller.
 pub fn variance_conflicts_static_jumps(reference: &[u8], variance: &SkeletonVariance) -> bool {
     let skip = skip_logic_push_mask(reference);
-    debug_assert_eq!(skip.len(), variance.pushes.len());
+    // Hard assert: a silent zip truncation here would reopen the
+    // apply_variance abort this pre-check exists to prevent.
+    assert_eq!(skip.len(), variance.pushes.len());
     variance
         .pushes
         .iter()

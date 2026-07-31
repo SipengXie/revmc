@@ -23,6 +23,11 @@ pub struct RegistryEntry {
     pub num_variant: u32,
     #[serde(default)]
     pub member_data_tables: Vec<Vec<u8>>, // pre-computed data tables, one per member
+    /// `true` iff this registry was written after static-jump-conflicting
+    /// families were filtered out at build time. Old registries (default
+    /// false) may still contain such families and must be rebuilt.
+    #[serde(default)]
+    pub static_jump_checked: bool,
 }
 
 pub struct AnalyzedGroup {
@@ -67,6 +72,19 @@ pub fn load_or_build_families(
         let data = std::fs::read(registry_path).expect("read registry");
         let entries: Vec<RegistryEntry> =
             bincode::deserialize(&data).expect("deserialize registry");
+
+        // Refuse registries written before the static-jump degradation
+        // filter existed: they may still contain families whose members
+        // jump to different static targets, which the compile driver now
+        // degrades to per-hash — loading one here would silently shrink or
+        // skew the skeleton-dispatched set relative to the compile run.
+        if entries.iter().any(|e| !e.static_jump_checked) {
+            panic!(
+                "registry {} predates the static-jump degradation filter; \
+                 delete it and re-run without --registry to rebuild",
+                registry_path
+            );
+        }
 
         let has_cached_tables = entries.first().map_or(false, |e| !e.member_data_tables.is_empty());
 
@@ -271,6 +289,7 @@ pub fn load_or_build_families(
                                 .data
                         })
                         .collect(),
+                    static_jump_checked: true,
                 }
             })
             .collect();
