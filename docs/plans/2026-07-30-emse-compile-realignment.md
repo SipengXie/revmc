@@ -995,3 +995,36 @@ compile time, a factor of ~12,400**. (Data-table construction, 0.234 s for
 driver — report it separately if at all.) Suggested phrasing: "家族构建的
 全部成本(分组 0.78 秒 + 常量分类 0.305 秒 = 1.085 秒)不到编译时间的万分之一
 (1/12,400),即使全部计入也不改变任何结论。"
+
+### [HO-COV] formal statement (drop-in for the rebuttal / paper)
+
+**中文(rebuttal 用).**
+将窗口的一万个区块按时序划分为互不相交的前后两半 W₁(选择窗口)与 W₂(评估
+窗口)。设 t_u(W) 为编译单元 u 在窗口 W 上的独占执行时间,
+cov(S, W) = Σ_{u∈S} t_u(W) / Σ_u t_u(W) 为单元集合 S 在 W 上的执行时间覆盖率,
+S_k(W) 为按 t_u(W) 降序取前 k 个单元所得集合。定义相对先知选择的覆盖保持率
+  ρ_k = cov(S_k(W₁), W₂) / cov(S_k(W₂), W₂),
+其中 S_k(W₁) 为仅依据历史窗口 W₁ 作出的前瞻性选择,S_k(W₂) 为可观测 W₂ 后作出
+的先知(clairvoyant)选择,即规模为 k 时在 W₂ 上的最优子集。由构造 ρ_k ≤ 1,
+取等当且仅当前瞻选择在评估窗口上亦为最优。
+实测:cov(S₅₀(W₁), W₂) = 80.2%,cov(S₅₀(W₂), W₂) = 80.8%,故 **ρ₅₀ = 0.992**;
+同法 **ρ₁₀₀ = 0.991**。即仅凭历史流量作出的编译集选择,可达到同等规模先知选择
+所能达到覆盖率的 99.2%,选择过程不依赖对评估窗口的观测。
+
+**English (paper).**
+Partition the 10,000-block window chronologically into disjoint halves W₁
+(selection) and W₂ (evaluation). For compile unit u let t_u(W) be its
+exclusive execution time over W, let cov(S, W) = Σ_{u∈S} t_u(W) / Σ_u t_u(W),
+and let S_k(W) be the k units with largest t_u(W). We report the
+oracle-relative coverage
+  ρ_k = cov(S_k(W₁), W₂) / cov(S_k(W₂), W₂),
+comparing a prospective selection made from W₁ alone against the
+clairvoyant selection of equal size on W₂. By construction ρ_k ≤ 1, with
+equality iff the prospective choice is optimal on the evaluation window.
+Measured: cov(S₅₀(W₁), W₂) = 80.2% vs cov(S₅₀(W₂), W₂) = 80.8%, giving
+**ρ₅₀ = 0.992** (ρ₁₀₀ = 0.991). A selector with no access to the evaluation
+window attains 99.2% of the coverage attainable with full foreknowledge.
+
+Companion statement (curve-level, stronger and simpler to state): a compile
+set sized on W₁ to reach a target coverage c attains c ± 0.3pp on W₂ for
+c ∈ {90%, 95%, 99%} (measured: 90.0%, 94.7%, 98.7%).
