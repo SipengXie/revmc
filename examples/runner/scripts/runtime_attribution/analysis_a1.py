@@ -9,7 +9,7 @@ Outputs (under this script's directory):
   join_summary.json
   signal_*_scatter.png            (one per Spearman test)
   family_size_buckets.csv
-  bytecode_len_buckets.csv
+  skeleton_len_buckets.csv
   variant_push_summary.csv
   signal_*.json                    (machine-readable stats per signal)
 
@@ -115,10 +115,11 @@ def build_table():
         short = pc["skeleton_hash"].replace("skel_", "")
         fam = fam_by_short.get(short)
         av = av_by_short.get(short)
-        bytecode_len = fam["skeleton_len"] if fam else None
-        bucket = (
-            bucket_for_raw_len(bytecode_len) if bytecode_len is not None else None
-        )
+        # `skeleton_len` has PUSH immediates stripped, so it must NOT be
+        # re-bucketed here — Stage A's `bucket` is computed from the raw
+        # bytecode length and is the stratum the paper reports.
+        skeleton_len = fam["skeleton_len"] if fam else None
+        bucket = fam["bucket"] if fam else None
         rec = {
             "code_hash": code_hash,
             "skeleton_hash": short,
@@ -138,7 +139,7 @@ def build_table():
                 and sk_o_by_short.get(short) > 0
                 else None
             ),
-            "bytecode_len": bytecode_len,
+            "skeleton_len": skeleton_len,
             "bucket": bucket,
             "fam_canonical_size": fam["family_size"] if fam else None,
             "protocol_tag": fam["protocol_tag"] if fam else None,
@@ -221,7 +222,7 @@ def main():
     # Convenience numpy arrays
     spd = np.array([r["speedup_ratio"] for r in rows], dtype=float)
     fs = np.array([r["family_size"] for r in rows], dtype=float)
-    bl = np.array([r["bytecode_len"] for r in rows], dtype=float)
+    bl = np.array([r["skeleton_len"] for r in rows], dtype=float)
     no = np.array(
         [r["naive_o_bytes"] if r["naive_o_bytes"] is not None else np.nan for r in rows],
         dtype=float,
@@ -249,8 +250,8 @@ def main():
         "spearman_speedup_vs_family_size": spearman(fs, spd),
         "spearman_speedup_vs_log_family_size": spearman(np.log10(fs), spd),
     }
-    signals["bytecode_len"] = {
-        "spearman_speedup_vs_bytecode_len": spearman(bl, spd),
+    signals["skeleton_len"] = {
+        "spearman_speedup_vs_skeleton_len": spearman(bl, spd),
     }
     signals["naive_o_bytes"] = {
         "spearman_speedup_vs_naive_o_bytes": spearman(no, spd),
@@ -276,10 +277,10 @@ def main():
     scatter(
         bl,
         spd,
-        "bytecode_len (log)",
+        "skeleton_len (log)",
         "speedup_ratio",
-        f"speedup vs bytecode_len  (Spearman rho={signals['bytecode_len']['spearman_speedup_vs_bytecode_len']['rho']:.3f}, n={signals['bytecode_len']['spearman_speedup_vs_bytecode_len']['n']})",
-        OUT / "signal_bytecode_len_scatter.png",
+        f"speedup vs skeleton_len  (Spearman rho={signals['skeleton_len']['spearman_speedup_vs_skeleton_len']['rho']:.3f}, n={signals['skeleton_len']['spearman_speedup_vs_skeleton_len']['n']})",
+        OUT / "signal_skeleton_len_scatter.png",
         log_x=True,
     )
     scatter(
@@ -316,14 +317,14 @@ def main():
         fs_table.append(q)
     write_csv(fs_table, OUT / "family_size_buckets.csv")
 
-    # ----- A3b: bytecode_len buckets -----
+    # ----- A3b: skeleton_len buckets -----
     bl_table = []
     for name in ["tiny", "small", "medium", "large", "huge"]:
         sel = [r["speedup_ratio"] for r in rows if r["bucket"] == name]
         q = quartile_summary(sel)
         q["bin"] = name
         bl_table.append(q)
-    write_csv(bl_table, OUT / "bytecode_len_buckets.csv")
+    write_csv(bl_table, OUT / "skeleton_len_buckets.csv")
 
     def _bucket_plot(table, xlabel, out_name):
         present = [t for t in table if t["n"] > 0]
@@ -450,12 +451,12 @@ def main():
 
     confound = {
         "spearman_log_family_size_vs_variant_ratio": spearman(np.log10(fs), av_var_ratio),
-        "spearman_bytecode_len_vs_variant_ratio": spearman(bl, av_var_ratio),
-        "spearman_family_size_vs_bytecode_len": spearman(fs, bl),
+        "spearman_skeleton_len_vs_variant_ratio": spearman(bl, av_var_ratio),
+        "spearman_family_size_vs_skeleton_len": spearman(fs, bl),
         "partial_variant_ratio_vs_speedup_given_log_fs": partial_spearman(
             av_var_ratio, spd, np.log10(fs)
         ),
-        "partial_bytecode_len_vs_speedup_given_log_fs": partial_spearman(
+        "partial_skeleton_len_vs_speedup_given_log_fs": partial_spearman(
             bl, spd, np.log10(fs)
         ),
     }

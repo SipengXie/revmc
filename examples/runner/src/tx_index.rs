@@ -86,8 +86,8 @@ fn build_tx_index_full(
 }
 
 /// Cached wrapper around `build_tx_index_full`. Reads from
-/// `~/.cache/skelot_index/tx_index_{start_block}_{block_count}.bin` when
-/// present, otherwise rebuilds and atomically writes the cache. The corpus
+/// `~/.cache/skelot_index/tx_index_{corpus}_{start_block}_{block_count}.bin`
+/// when present, otherwise rebuilds and atomically writes the cache. The corpus
 /// under `bench_dir` is assumed static; remove the cache file if it changes.
 pub fn build_tx_index_cached(
     bench_dir: &Path,
@@ -97,7 +97,14 @@ pub fn build_tx_index_cached(
     let cache_dir = std::env::var_os("HOME")
         .map(|h| std::path::PathBuf::from(h).join(".cache").join("skelot_index"))
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp/skelot_index"));
-    let cache_path = cache_dir.join(format!("tx_index_{start_block}_{block_count}.bin"));
+    // Key includes the corpus directory name: two chains (or corpus versions)
+    // over the same block window index different transactions.
+    let corpus_tag = bench_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "corpus".into());
+    let cache_path =
+        cache_dir.join(format!("tx_index_{corpus_tag}_{start_block}_{block_count}.bin"));
     if let Ok(data) = std::fs::read(&cache_path) {
         match bincode::deserialize::<HashMap<B256, (u64, usize)>>(&data) {
             Ok(map) => {

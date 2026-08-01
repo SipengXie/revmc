@@ -99,36 +99,28 @@ pub fn analyze_skeleton_group_with_mode(
     let ref_pushes = extract_push_immediates(reference);
 
     let mut is_variant = vec![false; ref_pushes.len()];
-    match mode {
-        ClassifyMode::Auto => {
-            for &bytecode in &bytecodes[1..] {
-                let pushes = extract_push_immediates(bytecode);
-                assert_eq!(
-                    pushes.len(),
-                    ref_pushes.len(),
-                    "bytecodes have different number of PUSH instructions"
-                );
-                for (i, (ref_imm, imm)) in ref_pushes.iter().zip(pushes.iter()).enumerate() {
-                    if ref_imm != imm {
-                        is_variant[i] = true;
-                    }
+    for &bytecode in &bytecodes[1..] {
+        let pushes = extract_push_immediates(bytecode);
+        assert_eq!(
+            pushes.len(),
+            ref_pushes.len(),
+            "bytecodes have different number of PUSH instructions"
+        );
+        if mode == ClassifyMode::Auto {
+            for (i, (ref_imm, imm)) in ref_pushes.iter().zip(pushes.iter()).enumerate() {
+                if ref_imm != imm {
+                    is_variant[i] = true;
                 }
             }
         }
-        ClassifyMode::ForceAllVariant => {
-            for &bytecode in &bytecodes[1..] {
-                let pushes = extract_push_immediates(bytecode);
-                assert_eq!(
-                    pushes.len(),
-                    ref_pushes.len(),
-                    "bytecodes have different number of PUSH instructions"
-                );
-            }
-            let skip_logic = skip_logic_push_mask(reference);
-            debug_assert_eq!(skip_logic.len(), ref_pushes.len());
-            for (i, v) in is_variant.iter_mut().enumerate() {
-                *v = !skip_logic[i];
-            }
+    }
+    if mode == ClassifyMode::ForceAllVariant {
+        let skip_logic = skip_logic_push_mask(reference);
+        // Hard assert, not debug_assert: the indexing below would otherwise
+        // become an out-of-bounds abort in release with no diagnosis.
+        assert_eq!(skip_logic.len(), ref_pushes.len());
+        for (i, v) in is_variant.iter_mut().enumerate() {
+            *v = !skip_logic[i];
         }
     }
 
@@ -186,28 +178,17 @@ pub(crate) fn normalize_push_immediate(imm: &[u8], declared_len: usize) -> [u8; 
 /// JUMP/JUMPI (what the bytecode analysis would mark as `SKIP_LOGIC`). The mask
 /// is indexed by PUSH ordinal, matching [`extract_push_immediates`] (PUSH0 is
 /// skipped). A `true` entry means the PUSH's value is consumed by an adjacent
-/// `JUMP` or `JUMPI` to a valid JUMPDEST, so classifying it as Variant would
-/// invalidate the static-jump folding done by the backend.
+/// `JUMP` or `JUMPI`, so classifying it as Variant would invalidate the
+/// static-jump resolution done by the backend.
+///
+/// Target validity is deliberately NOT required. An invalid target makes the
+/// backend emit an unconditional `InvalidJump` trap instead of folding the
+/// branch, which is equally incompatible with a runtime table lookup — and
+/// worse, produces no assert, so the mismatch would be silent.
 pub fn skip_logic_push_mask(bytecode: &[u8]) -> Vec<bool> {
-    // Pass 1: collect valid JUMPDEST PCs (JUMPDEST opcodes not inside a PUSH imm).
-    let mut jumpdests = std::collections::HashSet::new();
-    let mut i = 0usize;
-    while i < bytecode.len() {
-        let op_byte = bytecode[i];
-        if op_byte == op::JUMPDEST {
-            jumpdests.insert(i);
-        }
-        if op_byte >= op::PUSH1 && op_byte <= op::PUSH32 {
-            let n = (op_byte - op::PUSH0) as usize;
-            i += 1 + n;
-        } else {
-            i += 1;
-        }
-    }
-
-    // Pass 2: walk again, mark PUSH<N> at ordinal k as skip-logic iff it is
-    // immediately followed by JUMP/JUMPI to a valid JUMPDEST and the immediate
-    // fits in a usize.
+    // Mark PUSH<N> at ordinal k iff it is immediately followed by JUMP/JUMPI
+    // and the immediate fits in a usize (wider immediates cannot be a PC, and
+    // the backend's own analysis rejects them the same way).
     let mut mask = Vec::new();
     let mut i = 0usize;
     while i < bytecode.len() {
@@ -221,13 +202,7 @@ pub fn skip_logic_push_mask(bytecode: &[u8]) -> Vec<bool> {
             if jump_pc < bytecode.len() && n <= std::mem::size_of::<usize>() {
                 let jump_op = bytecode[jump_pc];
                 if jump_op == op::JUMP || jump_op == op::JUMPI {
-                    let imm = &bytecode[imm_start..imm_end];
-                    let mut padded = [0u8; std::mem::size_of::<usize>()];
-                    padded[std::mem::size_of::<usize>() - imm.len()..].copy_from_slice(imm);
-                    let target = usize::from_be_bytes(padded);
-                    if jumpdests.contains(&target) {
-                        is_skip = true;
-                    }
+                    is_skip = true;
                 }
             }
             mask.push(is_skip);
@@ -255,6 +230,23 @@ pub fn variance_conflicts_static_jumps(reference: &[u8], variance: &SkeletonVari
         .iter()
         .zip(skip.iter())
         .any(|(p, s)| *s && matches!(p, PushClassification::Variant { .. }))
+}
+
+/// `true` if this family cannot share one artifact because a PUSH consumed by
+/// an adjacent static JUMP/JUMPI differs between members.
+///
+/// Answered from the member bytecodes rather than from an existing
+/// [`SkeletonVariance`], because [`ClassifyMode::ForceAllVariant`] forces
+/// exactly those PUSHes back to Invariant — so
+/// [`variance_conflicts_static_jumps`] applied to a ForceAllVariant variance
+/// answers `false` for every family, whatever the members contain. Callers
+/// must use this one when the run's classify mode is not fixed to `Auto`.
+pub fn members_conflict_static_jumps(bytecodes: &[&[u8]]) -> bool {
+    if bytecodes.len() < 2 {
+        return false;
+    }
+    let auto = analyze_skeleton_group_with_mode(bytecodes, ClassifyMode::Auto);
+    variance_conflicts_static_jumps(bytecodes[0], &auto)
 }
 
 /// Extract the opcode skeleton: all opcodes kept, PUSH1..PUSH32 immediate
@@ -465,6 +457,31 @@ mod tests {
         let v_plain = analyze_skeleton_group_with_mode(&[c, d], ClassifyMode::Auto);
         assert_eq!(v_plain.num_variant, 1);
         assert!(!variance_conflicts_static_jumps(c, &v_plain));
+    }
+
+    #[test]
+    fn conflict_detected_when_reference_target_is_not_a_jumpdest() {
+        // PUSH1 <t>, JUMP, JUMPDEST@3, PUSH1 0, PUSH1 0, RETURN.
+        // The reference's target (2) is the JUMP byte itself, so the backend
+        // bakes an unconditional InvalidJump; member `b` needs a real jump to
+        // JUMPDEST@3. Requiring a VALID target here would miss the conflict and
+        // hand `b` an artifact that always halts.
+        let a: &[u8] = &[0x60, 0x02, 0x56, 0x5b, 0x60, 0x00, 0x60, 0x00, 0xf3];
+        let b: &[u8] = &[0x60, 0x03, 0x56, 0x5b, 0x60, 0x00, 0x60, 0x00, 0xf3];
+        assert!(members_conflict_static_jumps(&[a, b]));
+        assert!(members_conflict_static_jumps(&[b, a]), "must not depend on member order");
+    }
+
+    #[test]
+    fn force_all_variant_does_not_hide_a_static_jump_conflict() {
+        // ForceAllVariant pushes static-jump PUSHes back to Invariant, which
+        // makes `variance_conflicts_static_jumps` answer false for every
+        // family; the member-level check must still see the conflict.
+        let a: &[u8] = &[0x60, 0x03, 0x56, 0x5b, 0x5b, 0x00];
+        let b: &[u8] = &[0x60, 0x04, 0x56, 0x5b, 0x5b, 0x00];
+        let forced = analyze_skeleton_group_with_mode(&[a, b], ClassifyMode::ForceAllVariant);
+        assert!(!variance_conflicts_static_jumps(a, &forced));
+        assert!(members_conflict_static_jumps(&[a, b]));
     }
 
     #[test]

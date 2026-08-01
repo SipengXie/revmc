@@ -155,33 +155,28 @@ pub fn group_skeleton_families(
     mode: SkeletonMode,
 ) -> SkeletonGrouping {
     let mut stats = GroupingStats::default();
-    let mut buckets: HashMap<u64, Vec<B256>> = HashMap::new();
+    // The skeleton is carried into the bucket rather than re-derived below:
+    // re-deriving costs a second strip plus a fresh allocation per member.
+    let mut buckets: HashMap<u64, Vec<(B256, Vec<u8>)>> = HashMap::new();
     for (code_hash, bytes) in contracts {
         let skel = skeleton_bytes(bytes, mode);
-        buckets.entry(hash_bytes(&skel)).or_default().push(*code_hash);
+        buckets.entry(hash_bytes(&skel)).or_default().push((*code_hash, skel));
     }
 
     let mut used_hashes: HashSet<u64> = buckets.keys().copied().collect();
-    let mut bucket_list: Vec<(u64, Vec<B256>)> = buckets.into_iter().collect();
+    let mut bucket_list: Vec<(u64, Vec<(B256, Vec<u8>)>)> = buckets.into_iter().collect();
     bucket_list.sort_by_key(|(h, _)| *h);
 
     let mut families = Vec::new();
     let mut per_hash = Vec::new();
 
-    for (bucket_hash, mut members) in bucket_list {
-        members.sort();
-        if members.len() == 1 {
-            per_hash.push(members[0]);
+    for (bucket_hash, mut with_skel) in bucket_list {
+        with_skel.sort_by(|a, b| a.0.cmp(&b.0));
+        if with_skel.len() == 1 {
+            per_hash.push(with_skel[0].0);
             continue;
         }
 
-        let with_skel: Vec<(B256, Vec<u8>)> = members
-            .into_iter()
-            .map(|m| {
-                let skel = skeleton_bytes(&contracts[&m], mode);
-                (m, skel)
-            })
-            .collect();
         let mut subgroups = split_by_skeleton(with_skel);
         if subgroups.len() > 1 {
             stats.collision_groups_split += subgroups.len() - 1;

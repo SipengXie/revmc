@@ -260,7 +260,7 @@ def problem4_characterize_slower():
             "ph_calls": int(p["ph_calls"]),
             "ph_cycles_per_call": float(p["ph_cycles_per_call"]),
             "family_size": int(j["family_size"]),
-            "bytecode_len": int(j["bytecode_len"]) if j.get("bytecode_len") else None,
+            "skeleton_len": int(j["skeleton_len"]) if j.get("skeleton_len") else None,
             "bucket": j["bucket"],
             "av_variant_ratio": (
                 float(j["av_variant_ratio"]) if j.get("av_variant_ratio") else None
@@ -317,9 +317,9 @@ def problem4_characterize_slower():
             "slower": stats_block(slower, "family_size"),
             "faster": stats_block(faster, "family_size"),
         },
-        "median_bytecode_len": {
-            "slower": stats_block(slower, "bytecode_len"),
-            "faster": stats_block(faster, "bytecode_len"),
+        "median_skeleton_len": {
+            "slower": stats_block(slower, "skeleton_len"),
+            "faster": stats_block(faster, "skeleton_len"),
         },
         "median_av_variant_ratio": {
             "slower": stats_block(slower, "av_variant_ratio"),
@@ -407,7 +407,7 @@ def main():
     print("=== Problem 4: characterization of skelot-slower contracts ===")
     print(f"  slower (cyc_ratio>1): {p4['n_slower']}/{p4['n_slower']+p4['n_faster']} = {p4['slower_pct']:.1f}%")
     print(f"  median family_size: slower={p4['median_family_size']['slower']}  faster={p4['median_family_size']['faster']}")
-    print(f"  median bytecode_len: slower={p4['median_bytecode_len']['slower']}  faster={p4['median_bytecode_len']['faster']}")
+    print(f"  median skeleton_len: slower={p4['median_skeleton_len']['slower']}  faster={p4['median_skeleton_len']['faster']}")
     print(f"  median av_variant_ratio: slower={p4['median_av_variant_ratio']['slower']}  faster={p4['median_av_variant_ratio']['faster']}")
     print(f"  median ph_calls (count): slower={p4['median_ph_calls']['slower']}  faster={p4['median_ph_calls']['faster']}")
     print(f"  median ph_cycles_per_call: slower={p4['median_ph_cycles_per_call']['slower']:.0f}  faster={p4['median_ph_cycles_per_call']['faster']:.0f}")

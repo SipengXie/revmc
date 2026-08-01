@@ -81,15 +81,22 @@ impl TimingPerHashHandler {
             let perf_before = if is_target { perf_snapshot() } else { None };
             let t0 = if is_target { Some(Instant::now()) } else { None };
             let action = unsafe { f.call_with_interpreter(&mut frame.interpreter, ctx) };
-            if let Some(t0) = t0 {
-                *self.timings.entry(bytecode_hash).or_default() += t0.elapsed();
-            }
-            if let (Some(before), Some(after)) = (perf_before, perf_snapshot()) {
-                let agg = self.perf_counts.entry(bytecode_hash).or_insert([0u64; PERF_NEVENTS + 1]);
-                for i in 0..PERF_NEVENTS {
-                    agg[i] = agg[i].wrapping_add(after[i].wrapping_sub(before[i]));
+            // `elapsed()` must be read before anything else: a compound
+            // assignment evaluates its left operand first, so folding this into
+            // `entry(..) += t0.elapsed()` charges the hash probe to the frame.
+            let dt = t0.map(|t0| t0.elapsed());
+            if let Some(before) = perf_before {
+                if let Some(after) = perf_snapshot() {
+                    let agg =
+                        self.perf_counts.entry(bytecode_hash).or_insert([0u64; PERF_NEVENTS + 1]);
+                    for i in 0..PERF_NEVENTS {
+                        agg[i] = agg[i].wrapping_add(after[i].wrapping_sub(before[i]));
+                    }
+                    agg[PERF_NEVENTS] += 1;
                 }
-                agg[PERF_NEVENTS] += 1;
+            }
+            if let Some(dt) = dt {
+                *self.timings.entry(bytecode_hash).or_default() += dt;
             }
             let result = frame.process_next_action::<_, BenchError>(ctx, action).inspect(|i| {
                 if i.is_result() {
@@ -173,14 +180,17 @@ impl TimingInterpreterHandler {
         let perf_before = perf_snapshot();
         let t0 = Instant::now();
         let out = evm.frame_run()?;
-        *self.timings.entry(bytecode_hash).or_default() += t0.elapsed();
-        if let (Some(before), Some(after)) = (perf_before, perf_snapshot()) {
-            let agg = self.perf_counts.entry(bytecode_hash).or_insert([0u64; PERF_NEVENTS + 1]);
-            for i in 0..PERF_NEVENTS {
-                agg[i] = agg[i].wrapping_add(after[i].wrapping_sub(before[i]));
+        let dt = t0.elapsed();
+        if let Some(before) = perf_before {
+            if let Some(after) = perf_snapshot() {
+                let agg = self.perf_counts.entry(bytecode_hash).or_insert([0u64; PERF_NEVENTS + 1]);
+                for i in 0..PERF_NEVENTS {
+                    agg[i] = agg[i].wrapping_add(after[i].wrapping_sub(before[i]));
+                }
+                agg[PERF_NEVENTS] += 1;
             }
-            agg[PERF_NEVENTS] += 1;
         }
+        *self.timings.entry(bytecode_hash).or_default() += dt;
         Ok(out)
     }
 }
@@ -252,15 +262,19 @@ impl TimingSkeletonHandler {
             let action = unsafe {
                 skel_fn.call_with_interpreter_data(&mut frame.interpreter, ctx, data_table.as_ptr())
             };
-            if let Some(t0) = t0 {
-                *self.timings.entry(bytecode_hash).or_default() += t0.elapsed();
-            }
-            if let (Some(before), Some(after)) = (perf_before, perf_snapshot()) {
-                let agg = self.perf_counts.entry(bytecode_hash).or_insert([0u64; PERF_NEVENTS + 1]);
-                for i in 0..PERF_NEVENTS {
-                    agg[i] = agg[i].wrapping_add(after[i].wrapping_sub(before[i]));
+            let dt = t0.map(|t0| t0.elapsed());
+            if let Some(before) = perf_before {
+                if let Some(after) = perf_snapshot() {
+                    let agg =
+                        self.perf_counts.entry(bytecode_hash).or_insert([0u64; PERF_NEVENTS + 1]);
+                    for i in 0..PERF_NEVENTS {
+                        agg[i] = agg[i].wrapping_add(after[i].wrapping_sub(before[i]));
+                    }
+                    agg[PERF_NEVENTS] += 1;
                 }
-                agg[PERF_NEVENTS] += 1;
+            }
+            if let Some(dt) = dt {
+                *self.timings.entry(bytecode_hash).or_default() += dt;
             }
             let result = frame.process_next_action::<_, BenchError>(ctx, action).inspect(|i| {
                 if i.is_result() {

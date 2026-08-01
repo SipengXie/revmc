@@ -18,5 +18,6 @@ CLAUDE.md
 examples/runner/scripts/runtime_attribution/output/
 examples/runner/scripts/runtime_attribution/paths.env
 __pycache__/
-# Generated skeleton registry data (200+ MB)
-skeleton_registry_full*.bin
+# Generated skeleton registry data (200+ MB). Unanchored suffix on purpose:
+# `...bin.pre-degradation-filter` slipped past a `*.bin` pattern once already.
+skeleton_registry_full*

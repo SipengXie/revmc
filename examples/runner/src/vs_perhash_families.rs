@@ -18,19 +18,20 @@ pub struct RegistryEntry {
     pub member_hashes: Vec<[u8; 32]>,
     pub variance_pushes: Vec<i32>, // -1 = Invariant, >= 0 = Variant(table_index)
     pub num_variant: u32,
-    #[serde(default)]
     pub member_data_tables: Vec<Vec<u8>>, // pre-computed data tables, one per member
     /// `true` iff this registry was written after static-jump-conflicting
-    /// families were filtered out at build time. Old registries (default
-    /// false) may still contain such families and must be rebuilt.
-    #[serde(default)]
+    /// families were filtered out at build time.
+    ///
+    /// bincode is positional and non-self-describing, so `#[serde(default)]`
+    /// cannot rescue a file written before this field existed — such a file
+    /// fails to deserialize entirely. This flag therefore only guards against
+    /// a future writer that sets it to false, not against old registries;
+    /// those are caught by the decode error at the read site.
     pub static_jump_checked: bool,
     /// Boundary/classify fingerprint the registry was built under. Loading a
     /// registry into a run with different flags would hand mismatched data
     /// tables to the compiled artifacts (wrong immediates, no crash).
-    #[serde(default)]
     pub skeleton_mode: String,
-    #[serde(default)]
     pub classify_mode: String,
 }
 
@@ -74,8 +75,18 @@ pub fn load_or_build_families(
         // Fast path: load pre-built registry with cached data tables
         println!("\n--- Phase 2: Loading skeleton registry from {} ---", registry_path);
         let data = std::fs::read(registry_path).expect("read registry");
-        let entries: Vec<RegistryEntry> =
-            bincode::deserialize(&data).expect("deserialize registry");
+        let entries: Vec<RegistryEntry> = match bincode::deserialize(&data) {
+            Ok(v) => v,
+            // A registry written before the current field set cannot decode at
+            // all under bincode's positional format, so this is the real
+            // staleness signal — report it as one instead of as a raw codec error.
+            Err(e) => panic!(
+                "registry {} does not match the current RegistryEntry layout ({e}); \
+                 it predates a schema change — delete it and re-run without \
+                 --registry to rebuild",
+                registry_path
+            ),
+        };
 
         // Refuse registries written before the static-jump degradation
         // filter existed: they may still contain families whose members
@@ -111,6 +122,7 @@ pub fn load_or_build_families(
             println!("  Using cached data tables (no bytecode scan)");
             // We don't need AnalyzedGroup.members bytecodes — only for build_data_table
             // which is already cached. Store empty bytecodes as placeholder.
+            let n_entries = entries.len();
             analyzed = entries
                 .into_iter()
                 .filter(|entry| {
@@ -139,6 +151,12 @@ pub fn load_or_build_families(
                     }
                 })
                 .collect();
+            if analyzed.len() != n_entries {
+                eprintln!(
+                    "  WARN: {} of {n_entries} registry entries dropped (member/table count mismatch) — this run measures fewer families than the compile run produced",
+                    n_entries - analyzed.len()
+                );
+            }
         } else {
             // Registry without cached tables — fall back to bytecode scan.
             // Same collector as the compile driver: a corpus differing by
@@ -223,7 +241,7 @@ pub fn load_or_build_families(
                 // Mirror the compile driver: families whose members jump to
                 // different static targets are degraded to per-hash and never
                 // skeleton-dispatched, so they drop out of the comparison.
-                if revmc::skeleton::variance_conflicts_static_jumps(views[0], &variance) {
+                if revmc::skeleton::members_conflict_static_jumps(&views) {
                     println!(
                         "  skel {:016x}: {} members degraded (variant PUSH feeds a static jump), excluded",
                         family.skel_hash,

@@ -401,6 +401,8 @@ fn main() {
     let mut skeleton_wall_ns: HashMap<B256, u128> = HashMap::new();
     let mut blocks_measured = 0usize;
     let mut blocks_skipped = 0usize;
+    let mut correctness_blocks_rejected = 0usize;
+    let mut correctness_tx_mismatches = 0u64;
 
     #[derive(Default)]
     struct ArmStats {
@@ -469,6 +471,8 @@ fn main() {
             }
             if mismatches > 0 {
                 eprintln!("  ABORT block {}: {} mismatches — skipping", block, mismatches);
+                correctness_blocks_rejected += 1;
+                correctness_tx_mismatches += u64::from(mismatches);
                 continue;
             }
         }
@@ -912,6 +916,8 @@ fn main() {
                 median_speedup_ratio: median_ratio,
                 mean_delta_us: mean_delta,
                 p95_delta_us: p95_delta,
+                correctness_blocks_rejected,
+                correctness_tx_mismatches,
             },
             mode_reports,
             per_family,
@@ -1076,6 +1082,14 @@ fn main() {
         std::fs::write(perf_out, serde_json::to_vec_pretty(&out).expect("serialize perf"))
             .expect("write perf out");
         println!("Wrote per-target-tx perf counters to {perf_out}");
+    }
+
+    if correctness_blocks_rejected > 0 {
+        eprintln!(
+            "\nCORRECTNESS GATE FAILED: {correctness_tx_mismatches} tx mismatches across \
+             {correctness_blocks_rejected} blocks; those blocks are excluded from every arm."
+        );
+        std::process::exit(3);
     }
 
     println!("\nDone.");

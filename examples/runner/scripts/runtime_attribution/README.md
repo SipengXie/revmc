@@ -82,7 +82,7 @@ Produces `joined_per_contract.csv` (one row per target contract,
 joined across `skeleton_vs_perhash.json`, `compile_bench.json`,
 `skeleton_families.json`, and `ablation_allvariant.families.jsonl`),
 `signals.json` (Spearman correlations and partial correlations across
-`family_size`, `bytecode_len`, `naive_o_bytes`, `o_bytes_ratio`,
+`family_size`, `skeleton_len`, `naive_o_bytes`, `o_bytes_ratio`,
 `av_variant_ratio`), bucketed median tables, and scatter plots.
 
 ## 2. Stage B — per-instance .text size comparison

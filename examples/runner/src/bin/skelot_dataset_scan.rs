@@ -141,7 +141,15 @@ impl ScanContext {
     }
 }
 
-fn scan_window(bench_dir: &PathBuf, start: u64, count: u64, ctx: &mut ScanContext) {
+/// Ingests every block in `[start, start + count)` and returns the set of
+/// bytecode hashes seen anywhere in the window (not just the newly-added ones).
+fn scan_window(
+    bench_dir: &PathBuf,
+    start: u64,
+    count: u64,
+    ctx: &mut ScanContext,
+) -> std::collections::HashSet<B256> {
+    let mut seen = std::collections::HashSet::new();
     for bn in start..start + count {
         let path = bench_dir.join(format!("states/{bn}.bin"));
         let snap = match crate::skelot_common::load_state_v1(&path) {
@@ -149,9 +157,11 @@ fn scan_window(bench_dir: &PathBuf, start: u64, count: u64, ctx: &mut ScanContex
             Err(_) => continue,
         };
         crate::skelot_common::iter_bytecode_raw(&snap, |hash, raw| {
+            seen.insert(*hash);
             ctx.ingest(raw, *hash);
         });
     }
+    seen
 }
 
 fn metrics_for_hashes(hashes: impl IntoIterator<Item = B256>, ctx: &ScanContext) -> ScopeMetrics {
@@ -257,12 +267,16 @@ fn main() {
     // Track which hashes first appeared in which window, so per-window metrics
     // include only the bytecodes newly seen in that window.
     let mut per_window_hashes: Vec<Vec<B256>> = vec![Vec::new(); n_windows as usize];
+    // All hashes seen in each window, captured during the single ingest pass.
+    let mut per_window_hashes_local: Vec<Vec<B256>> = vec![Vec::new(); n_windows as usize];
 
     for w in 0..n_windows {
         let start = start_block + w * args.window_size;
         let window_blocks = args.window_size.min(start_block + block_count - start);
         let before: std::collections::HashSet<B256> = ctx.codes.keys().copied().collect();
-        scan_window(&bench_dir, start, window_blocks, &mut ctx);
+        let seen = scan_window(&bench_dir, start, window_blocks, &mut ctx);
+        per_window_hashes_local[w as usize] =
+            seen.into_iter().filter(|h| ctx.codes.contains_key(h)).collect();
         let new_hashes: Vec<B256> =
             ctx.codes.keys().copied().filter(|h| !before.contains(h)).collect();
         eprintln!(
@@ -275,23 +289,6 @@ fn main() {
         per_window_hashes[w as usize] = new_hashes;
     }
 
-    // Build per-window membership (all hashes seen in window) for `metrics_local`.
-    // Re-reads each state file once. For 10K Base blocks at <1s/file the cost is
-    // bounded; if profiling shows it dominates, push membership into scan_window.
-    let mut per_window_hashes_local: Vec<Vec<B256>> = vec![Vec::new(); n_windows as usize];
-    for w in 0..n_windows {
-        let start = start_block + w * args.window_size;
-        let mut seen: std::collections::HashSet<B256> = Default::default();
-        for bn in start..start + args.window_size {
-            let path = bench_dir.join(format!("states/{bn}.bin"));
-            let Ok(snap) = skelot_common::load_state_v1(&path) else { continue };
-            for hash in snap.codes.keys() {
-                seen.insert(*hash);
-            }
-        }
-        per_window_hashes_local[w as usize] =
-            seen.into_iter().filter(|h| ctx.codes.contains_key(h)).collect();
-    }
 
     let all_hashes: Vec<B256> = ctx.codes.keys().copied().collect();
     let corpus = metrics_for_hashes(all_hashes.clone(), &ctx);

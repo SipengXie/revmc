@@ -42,9 +42,10 @@ run_one() {
     local bench_log="$OUT_DIR/perf_residual_${mode}_${event_set}.${RUN_TAG}.bench.log"
     local perf_log="$OUT_DIR/perf_residual_${mode}_${event_set}.${RUN_TAG}.perf.log"
     : > "$bench_log"; : > "$perf_log"; : > "$stat"
-    local fifo
+    local fifo perf_pid_file
     fifo=$(mktemp -u /tmp/perf_residual_fifo_XXXXXX)
     mkfifo "$fifo"
+    perf_pid_file=$(mktemp /tmp/perf_residual_pid_XXXXXX)
     (
         "$BIN" --bench-dir "$BENCH_DATA" \
             --per-hash-cache "$PH_CACHE" --skeleton-cache "$SK_CACHE" \
@@ -61,6 +62,7 @@ run_one() {
                 /usr/bin/time -f "perf wall=%E" \
                     perf stat -x, -o "$stat" -e "$events" -p "$bench_pid" \
                     >> "$perf_log" 2>&1 &
+                echo $! > "$perf_pid_file"
                 break
             fi
         done < "$fifo"
@@ -69,7 +71,16 @@ run_one() {
     local reader=$!
     wait "$bench_pid" || true
     wait "$reader" 2>/dev/null || true
-    rm -f "$fifo"
+    # perf is a grandchild (spawned inside the reader subshell) so `wait`
+    # can't reach it; poll until it has exited and flushed the stat file.
+    if [[ -s "$perf_pid_file" ]]; then
+        local perf_pid
+        perf_pid=$(cat "$perf_pid_file")
+        while kill -0 "$perf_pid" 2>/dev/null; do
+            sleep 0.1
+        done
+    fi
+    rm -f "$fifo" "$perf_pid_file"
     echo "wrote $stat"
     cat "$stat"
 }

@@ -20,6 +20,12 @@ pub struct Summary {
     pub median_speedup_ratio: f64,
     pub mean_delta_us: f64,
     pub p95_delta_us: f64,
+    /// Blocks the per-tx (success, gas) gate rejected, and the total number of
+    /// differing transactions in them. A run that reports non-zero here has NOT
+    /// measured those blocks in any arm — without this the gate could only be
+    /// observed on stderr.
+    pub correctness_blocks_rejected: usize,
+    pub correctness_tx_mismatches: u64,
 }
 
 #[derive(Serialize)]

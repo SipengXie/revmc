@@ -1323,3 +1323,43 @@ stratified sampling, so no sampled family can be structurally unmeasurable
 in the runtime column. This subsumes the 8 families that stayed empty in
 the rebuild: they were sampled from load-only contracts and could never
 have had runtime data.
+
+## Addendum 16: Table 4 FINAL rebuild (post-review fixes + eligibility filter)
+
+Two corrections since Addendum 14's rebuild, then a full cold re-run:
+1. **Bucketing bug** (code review): `skeleton_raw_len: f.skeleton_len` fed the
+   IMMEDIATE-STRIPPED length into size bucketing, putting 44 of 85 sampled
+   families one bucket too low. Now takes Stage A's authoritative `bucket`.
+2. **Eligibility filter** (user directive, Addendum 15): families with no
+   member that ever executes are dropped before stratified sampling — they
+   are corpus entries reached only by EXTCODESIZE and can never produce a
+   runtime measurement. 1,724 of 11,189 families (15.4%) dropped; 9,465
+   remain eligible.
+
+Sample size moves 85 → **82**: the rule is unchanged (five size buckets,
+top 20 by member count) but one bucket now holds fewer than 20 eligible
+multi-member families. State this in the revision — the count changed
+because the candidate pool changed, not the rule.
+
+| metric | published | rebuild (bad bucket) | **FINAL** |
+|---|---|---|---|
+| runtime coverage | 44/85 | 77/85 | **80/82 (97.6%)** |
+| all-variant vs split, size | +29.6% | +29.4% | **+29.8%** |
+| all-variant vs split, compile | <2% | −0.5% | **+4.5%** |
+| all-variant vs split, exec median | ~1.15× | 1.075× | **1.068×** |
+
+Per-family median frame duration (n=80): per-hash 1,180 ns, split 1,138 ns,
+all-variant 1,212 ns. Whole-table compile/size: per-hash 29,255 s /
+273.3 MB, split 704.6 s / 12.1 MB, all-variant 736.1 s / 15.7 MB.
+
+Reading: the artifact-size claim reproduces to within 0.2 pp of the
+published +29.6% across three independent runs and two family sets — it is
+robust. The execution penalty of all-variant settles at **1.068×**, well
+below the published ~1.15×; the newly measured families are
+internal-call-only contracts that the `tx.to` index structurally excluded,
+and they are not data-table-heavy hot paths. Compile-time parity is now
++4.5% rather than <2%; on 82 families of 704 s total the absolute gap is
+~31 s, still small, but the revision should quote the measured value
+rather than "within 2%".
+Artifacts: `ablation_allvariant.{json,families.jsonl}`; prior versions kept
+as `*.published-44of85.jsonl` and `*.rebuild-badbucket.{json,jsonl}`.

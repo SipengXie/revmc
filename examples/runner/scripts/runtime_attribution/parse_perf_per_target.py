@@ -114,10 +114,18 @@ def per_contract_compare():
                 ),
                 "ph_ipc": ph["instructions"] / ph["cycles"] if ph["cycles"] else 0,
                 "sk_ipc": sk["instructions"] / sk["cycles"] if sk["cycles"] else 0,
-                "ph_l1i_per_kinstr": ph["l1i_misses"] / ph["instructions"] * 1000.0,
-                "sk_l1i_per_kinstr": sk["l1i_misses"] / sk["instructions"] * 1000.0,
-                "ph_itlb_per_kinstr": ph["itlb_misses"] / ph["instructions"] * 1000.0,
-                "sk_itlb_per_kinstr": sk["itlb_misses"] / sk["instructions"] * 1000.0,
+                "ph_l1i_per_kinstr": ph["l1i_misses"] / ph["instructions"] * 1000.0
+                if ph["instructions"]
+                else 0,
+                "sk_l1i_per_kinstr": sk["l1i_misses"] / sk["instructions"] * 1000.0
+                if sk["instructions"]
+                else 0,
+                "ph_itlb_per_kinstr": ph["itlb_misses"] / ph["instructions"] * 1000.0
+                if ph["instructions"]
+                else 0,
+                "sk_itlb_per_kinstr": sk["itlb_misses"] / sk["instructions"] * 1000.0
+                if sk["instructions"]
+                else 0,
                 "ph_brmiss_per_kbr": ph["branch_misses"]
                 / ph["branches"]
                 * 1000.0

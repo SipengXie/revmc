@@ -84,8 +84,11 @@ run_one() {
     } &
     local reader_pid=$!
 
-    wait "$bench_pid"
-    local bench_rc=$?
+    # `|| true` is load-bearing under `set -e`: an unguarded `wait` on a
+    # non-zero exit kills the script before rc can be recorded, silently
+    # dropping the remaining cells of the grid.
+    local bench_rc=0
+    wait "$bench_pid" || bench_rc=$?
     echo "bench exited rc=$bench_rc" >> "$perf_log"
     # Reader will EOF when fifo writer (bench) closes; wait for it
     wait "$reader_pid" 2>/dev/null || true

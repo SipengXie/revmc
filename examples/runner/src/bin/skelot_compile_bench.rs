@@ -18,7 +18,7 @@ use clap::Parser;
 use revm::primitives::B256;
 use revmc::emse::{bytecode_view, group_skeleton_families, GroupingStats, SkeletonMode};
 use revmc::skeleton::{
-    analyze_skeleton_group_with_mode, variance_conflicts_static_jumps, ClassifyMode,
+    analyze_skeleton_group_with_mode, members_conflict_static_jumps, ClassifyMode,
     SkeletonVariance,
 };
 use revmc::OptimizationLevel;
@@ -310,7 +310,7 @@ fn run_skeleton(
                 .map(|h| bytecode_view(&contracts[h], skeleton_mode))
                 .collect();
             let variance = analyze_skeleton_group_with_mode(&views, classify_mode);
-            if variance_conflicts_static_jumps(views[0], &variance) {
+            if members_conflict_static_jumps(&views) {
                 eprintln!(
                     "  skel {:016x}: {} members degraded to per-hash (variant PUSH feeds a static jump)",
                     family.skel_hash,
@@ -350,8 +350,16 @@ fn run_skeleton(
     let families_out = std::sync::Mutex::new(Vec::<FamilyRecord>::new());
     let fallback_count = AtomicUsize::new(0);
     let fam_done = AtomicUsize::new(0);
+    let resumed = AtomicUsize::new(0);
     let total_t0 = Instant::now();
 
+    // Longest-processing-time-first, matching the per-hash arm: dealing in
+    // arbitrary order leaves a long tail of idle threads and depresses the
+    // wall-clock ratio for scheduling reasons rather than compilation ones.
+    let mut variances = variances;
+    variances.sort_by_key(|(_, members, _)| {
+        std::cmp::Reverse(contracts.get(&members[0]).map_or(0, |b| b.len()))
+    });
     let mut assignments: Vec<Vec<(u64, Vec<B256>, SkeletonVariance)>> =
         (0..threads).map(|_| Vec::new()).collect();
     for (i, item) in variances.into_iter().enumerate() {
@@ -364,9 +372,18 @@ fn run_skeleton(
             let families_ref = &families_out;
             let fb_ref = &fallback_count;
             let fam_done_ref = &fam_done;
+            let resumed_ref = &resumed;
             s.spawn(move || {
                 for (skel_hash, member_hashes, variance) in chunk {
                     let a = skeleton_paths(cache_dir, skel_hash, opt);
+                    if resume && a.library.exists() {
+                        // Same rule as the per-hash arm: a skipped unit carries
+                        // no timing, otherwise a resumed SkelOT arm would be
+                        // compared against a cold per-hash arm.
+                        resumed_ref.fetch_add(1, Ordering::Relaxed);
+                        fam_done_ref.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     let rep_bytes = bytecode_view(&contracts[&member_hashes[0]], skeleton_mode);
                     let t0 = Instant::now();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -444,6 +461,8 @@ fn run_skeleton(
         }
     });
 
+    let mut singletons = singletons;
+    singletons.sort_by_key(|h| std::cmp::Reverse(contracts.get(h).map_or(0, |b| b.len())));
     let mut singleton_assignments: Vec<Vec<B256>> = (0..threads).map(|_| Vec::new()).collect();
     for (i, hash) in singletons.into_iter().enumerate() {
         singleton_assignments[i % threads].push(hash);
@@ -453,10 +472,16 @@ fn run_skeleton(
         for chunk in singleton_assignments {
             let compiled_ref = &compiled;
             let single_done_ref = &single_done;
+            let resumed_ref = &resumed;
             s.spawn(move || {
                 for hash in chunk {
                     let bytes = &contracts[&hash];
                     let a = per_hash_paths(cache_dir, &hash, opt);
+                    if resume && a.library.exists() {
+                        resumed_ref.fetch_add(1, Ordering::Relaxed);
+                        single_done_ref.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     let t0 = Instant::now();
                     if let Err(e) = compile_per_hash(bytes, &a.symbol, &a.object, &a.library, opt) {
                         eprintln!("  singleton FAIL 0x{}...: {e}", &hex::encode(hash)[..12]);
@@ -478,6 +503,12 @@ fn run_skeleton(
         }
     });
 
+    let resumed_total = resumed.load(Ordering::Relaxed);
+    if resumed_total > 0 {
+        eprintln!(
+            "  WARN: resume skipped {resumed_total} pre-existing units — they are EXCLUDED from timing records; totals are not a cold-compile measurement"
+        );
+    }
     let total_dur = total_t0.elapsed().as_secs_f64();
     let fallback_total = fallback_count.load(Ordering::Relaxed);
     SkeletonRunOutcome {

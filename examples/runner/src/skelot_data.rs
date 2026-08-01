@@ -89,14 +89,14 @@ pub fn load_state_v1(path: &std::path::Path) -> Result<CacheSnapshotV1, String> 
 
 pub fn iter_bytecode_raw<F: FnMut(&B256, Vec<u8>)>(snap: &CacheSnapshotV1, mut f: F) {
     for (hash, code) in &snap.codes {
-        let raw = match code.clone() {
+        let raw = match code {
             // LegacyAnalyzed.bytecode includes 33 trailing bytes of safety padding
             // appended during analysis (32 zero bytes + STOP). Slice to original_len so
             // callers see only on-chain raw bytes — otherwise raw_len inflates by 33 and
             // skeleton extraction at end-of-code mid-PUSH boundaries diverges from the
             // original-bytes semantics used by the canonical paper data.
             BytecodeV86Mirror::LegacyAnalyzed { bytecode, original_len, .. } => {
-                bytecode[..original_len.min(bytecode.len())].to_vec()
+                bytecode[..(*original_len).min(bytecode.len())].to_vec()
             }
             BytecodeV86Mirror::Eip7702 { raw, .. } => raw.to_vec(),
         };
@@ -136,18 +136,20 @@ pub fn collect_bytecodes(
             // Clamp like iter_bytecode_raw: serde fills the analyzed fields
             // directly (no constructor assert), so a corrupt original_len
             // must not become an out-of-bounds slice under panic=abort.
-            let raw = match &bytecode {
+            let raw: &[u8] = match &bytecode {
                 Bytecode::LegacyAnalyzed(a) => {
                     let b = a.bytecode();
-                    b[..a.original_len().min(b.len())].to_vec()
+                    &b[..a.original_len().min(b.len())]
                 }
-                other => other.original_byte_slice().to_vec(),
+                other => other.original_byte_slice(),
             };
-            if should_skip_bytes(&raw) {
+            if should_skip_bytes(raw) {
                 skipped_codes += 1;
                 continue;
             }
-            all.entry(hash).or_insert(raw);
+            // Copy only on first sight: a contract loaded by N blocks would
+            // otherwise be copied N times and dropped N-1 times.
+            all.entry(hash).or_insert_with(|| raw.to_vec());
         }
     }
     if unreadable + undecodable > 0 {

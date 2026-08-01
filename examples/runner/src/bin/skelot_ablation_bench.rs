@@ -141,6 +141,7 @@ struct StageAFamily {
     skeleton_hash: String,
     skeleton_len: usize,
     family_size: usize,
+    bucket: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,7 +171,8 @@ fn load_stage_a_families(families_path: &std::path::Path) -> anyhow::Result<Vec<
             });
             FamilySummary {
                 skeleton_id: f.skeleton_hash,
-                skeleton_raw_len: f.skeleton_len,
+                skeleton_len: f.skeleton_len,
+                bucket: f.bucket,
                 member_count: f.family_size,
                 member_hashes,
             }
@@ -407,7 +409,35 @@ use ablation_exec::{flat_mode, geomean, run_family_exec};
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let families = load_stage_a_families(&args.families)?;
+    let mut families = load_stage_a_families(&args.families)?;
+
+    // Drop families no member of which ever executes. The corpus is every
+    // contract the node had to LOAD, which includes code referenced only by
+    // EXTCODESIZE ("is this a contract?" guards) — 2,821 of 19,130 on Base
+    // 10K, 100% EXTCODESIZE-referenced. Such families can never yield a
+    // runtime measurement, so sampling them wastes a stratum slot and
+    // leaves the runtime column structurally empty. The frame-level tx
+    // index's key set IS the executed set, so `--tx-index` doubles as the
+    // eligibility filter.
+    if let Some(p) = &args.tx_index {
+        let data = std::fs::read(p).expect("read --tx-index");
+        let idx: HashMap<B256, (u64, usize)> =
+            bincode::deserialize(&data).expect("deserialize --tx-index");
+        let before = families.len();
+        families.retain(|f| {
+            f.member_hashes.iter().any(|h| {
+                <B256 as std::str::FromStr>::from_str(h.trim_start_matches("0x"))
+                    .map(|k| idx.contains_key(&k))
+                    .unwrap_or(false)
+            })
+        });
+        eprintln!(
+            "[eligibility] {} of {before} families have >=1 executed member; {} dropped (load-only)",
+            families.len(),
+            before - families.len()
+        );
+    }
+
     let sampled = stratified_family_sample(&families, args.per_bucket, args.seed);
     eprintln!("Sampled {} families from {} total", sampled.len(), families.len());
 
@@ -507,11 +537,29 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
         {
+            let refs: Vec<&[u8]> = members.iter().map(|(_, v)| v.as_slice()).collect();
+            // This driver analyses RAW bytecodes, so a family file produced by
+            // `skelot_dataset_scan --skeleton-mode emse` (members share a
+            // skeleton only AFTER metadata stripping) has members with
+            // different raw PUSH counts. Feeding those to
+            // analyze_skeleton_group_with_mode trips its assert, and under
+            // `panic = "abort"` that kills the whole multi-hour run instead of
+            // skipping one family.
+            let ref_pushes = revmc::skeleton::extract_push_immediates(refs[0]).len();
+            if refs[1..]
+                .iter()
+                .any(|b| revmc::skeleton::extract_push_immediates(b).len() != ref_pushes)
+            {
+                eprintln!(
+                    "[skip] family {}: members disagree on raw PUSH count — this family file was \
+                     built under a different skeleton boundary (EMSE?) than this driver analyses",
+                    fam.skeleton_id
+                );
+                continue;
+            }
             // Static-jump-conflicting families are degraded to per-hash by the
             // compile drivers and never skeleton-dispatched; skip them here.
-            let refs: Vec<&[u8]> = members.iter().map(|(_, v)| v.as_slice()).collect();
-            let v = analyze_skeleton_group_with_mode(&refs, ClassifyMode::Auto);
-            if revmc::skeleton::variance_conflicts_static_jumps(refs[0], &v) {
+            if revmc::skeleton::members_conflict_static_jumps(&refs) {
                 eprintln!(
                     "[skip] family {}: variant PUSH feeds a static jump (degraded family)",
                     fam.skeleton_id
@@ -534,7 +582,7 @@ fn main() -> anyhow::Result<()> {
             "skelot_forced",
         )?;
 
-        let bucket_name = skelot_common::bucket_for_raw_len(fam.skeleton_raw_len);
+        let bucket_name = fam.bucket.as_str();
 
         // Rep (block, tx_index) is computed during cap_members so we don't
         // need tx_index in this scope (the all-done fast path doesn't build

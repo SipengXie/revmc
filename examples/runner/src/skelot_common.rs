@@ -128,21 +128,13 @@ pub use revmc::skeleton::extract_opcode_skeleton;
 /// Same as `extract_opcode_skeleton` but also returns `(opcode_count, imm_bytes)`
 /// for Stage A's Table 1 bucket statistics.
 pub fn extract_opcode_skeleton_with_counts(bytes: &[u8]) -> (Vec<u8>, usize, usize) {
-    let mut skeleton = Vec::with_capacity(bytes.len());
-    let mut opcode_count = 0usize;
-    let mut imm_bytes = 0usize;
-    let mut i = 0;
-    while i < bytes.len() {
-        let op = bytes[i];
-        skeleton.push(op);
-        opcode_count += 1;
-        i += 1;
-        if (0x60..=0x7f).contains(&op) {
-            let n = (op - 0x5f) as usize;
-            imm_bytes += n;
-            i += n;
-        }
-    }
+    let skeleton = extract_opcode_skeleton(bytes);
+    // Every byte is either an opcode or an immediate, so the counts are
+    // derivable. Counting the DECLARED push width instead would overshoot on a
+    // bytecode whose final PUSH is truncated, making opcodes+immediates exceed
+    // the raw length.
+    let opcode_count = skeleton.len();
+    let imm_bytes = bytes.len() - opcode_count;
     (skeleton, opcode_count, imm_bytes)
 }
 
@@ -460,24 +452,34 @@ pub use skelot_data::*;
 
 // ── Statistics (Welch's t) ─────────────────────────────────────────────────
 
-/// Welch's two-sample t-test. Returns `(t, p)` with a two-sided p-value
-/// computed from the normal approximation (adequate for rounds >= ~30).
+#[path = "stats.rs"]
+pub mod stats;
+
+/// Welch's two-sample t-test. Returns `(t, p)` with a two-sided p-value from
+/// the t distribution at the Welch-Satterthwaite degrees of freedom.
+///
+/// The normal approximation this replaced is only adequate from ~30 samples per
+/// arm; the replay driver defaults to 5 rounds, where it understates p enough
+/// to flip a significance verdict.
 pub fn welch_t(a: &[f64], b: &[f64]) -> (f64, f64) {
     let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
     let var = |v: &[f64], m: f64| {
         v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (v.len() as f64 - 1.0).max(1.0)
     };
+    let (na, nb) = (a.len() as f64, b.len() as f64);
     let ma = mean(a);
     let mb = mean(b);
     let va = var(a, ma);
     let vb = var(b, mb);
-    let se = ((va / a.len() as f64) + (vb / b.len() as f64)).sqrt();
-    if se == 0.0 {
+    let se_sq = va / na + vb / nb;
+    if se_sq == 0.0 {
         return (0.0, 1.0);
     }
-    let t = (ma - mb) / se;
-    let z = t.abs();
-    let p = 2.0 * (1.0 - 0.5 * (1.0 + libm::erf(z / std::f64::consts::SQRT_2)));
+    let t = (ma - mb) / se_sq.sqrt();
+    let df_den =
+        (va / na).powi(2) / (na - 1.0).max(1.0) + (vb / nb).powi(2) / (nb - 1.0).max(1.0);
+    let df = if df_den > 0.0 { se_sq.powi(2) / df_den } else { (na + nb - 2.0).max(1.0) };
+    let p = 2.0 * (1.0 - self::stats::t_cdf(t.abs(), df));
     (t, p)
 }
 
@@ -491,19 +493,24 @@ pub fn welch_p(a: &[f64], b: &[f64]) -> f64 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FamilySummary {
     pub skeleton_id: String,
-    pub skeleton_raw_len: usize,
+    /// Opcode-skeleton length (PUSH immediates stripped), NOT the raw
+    /// bytecode length — the two differ by ~15-20% on Solidity output, so
+    /// this must never be fed to `bucket_for_raw_len`.
+    pub skeleton_len: usize,
+    /// Size bucket as computed by Stage A from the RAW bytecode length.
+    pub bucket: String,
     pub member_count: usize,
     pub member_hashes: Vec<String>,
 }
 
-/// Exact bucket boundaries used by Stage A.
+/// Index of a bucket name produced by [`bucket_for_raw_len`].
 /// Returns 0..=4 for tiny/small/medium/large/huge.
-fn bucket_index_for_raw_len(raw_len: usize) -> usize {
-    match raw_len {
-        0..=99 => 0,
-        100..=999 => 1,
-        1_000..=4_999 => 2,
-        5_000..=14_999 => 3,
+pub fn bucket_index(name: &str) -> usize {
+    match name {
+        "tiny" => 0,
+        "small" => 1,
+        "medium" => 2,
+        "large" => 3,
         _ => 4,
     }
 }
@@ -524,7 +531,7 @@ pub fn stratified_family_sample(
         if fam.member_count < 2 {
             continue;
         }
-        buckets[bucket_index_for_raw_len(fam.skeleton_raw_len)].push(fam);
+        buckets[bucket_index(&fam.bucket)].push(fam);
     }
     let mut out = Vec::with_capacity(per_bucket * 5);
     for mut bucket in buckets {
@@ -551,10 +558,11 @@ pub fn eip1167_impl_addr(bytes: &[u8]) -> Option<Address> {
 mod stratified_tests {
     use super::*;
 
-    fn mk_family(skeleton_raw_len: usize, members: usize) -> FamilySummary {
+    fn mk_family(raw_len: usize, members: usize) -> FamilySummary {
         FamilySummary {
-            skeleton_id: format!("fam-{}-{}", skeleton_raw_len, members),
-            skeleton_raw_len,
+            skeleton_id: format!("fam-{}-{}", raw_len, members),
+            skeleton_len: raw_len,
+            bucket: bucket_for_raw_len(raw_len).to_string(),
             member_count: members,
             member_hashes: (0..members).map(|i| format!("{:064x}", i)).collect(),
         }
@@ -575,7 +583,7 @@ mod stratified_tests {
 
         let mut per_bucket = [0usize; 5];
         for fam in &s1 {
-            per_bucket[bucket_index_for_raw_len(fam.skeleton_raw_len)] += 1;
+            per_bucket[bucket_index(&fam.bucket)] += 1;
         }
         assert_eq!(per_bucket, [20, 20, 20, 20, 20]);
     }
