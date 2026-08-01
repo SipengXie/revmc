@@ -29,13 +29,14 @@ fn main() {
         let chain_id = loader.raw_txs().first().and_then(|t| t.chain_id);
         let mut evm = make_evm(&loader, chain_id);
         for tx in loader.raw_txs() {
-            if tx.tx_type == 0x7e { *census.entry("skipped:deposit".into()).or_default() += 1; continue; }
+            let is_dep = tx.tx_type == 0x7e;
             evm.0.ctx.tx = build_op_tx(tx);
+            let pre = if is_dep { "deposit:" } else { "" };
             let key = match h.run(&mut evm) {
-                Ok(ExecutionResult::Success { .. }) => "success".to_string(),
-                Ok(ExecutionResult::Revert { .. }) => "revert".to_string(),
-                Ok(ExecutionResult::Halt { reason, .. }) => format!("halt:{reason:?}"),
-                Err(e) => format!("error:{}", format!("{e:?}").chars().take(40).collect::<String>()),
+                Ok(ExecutionResult::Success { .. }) => format!("{pre}success"),
+                Ok(ExecutionResult::Revert { .. }) => format!("{pre}revert"),
+                Ok(ExecutionResult::Halt { reason, .. }) => format!("{pre}halt:{reason:?}"),
+                Err(e) => format!("{pre}error:{}", format!("{e:?}").chars().take(40).collect::<String>()),
             };
             *census.entry(key).or_default() += 1;
         }

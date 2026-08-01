@@ -1363,3 +1363,37 @@ and they are not data-table-heavy hot paths. Compile-time parity is now
 rather than "within 2%".
 Artifacts: `ablation_allvariant.{json,families.jsonl}`; prior versions kept
 as `*.published-44of85.jsonl` and `*.rebuild-badbucket.{json,jsonl}`.
+
+## Addendum 17: uniform-EVM replay is a METHODOLOGY CHOICE, not a defect
+
+Investigating two unmeasurable ablation families surfaced the mechanism and
+a decision worth stating explicitly in the paper.
+
+**Finding.** Our replay drives `revm`'s generic (Ethereum) handler, not
+`op_revm::OpHandler`, on all four chains. Consequences, all outside the
+timed frames: OP deposit transactions do not receive their L1-bridged
+`mint` and are subjected to the max-fee balance check they should skip
+(1 of ~1,000 deposits fails as a result); the OP L1 data fee is not charged,
+so balances run marginally high. Base 10K carries 10,118 deposits (1.01 per
+block), 78 of them minting 351.55 ETH in total.
+
+**Decision (user, 2026-08-01): keep the uniform handler.** Chain-native
+handlers would make Base OP-exact but leave BSC on Ethereum rules and
+Arbitrum unrepresentable (revm has no ArbOS), i.e. four different rulers for
+a four-chain comparison. The measured quantity is bytecode execution time;
+per-transaction accounting (deposit mint, L1 data fee, ArbOS metering)
+happens outside the frames we time and would become a per-chain confound.
+
+**Paper wording:** "We replay all chains under a single EVM configuration
+rather than each chain's native settlement rules. The measured quantity is
+bytecode execution time; chain-specific transaction accounting sits outside
+the timed frames and would introduce a per-chain confound in a cross-chain
+comparison. Transaction-level outcomes (success/revert, gas totals) are
+therefore those of a uniform-EVM replay, not chain-exact; per-frame and
+per-family measurements — the paper's claims — are unaffected."
+
+Robustness fix shipped alongside (independent of the above): `cap_members`
+now returns up to 8 candidate representative transactions instead of one,
+and `run_family_exec` walks them until pre-tx state rebuilds successfully.
+A family is no longer lost because its earliest candidate happens to sit
+behind a mint-bearing deposit.

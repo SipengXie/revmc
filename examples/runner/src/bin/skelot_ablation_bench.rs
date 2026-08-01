@@ -225,11 +225,16 @@ fn resolve_family_members(
 /// Cap deterministically: members with txs in corpus first (sorted by
 /// (earliest block, tx_index)), then fill remainder by hash-sort. Guarantees
 /// at least one capped member has a tx if the family has any observations.
+/// Returns the capped member set plus ALL candidate representative
+/// transactions (sorted, deduped). A single candidate is not enough: the
+/// exec phase rebuilds pre-tx state by replaying the block prefix, which can
+/// fail on that particular block (e.g. an OP deposit whose mint the uniform
+/// EVM handler does not apply). The caller walks the list until one works.
 fn cap_members(
     resolved: Vec<(String, B256, Vec<u8>)>,
     tx_index: &HashMap<B256, (u64, usize)>,
     cap: usize,
-) -> (Vec<(B256, Vec<u8>)>, Option<(u64, usize)>) {
+) -> (Vec<(B256, Vec<u8>)>, Vec<(u64, usize)>) {
     let mut with_tx: Vec<(u64, usize, String, B256, Vec<u8>)> = Vec::new();
     let mut without_tx: Vec<(String, B256, Vec<u8>)> = Vec::new();
     for (hstr, key, code) in resolved {
@@ -240,7 +245,9 @@ fn cap_members(
     }
     with_tx.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
     without_tx.sort_by(|a, b| a.0.cmp(&b.0));
-    let rep_tx = with_tx.first().map(|(bn, ti, _, _, _)| (*bn, *ti));
+    let mut rep_tx: Vec<(u64, usize)> = with_tx.iter().map(|(bn, ti, _, _, _)| (*bn, *ti)).collect();
+    rep_tx.dedup();
+    rep_tx.truncate(8);
     let mut out: Vec<(B256, Vec<u8>)> = with_tx.into_iter().map(|(_, _, _, h, v)| (h, v)).collect();
     if out.len() < cap {
         let need = cap - out.len();
@@ -482,12 +489,12 @@ fn main() -> anyhow::Result<()> {
     // covers every sampled family. Otherwise, load the cached indices so
     // subsequent runs reuse the scan result instead of paying ~8 min per
     // restart. Each entry is `(capped_members, earliest_rep_block)`.
-    let family_plans: Vec<(Vec<(B256, Vec<u8>)>, Option<(u64, usize)>)> = if all_done {
+    let family_plans: Vec<(Vec<(B256, Vec<u8>)>, Vec<(u64, usize)>)> = if all_done {
         eprintln!(
             "[resume] all {} sampled families already in sidecar; skipping corpus scan",
             sampled.len()
         );
-        vec![(Vec::new(), None); sampled.len()]
+        vec![(Vec::new(), Vec::new()); sampled.len()]
     } else {
         let all_codes =
             collect_bytecodes_cached(&args.bench_dir, args.start_block, args.block_count);
@@ -587,7 +594,7 @@ fn main() -> anyhow::Result<()> {
         // Rep (block, tx_index) is computed during cap_members so we don't
         // need tx_index in this scope (the all-done fast path doesn't build
         // it). Exec replays THIS single tx per round on the pre-tx snapshot.
-        let rep_tx: Option<(u64, usize)> = *rep_tx_from_cap;
+        let rep_tx: &[(u64, usize)] = rep_tx_from_cap.as_slice();
 
         let (ph_exec, sk_exec, av_exec) = run_family_exec(
             &fam.skeleton_id,
@@ -611,8 +618,9 @@ fn main() -> anyhow::Result<()> {
             "bucket": bucket_name,
             "member_count": fam.member_count,
             "members_compiled": members.len(),
-            "rep_block": rep_tx.map(|(bn, _)| bn),
-            "rep_tx_index": rep_tx.map(|(_, ti)| ti),
+            "rep_block": rep_tx.first().map(|(bn, _)| *bn),
+            "rep_tx_index": rep_tx.first().map(|(_, ti)| *ti),
+            "rep_candidates": rep_tx.len(),
             "per_hash": ph_row,
             "skelot": sk_row,
             "all_variant": av_row,

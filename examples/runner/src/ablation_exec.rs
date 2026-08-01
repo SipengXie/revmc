@@ -340,7 +340,7 @@ pub fn geomean(xs: &[f64]) -> f64 {
 pub fn run_family_exec(
     fam_id: &str,
     members: &[(B256, Vec<u8>)],
-    rep_tx: Option<(u64, usize)>,
+    rep_candidates: &[(u64, usize)],
     bench_dir: &Path,
     ph_arts: &[PerHashArtifact],
     sk_art: &SkeletonArtifact,
@@ -350,39 +350,56 @@ pub fn run_family_exec(
 ) -> (ExecOutput, ExecOutput, ExecOutput) {
     let empty =
         || ExecOutput { samples: Vec::new(), frames_per_round_mean: 0.0, frame_samples_n: 0 };
-    let (bn, ti) = match rep_tx {
-        Some(p) => p,
-        None => {
-            eprintln!("[exec-skip] family {fam_id} has no capped member with a tx in corpus");
-            return (empty(), empty(), empty());
+    if rep_candidates.is_empty() {
+        eprintln!("[exec-skip] family {fam_id} has no capped member with a tx in corpus");
+        return (empty(), empty(), empty());
+    }
+    // Walk the candidates: rebuilding pre-tx state replays the block prefix
+    // and can fail on a given block (e.g. an OP deposit whose mint the
+    // uniform EVM handler does not apply). Any member's tx is an equally
+    // valid representative, so fall through to the next one.
+    let mut chosen: Option<(BinLoader, usize, _)> = None;
+    for &(bn, ti) in rep_candidates {
+        let loader = match BinLoader::new(bench_dir, bn) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[rep-try] family {fam_id} block {bn} loader: {e}");
+                continue;
+            }
+        };
+        match loader.raw_txs().get(ti) {
+            Some(tx) if tx.tx_type == 0x7e => {
+                eprintln!("[rep-try] family {fam_id} rep tx[{ti}] @ {bn} is deposit; next");
+                continue;
+            }
+            Some(_) => {}
+            None => {
+                eprintln!("[rep-try] family {fam_id} tx_index {ti} out of range @ {bn}; next");
+                continue;
+            }
         }
-    };
-    let loader = match BinLoader::new(bench_dir, bn) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[exec-skip] family {fam_id} block {bn} loader: {e}");
+        match snapshot_before_tx(&loader, ti, false) {
+            Ok(s) => {
+                chosen = Some((loader, ti, s));
+                break;
+            }
+            Err(e) => {
+                eprintln!("[rep-try] family {fam_id} snapshot_before_tx @ {bn}/{ti}: {e}; next");
+            }
+        }
+    }
+    let (loader, ti, snapshot) = match chosen {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "[exec-skip] family {fam_id}: all {} candidate rep txs failed",
+                rep_candidates.len()
+            );
             return (empty(), empty(), empty());
         }
     };
     let chain_id = loader.raw_txs().first().and_then(|tx| tx.chain_id);
-    let tx_bin = match loader.raw_txs().get(ti) {
-        Some(tx) if tx.tx_type == 0x7e => {
-            eprintln!("[exec-skip] family {fam_id} rep tx[{ti}] @ block {bn} is deposit (0x7e)");
-            return (empty(), empty(), empty());
-        }
-        Some(tx) => tx,
-        None => {
-            eprintln!("[exec-skip] family {fam_id} rep tx_index {ti} out of range for block {bn}");
-            return (empty(), empty(), empty());
-        }
-    };
-    let snapshot = match snapshot_before_tx(&loader, ti, false) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[exec-skip] family {fam_id} snapshot_before_tx failed: {e}");
-            return (empty(), empty(), empty());
-        }
-    };
+    let tx_bin = &loader.raw_txs()[ti];
 
     // Load .so files
     let mut per_hash_fns: HashMap<B256, RawEvmCompilerFn> = HashMap::new();
