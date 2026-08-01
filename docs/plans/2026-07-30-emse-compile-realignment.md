@@ -1443,3 +1443,32 @@ and (b) families whose members never execute are excluded — NOT because the
 selection rule changed. State both reasons; E-Q2 asked exactly how the
 sample was chosen. (The huge bucket's 3,323-member family is the Uniswap V3
 pool family that reviewer E suggested naming as a concrete example.)
+
+## Addendum 18: compile speedup after the scheduling fix — 2.07× → 2.19×
+
+The code review found the SkelOT arm dealt its 9,219 singleton compile jobs
+in bucket-hash order (uncorrelated with compile cost) while the Naive arm
+sorted size-descending first; both SkelOT phases now sort like Naive.
+Re-ran Base 10K cold into a separate cache dir
+(`caches/stage_b_emse_base_sorted`, results in
+`compile_bench_emse_base_sorted.json`, scope `full_10k_emse_sorted`) —
+the original artifacts and JSON are untouched and still back the replays.
+
+| | before | after |
+|---|---|---|
+| Naive wall | 27,860.4 s | 27,758.3 s (−0.4%) |
+| SkelOT wall | 13,483.4 s | **12,701.5 s (−5.8%)** |
+| **cold-compile speedup** | 2.07× | **2.19×** |
+| SkelOT thread utilisation | 13.5 / 16 | **14.5 / 16** |
+| units / artifact size | 10,037 / 2.151 GB | 10,037 / 2.151 GB (identical) |
+
+The fix is scheduling-only: unit count and artifact size are bit-identical,
+CPU-seconds move <1% (noise), and only the SkelOT arm's wall clock improves
+— exactly the predicted signature. Naive was already sorted, so it barely
+moves. Remaining gap to the scheduling-independent CPU-seconds ratio
+(423,112 / 184,625 = **2.29×**) is the residual barrier between the family
+and singleton phases.
+
+**Recommended figure for the revision: 2.19×** (measured wall clock, fixed
+scheduler), with 2.29× available as the scheduling-independent
+CPU-seconds ratio if a reviewer asks what the method itself saves.
