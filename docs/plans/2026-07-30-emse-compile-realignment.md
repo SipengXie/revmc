@@ -1422,3 +1422,24 @@ different bug fixes): size +29.4 / +29.8 / +29.8%, exec 1.075 / 1.068 /
 around **1.06–1.07×**, well below the published ~1.15×, because the
 `tx.to` index had structurally excluded internal-call-only families that
 are not data-table-heavy.
+
+### Table 4 bucket composition (for the revision's §E-Q2 answer)
+Same deterministic rule as published — five raw-size buckets, top 20 by
+member count per bucket — applied to the corrected candidate pool:
+
+| bucket | families | member count (min–max, median) |
+|---|---|---|
+| tiny (<100 B) | 5 | 2–342 (6) |
+| small (100–999 B) | 17 | 2–19 (4) |
+| medium (1K–5K) | 20 | 8–162 (37) |
+| large (5K–15K) | 20 | 8–465 (20) |
+| huge (>15K) | 20 | 11–3,323 (22) |
+| **total** | **82** | |
+
+Published composition was tiny 10 + huge 15 taken whole, others capped at
+20, hence 85. The count moved to 82 because the CANDIDATE POOL changed —
+(a) the bucketing bug is fixed, so families sit in their true size bucket,
+and (b) families whose members never execute are excluded — NOT because the
+selection rule changed. State both reasons; E-Q2 asked exactly how the
+sample was chosen. (The huge bucket's 3,323-member family is the Uniswap V3
+pool family that reviewer E suggested naming as a concrete example.)
