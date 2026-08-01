@@ -633,6 +633,21 @@ pub fn make_evm(loader: &BinLoader, chain_id: Option<u64>) -> BenchEvm {
     OpEvm::new(ctx, ())
 }
 
+/// Same as [`make_evm`] but with an inspector attached. Diagnostics only —
+/// the step hook fires on every opcode, so this must never be used in a
+/// timed measurement.
+pub fn make_evm_with_inspector<I>(
+    loader: &BinLoader,
+    chain_id: Option<u64>,
+    inspector: I,
+) -> OpEvm<op_revm::OpContext<CacheDB<EmptyDB>>, I> {
+    let cfg = build_op_cfg(chain_id);
+    let db = loader.build_cache_db();
+    let dummy_tx = OpTransaction::builder().build_fill();
+    let ctx = OpCtx::<EmptyDB>::op().with_cfg(cfg).with_db(db).with_tx(dummy_tx);
+    OpEvm::new(ctx, inspector)
+}
+
 #[cfg(test)]
 mod tests {
     use super::should_lookup_jit;

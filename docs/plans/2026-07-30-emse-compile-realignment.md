@@ -1280,3 +1280,46 @@ families are internal-call-only contracts that were systematically absent
 before, and they are not the data-table-heavy hot paths that drove the old
 number. The 8 remaining gaps are families whose members never execute
 anywhere in the 10K window (corpus limit, not a tooling limit).
+
+## Addendum 15: why 2,821 corpus contracts never execute — EXTCODESIZE, proven
+
+User pushed back on the earlier hand-wave ("corpus limit"); instrumented at
+opcode level (`load_reason_audit`, an Inspector that tallies every opcode
+referencing an address, resolving the target's code hash from the block's
+pre-state). 300 blocks:
+
+| references to… | total | breakdown |
+|---|---|---|
+| **never-executed code** | **17** | **EXTCODESIZE 100%** |
+| code that does execute | 1,326,649 | STATICCALL 42.8%, DELEGATECALL 24.0%, CALL 17.9%, EXTCODESIZE 14.9%, BALANCE 0.4% |
+
+**Mechanism, established:** a transaction passes address X as a parameter →
+the callee runs `EXTCODESIZE(X)` (the standard "is this a contract?" guard,
+e.g. OpenZeppelin `SafeERC20`) → X's account AND code enter the state the
+replay must materialise → X lands in our corpus → X's code is never
+executed. Not a tooling gap, not transaction failure (reverting txs DO
+execute their contracts) — a corpus-DEFINITION property.
+
+Corroborating shape: the never-executed set is bimodal — 1,242 of 2,821
+(44%) appear in exactly one block's snapshot (incidental checks), while 112
+appear in >100 blocks (systematically inspected, never called). The most
+frequent is OpenSea's fee-collection address
+`0x0000a26b00c1f0df003000390027140000faa719`: present in 853 of 3,000
+blocks, appears in 832 transactions' calldata as a parameter, **never a
+recipient, never in an access list, never executed**.
+
+### Corpus definition (state it in the paper)
+corpus = "code the node had to load" (19,130) ⊋ "code that executes"
+(16,309). The 2,821 difference (14.7%) is load-only. Dedup is insensitive
+to the choice: **47.5% on the full corpus vs 48.0% on the executed-only
+subset** — but the paper must say which it uses, or "19,130" invites the
+question.
+
+### REVISION ACTION (user, 2026-08-01)
+Ablation family selection must exclude contracts that are only ever
+inspected. Filter family membership by the replay's executed set
+(`per_target` of the interpreter arm, or `frame_tx_index`'s key set) before
+stratified sampling, so no sampled family can be structurally unmeasurable
+in the runtime column. This subsumes the 8 families that stayed empty in
+the rebuild: they were sampled from load-only contracts and could never
+have had runtime data.

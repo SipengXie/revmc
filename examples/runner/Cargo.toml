@@ -201,3 +201,23 @@ path = "src/bin/addr_code_hash.rs"
 [[bin]]
 name = "frame_tx_index"
 path = "src/bin/frame_tx_index.rs"
+
+[[bin]]
+name = "hash_to_addr"
+path = "src/bin/hash_to_addr.rs"
+
+[[bin]]
+name = "snapshot_audit"
+path = "src/bin/snapshot_audit.rs"
+
+[[bin]]
+name = "replay_outcomes"
+path = "src/bin/replay_outcomes.rs"
+
+[[bin]]
+name = "hash_block_freq"
+path = "src/bin/hash_block_freq.rs"
+
+[[bin]]
+name = "load_reason_audit"
+path = "src/bin/load_reason_audit.rs"
