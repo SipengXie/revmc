@@ -1397,3 +1397,28 @@ now returns up to 8 candidate representative transactions instead of one,
 and `run_family_exec` walks them until pre-tx state rebuilds successfully.
 A family is no longer lost because its earliest candidate happens to sit
 behind a mint-bearing deposit.
+
+### Table 4 COMPLETE: 82/82 (candidate fallback verified)
+The rep-tx fallback fired exactly as designed on both stragglers:
+`[rep-try] family b3e1b8bbf9fd1814 snapshot_before_tx @ 38005141/23:
+LackOfFundForMaxFee …; next` — then a later candidate rebuilt cleanly.
+Runtime coverage is now **82/82 (100%)**.
+
+Final Table 4 (82 families, all measured):
+
+| metric | published | FINAL |
+|---|---|---|
+| runtime coverage | 44/85 | **82/82** |
+| all-variant vs split, artifact size | +29.6% | **+29.8%** |
+| all-variant vs split, compile time | <2% | **+4.2%** |
+| all-variant vs split, exec median | ~1.15× | **1.064×** |
+
+Median frame duration: Naive per-hash 1,186 ns, SkelOT split 1,154 ns,
+all-variant 1,212 ns.
+
+Stability across the three independent rebuilds (different family sets,
+different bug fixes): size +29.4 / +29.8 / +29.8%, exec 1.075 / 1.068 /
+1.064×. The size claim is robust to 0.4 pp; the execution penalty settles
+around **1.06–1.07×**, well below the published ~1.15×, because the
+`tx.to` index had structurally excluded internal-call-only families that
+are not data-table-heavy.
