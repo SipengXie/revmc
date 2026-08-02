@@ -669,15 +669,31 @@ fn main() {
             continue;
         }
 
-        let ph_vals: Vec<f64> = ph.iter().map(|(_, _, us)| *us).collect();
-        let sk_vals: Vec<f64> = sk.iter().map(|(_, _, us)| *us).collect();
+        // Pair by (block, round): the two arms measure the SAME contract in
+        // the SAME replay slot, so the difference is the quantity of
+        // interest. An unpaired test would keep the between-block workload
+        // spread in the denominator and treat repeated rounds of one block
+        // as independent observations.
+        let sk_by_slot: HashMap<(u64, usize), f64> =
+            sk.iter().map(|&(b, r, us)| ((b, r), us)).collect();
+        let mut ph_vals: Vec<f64> = Vec::with_capacity(ph.len());
+        let mut sk_vals: Vec<f64> = Vec::with_capacity(ph.len());
+        for &(b, r, us) in ph {
+            if let Some(&sk_us) = sk_by_slot.get(&(b, r)) {
+                ph_vals.push(us);
+                sk_vals.push(sk_us);
+            }
+        }
+        if ph_vals.len() < 2 {
+            continue;
+        }
 
         let mean_ph = ph_vals.iter().sum::<f64>() / ph_vals.len() as f64;
         let mean_sk = sk_vals.iter().sum::<f64>() / sk_vals.len() as f64;
         let delta = mean_sk - mean_ph;
         let ratio = if mean_sk > 0.0 { mean_ph / mean_sk } else { 1.0 };
 
-        let (_, p) = skelot_common::welch_t(&ph_vals, &sk_vals);
+        let (_, p) = skelot_common::stats::paired_t(&ph_vals, &sk_vals);
         let d = cohens_d(&ph_vals, &sk_vals);
 
         let verdict = if p >= cli.alpha {
@@ -804,8 +820,12 @@ fn main() {
     let p95_delta = if all_deltas.is_empty() {
         0.0
     } else {
-        let idx = (all_deltas.len() as f64 * 0.95).ceil() as usize;
-        all_deltas[idx.min(all_deltas.len() - 1)]
+        // Nearest-rank p95: the ceil(0.95n)-th value, 1-based, hence
+        // index ceil(0.95n)-1. The previous form used ceil(0.95n) as a
+        // 0-based index (one rank high) and degenerated to the maximum
+        // for n <= 39.
+        let rank = ((all_deltas.len() as f64 * 0.95).ceil() as usize).max(1);
+        all_deltas[(rank - 1).min(all_deltas.len() - 1)]
     };
 
     let total = records.len();

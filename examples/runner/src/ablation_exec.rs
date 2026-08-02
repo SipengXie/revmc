@@ -291,8 +291,12 @@ pub fn summarize(samples: &[f64]) -> (f64, f64, f64, f64) {
     s.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = s.len();
     let median = s[n / 2];
-    let p5 = s[((n as f64 * 0.05) as usize).min(n - 1)];
-    let p95 = s[((n as f64 * 0.95) as usize).min(n - 1)];
+    // Nearest-rank, matching skeleton_vs_perhash_bench: the ceil(q*n)-th
+    // value 1-based. Truncation (the previous form) is a different
+    // convention and the two "p95" fields disagreed across artifacts.
+    let rank = |q: f64| (((n as f64 * q).ceil() as usize).max(1) - 1).min(n - 1);
+    let p5 = s[rank(0.05)];
+    let p95 = s[rank(0.95)];
     let mean = s.iter().sum::<f64>() / n as f64;
     let var = s.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n as f64 - 1.0).max(1.0);
     (median, p5, p95, var.sqrt())

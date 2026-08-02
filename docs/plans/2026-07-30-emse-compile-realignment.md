@@ -1472,3 +1472,60 @@ and singleton phases.
 **Recommended figure for the revision: 2.19×** (measured wall clock, fixed
 scheduler), with 2.29× available as the scheduling-independent
 CPU-seconds ratio if a reviewer asks what the method itself saves.
+
+## Addendum 19: second review sweep — a SHIPPED Table 4 number was inverted
+
+### CRITICAL, fixed: bucket compile ratios were 4× wrong with the sign flipped
+`compile_skeleton_mode` / `compile_per_hash_mode` recorded `0.0 ms` on a
+`.so` cache hit, and the bucket aggregate divided by that value clamped to
+`1e-9`. Two of 82 rows were cache hits (the two stragglers re-run in
+Addendum 17), and they poisoned their whole bucket:
+
+| bucket | published | **corrected** |
+|---|---|---|
+| large | 0.3446 | **1.3871** |
+| huge | 0.3018 | **1.2060** |
+| tiny / small / medium | 0.9878 / 1.4655 / 1.4170 | unchanged |
+
+The published table claimed all-variant compiles ~3× CHEAPER than split; it
+is in fact **20-40% dearer**, consistent with the other three buckets and
+with the whole-table figure (+4.4%). Fix: a cache hit now records `-1.0`
+("not measured") instead of `0.0`, aggregation excludes those rows and
+reports `compile_rows_measured`, and an empty set emits `null` rather than a
+fabricated `0.0`. Both families were recompiled cold; **all 82 rows now
+carry real compile timings** and every bucket reports 20/20 (small 17,
+tiny 5) measured.
+
+### Also fixed
+- **p95 off-by-one.** `ceil(0.95n)` was used as a 0-based index (one rank
+  high; degenerated to the maximum for n ≤ 39). Now nearest-rank
+  `ceil(0.95n)-1`, and `ablation_exec`'s truncating variant was aligned to
+  the same convention — the two "p95" fields in the paper artifacts had
+  been using different definitions.
+- **The "paired" test was unpaired.** `skeleton_vs_perhash_bench` documented
+  a paired test but called two-sample Welch on flat value vectors, leaving
+  between-block variance in the denominator and (at `--rounds 5`) counting
+  five replays of one block as five independent observations. Added
+  `stats::paired_t`, and the driver now joins the two arms on `(block,
+  round)` before testing. 3 unit tests.
+
+### Assessed, NOT changed (recorded for the paper session)
+- **Interpreter-arm frame window includes `process_next_action`** while both
+  JIT arms stop the clock before it — the interpreter's per-frame times are
+  inclusive of frame teardown. Does NOT affect the 1.24× per-frame median
+  (both JIT arms, both exclusive) but does inflate interpreter per-frame
+  totals and hence the 26.4% / 31.0% / 42.6% decomposition and the
+  exclusive-weight TSV. Fixing it changes the interpreter arm's numbers and
+  needs a re-run; flagged for decision.
+- **`skeleton_admission.rs` is dead code** (6 dead-code warnings; nothing
+  calls `check_admission`). CLAUDE.md described it as the live check for
+  admitting new bytecode to a family — corrected there.
+- **`load_reason_audit`'s "does execute" column counts EOAs** (any account
+  with `info: Some`, including `KECCAK_EMPTY` code hashes), so that column
+  is inflated. The load-bearing claim — never-executed contracts are 100%
+  EXTCODESIZE-referenced — reads the OTHER column and stands.
+- Latent: `skeleton_bench` lacks the 0xEF filter its siblings apply;
+  per-hash artifact scan keys on the code hash alone and ignores spec/opt
+  tags; the ablation re-reads its sidecar without provenance filtering
+  (which is how the 82 rows came from two runs); `--skeleton-mode` defaults
+  disagree across drivers (emse in 3, current in 6).

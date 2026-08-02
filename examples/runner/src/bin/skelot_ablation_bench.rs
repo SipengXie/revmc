@@ -322,7 +322,7 @@ fn compile_per_hash_mode(
                         let obj = cache_dir.join(format!("per_hash_{hash_hex}.o"));
                         let lib = cache_dir.join(format!("per_hash_{hash_hex}.so"));
                         let (unit_ms, size) = if cache_hit(&obj, &lib) {
-                            (0.0_f64, std::fs::metadata(&lib)?.len())
+                            (-1.0_f64, std::fs::metadata(&lib)?.len())
                         } else {
                             let t0 = Instant::now();
                             compile_per_hash(bc, &symbol, &obj, &lib, OPT)
@@ -384,8 +384,12 @@ fn compile_skeleton_mode(
     let variance = analyze_skeleton_group_with_mode(&refs, mode);
     let obj = cache_dir.join(format!("{tag}.o"));
     let lib = cache_dir.join(format!("{tag}.so"));
+    // A cache hit means this run did NOT compile: recording 0.0 ms would
+    // fabricate an infinitely fast arm and, once divided, invert the bucket
+    // ratio (observed: large 1.39 published as 0.34). -1 marks "not
+    // measured" so aggregation can exclude the row.
     let (compile_time_ms, so_bytes) = if cache_hit(&obj, &lib) {
-        (0.0_f64, std::fs::metadata(&lib)?.len())
+        (-1.0_f64, std::fs::metadata(&lib)?.len())
     } else {
         let t = Instant::now();
         compile_skeleton_group(&members[0].1, &variance, tag, &obj, &lib, OPT)
@@ -657,13 +661,18 @@ fn main() -> anyhow::Result<()> {
     }
     let mut aggregates = Vec::new();
     for (bucket, rows) in by_bucket {
+        // Rows whose artifacts came from cache carry no compile timing
+        // (-1.0); including them would divide by a clamp and invert the
+        // ratio. Excluded here and counted in `compile_rows_measured`.
         let ct: Vec<f64> = rows
             .iter()
-            .map(|r| {
-                r["all_variant"]["compile_time_ms"].as_f64().unwrap_or(0.0)
-                    / r["skelot"]["compile_time_ms"].as_f64().unwrap_or(1e-9).max(1e-9)
+            .filter_map(|r| {
+                let av = r["all_variant"]["compile_time_ms"].as_f64().unwrap_or(-1.0);
+                let sk = r["skelot"]["compile_time_ms"].as_f64().unwrap_or(-1.0);
+                (av > 0.0 && sk > 0.0).then(|| av / sk)
             })
             .collect();
+        let compile_rows_measured = ct.len();
         let so: Vec<f64> = rows
             .iter()
             .map(|r| {
@@ -694,7 +703,9 @@ fn main() -> anyhow::Result<()> {
         aggregates.push(serde_json::json!({
             "bucket": bucket,
             "n": rows.len(),
-            "compile_time_geomean_ratio_allvariant_over_skelot": geomean(&ct),
+            "compile_rows_measured": compile_rows_measured,
+            "compile_time_geomean_ratio_allvariant_over_skelot":
+                if ct.is_empty() { serde_json::Value::Null } else { geomean(&ct).into() },
             "so_bytes_geomean_ratio_allvariant_over_skelot": geomean(&so),
             "exec_median_geomean_ratio_allvariant_over_skelot":
                 if ex.is_empty() { 0.0 } else { geomean(&ex) },

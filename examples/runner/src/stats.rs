@@ -110,3 +110,65 @@ mod tests {
         assert!(p_t > 0.05, "t-based p should not clear alpha at df=8: {p_t}");
     }
 }
+
+/// Paired t-test over matched observations. Returns `(t, p)` for the
+/// two-sided test on the mean of the per-pair differences `a[i] - b[i]`.
+///
+/// Use this when the two samples are matched by construction — here, the
+/// same contract measured in the same (block, round) under two dispatch
+/// modes. An unpaired Welch test on the same data leaves the between-block
+/// workload variance in the denominator and, when several rounds replay one
+/// block, counts repeated replays as independent observations.
+pub fn paired_t(a: &[f64], b: &[f64]) -> (f64, f64) {
+    let n = a.len().min(b.len());
+    if n < 2 {
+        return (0.0, 1.0);
+    }
+    let d: Vec<f64> = (0..n).map(|i| a[i] - b[i]).collect();
+    let mean = d.iter().sum::<f64>() / n as f64;
+    let var = d.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n as f64 - 1.0);
+    if var <= 0.0 {
+        // Every pair differs by the same amount: perfect separation, so the
+        // t statistic diverges. Zero difference is the no-effect case.
+        return if mean == 0.0 { (0.0, 1.0) } else { (f64::INFINITY.copysign(mean), 0.0) };
+    }
+    let se = (var / n as f64).sqrt();
+    let t = mean / se;
+    let p = 2.0 * (1.0 - t_cdf(t.abs(), n as f64 - 1.0));
+    (t, p.clamp(0.0, 1.0))
+}
+
+#[cfg(test)]
+mod paired_tests {
+    use super::paired_t;
+
+    #[test]
+    fn paired_detects_consistent_shift_unpaired_would_miss() {
+        // Large between-pair spread, tiny but consistent within-pair delta.
+        // Between-pair spread is huge (100..1050) while each pair differs
+        // by ~2 with small noise — the case an unpaired test cannot see.
+        let a: Vec<f64> = (0..20).map(|i| 100.0 + i as f64 * 50.0).collect();
+        let b: Vec<f64> =
+            a.iter().enumerate().map(|(i, x)| x - 2.0 + (i % 3) as f64 * 0.1).collect();
+        let (t, p) = paired_t(&a, &b);
+        assert!(t > 10.0, "t = {t}");
+        assert!(p < 1e-6, "p = {p}");
+    }
+
+    #[test]
+    fn paired_diverges_on_constant_difference() {
+        let a = [1.0, 2.0, 3.0, 4.0];
+        let b = [0.0, 1.0, 2.0, 3.0];
+        let (t, p) = paired_t(&a, &b);
+        assert!(t.is_infinite() && t > 0.0, "t = {t}");
+        assert_eq!(p, 0.0);
+    }
+
+    #[test]
+    fn paired_reports_no_effect_on_identical_samples() {
+        let a = [1.0, 2.0, 3.0, 4.0];
+        let (t, p) = paired_t(&a, &a);
+        assert_eq!(t, 0.0);
+        assert_eq!(p, 1.0);
+    }
+}
