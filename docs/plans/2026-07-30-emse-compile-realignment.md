@@ -1215,7 +1215,7 @@ remains correct as written.)
 ## Addendum 14 (revmc session, 2026-07-31): Table 4 rebuild — frame-level index works; artifact cache was stale
 
 ### The fix works (evaluation confirmed empirically)
-`frame_tx_index` (commit 701f04fa) replays interpreted and records the first
+`frame_tx_index` (commit efb6bd70) replays interpreted and records the first
 `(block, tx_index)` where each code hash appears in ANY frame — 16,634
 hashes indexed over 10K blocks, 788 s, emitting the same bincode format so
 `skelot_ablation_bench --tx-index <path>` consumes it directly.
